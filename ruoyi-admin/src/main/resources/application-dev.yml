@@ -270,3 +270,15 @@ justauth:
       client-id: 10**********6
       client-secret: 1f7d08**********5b7**********29e
       redirect-uri: ${justauth.address}/social-callback?source=gitea
+
+--- # 微信小程序登录配置（GZ-SYS-002）
+wx:
+  miniapp:
+    # appid=wxMOCK 时走 mock 通道（不调微信 jscode2session，由 WxMockLoginAdapter 短路）
+    # 真实 AppID 接入后改为 wx.xxxxxx，自动切换 WxRealLoginAdapter
+    appid: ${WX_MA_APPID:wxMOCK}
+    secret: ${WX_MA_SECRET:}
+    # session_key Redis TTL（秒），默认 24h（doc/10 §1.N6）
+    session-key-ttl-seconds: 86400
+    # 业务 token TTL（秒），默认 7 天（doc/10 §1 状态机注释）
+    token-ttl-seconds: 604800

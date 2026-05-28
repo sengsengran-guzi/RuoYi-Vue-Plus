@@ -269,3 +269,11 @@ justauth:
       client-id: 10**********6
       client-secret: 1f7d08**********5b7**********29e
       redirect-uri: ${justauth.address}/social-callback?source=gitea
+
+--- # 微信小程序登录配置（GZ-SYS-002）— prod 由 env var 注入真实 AppID/Secret
+wx:
+  miniapp:
+    appid: ${WX_MA_APPID:wxMOCK}          # prod 部署前由甲方提供，CI/CD env var 注入；缺省 wxMOCK 不报错
+    secret: ${WX_MA_SECRET:}
+    session-key-ttl-seconds: ${WX_MA_SESSION_KEY_TTL:86400}
+    token-ttl-seconds: ${WX_MA_TOKEN_TTL:604800}

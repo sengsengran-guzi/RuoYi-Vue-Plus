@@ -69,6 +69,18 @@
             <groupId>org.dromara</groupId>
             <artifactId>ruoyi-common-json</artifactId>
         </dependency>
+        <!-- GZ-SYS-005 文件上传 / 对象存储 — 复用 ruoyi OssClient + OssFactory + sys_oss_config -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-oss</artifactId>
+        </dependency>
+
+        <!-- 单元测试（GZ-SYS-005 AC 7） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
 </project>
