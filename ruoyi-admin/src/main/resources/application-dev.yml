@@ -47,7 +47,8 @@ spring:
           driverClassName: com.mysql.cj.jdbc.Driver
           # jdbc 所有参数配置参考 https://lionli.blog.csdn.net/article/details/122018562
           # rewriteBatchedStatements=true 批处理优化 大幅提升批量插入更新删除性能(对数据库有性能损耗 使用批量操作应考虑性能问题)
-          url: jdbc:mysql://localhost:3306/ry-vue?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8&autoReconnect=true&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true&nullCatalogMeansCurrent=true
+          # 端口 3307（sensenran-guzi 偏移：本机 brew mysql 服务占 3306；对应 script/docker/dev-compose.yml 的 3307:3306）
+          url: jdbc:mysql://localhost:3307/ry-vue?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=false&serverTimezone=GMT%2B8&autoReconnect=true&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true&nullCatalogMeansCurrent=true
           username: root
           password: root
 #        # 从库数据源
@@ -97,8 +98,9 @@ spring.data:
   redis:
     # 地址
     host: localhost
-    # 端口，默认为6379
-    port: 6379
+    # 端口（sensenran-guzi 偏移到 6380：Kevin 本机长期跑 redis-local 占用 6379；
+    # 对应 script/docker/dev-compose.yml 的 6380:6379 端口映射）
+    port: 6380
     # 数据库索引
     database: 0
     # redis 密码必须配置

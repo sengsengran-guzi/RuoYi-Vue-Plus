@@ -1,0 +1,61 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: gz-redis-${DEPLOY_ENV:?DEPLOY_ENV is required}
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    # 用 $$ 转义，让密码在容器内 shell 展开（而不是 compose 解析时）
+    command: ["sh", "-c", "redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes"]
+    volumes:
+      - ../../redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  ruoyi-admin:
+    build:
+      # context 指向仓库根目录（compose 文件在 script/docker/ 下）
+      # Maven multi-stage build 需要根 pom.xml + 所有模块源码
+      context: ../..
+      dockerfile: Dockerfile
+    image: sensenran-guzi/ruoyi-admin:${DEPLOY_ENV:?DEPLOY_ENV is required}
+    container_name: gz-ruoyi-admin-${DEPLOY_ENV:?}
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    # 暴露 8080 给宿主机（宝塔 nginx 反代 127.0.0.1:8080）
+    ports:
+      - "8080:8080"
+    env_file:
+      - ../../.env
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      TZ: Asia/Shanghai
+      # Redis 用 docker 服务名解析（覆盖 .env 里的 REDIS_HOST / REDIS_PORT）
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    volumes:
+      - ../../logs:/app/logs
+    healthcheck:
+      # 用 liveness probe（只检查进程存活，不连下游服务，比 /actuator/health 健壮）
+      # Spring Boot 3.x 默认开启 liveness/readiness probe
+      test: ["CMD-SHELL", "wget -q --tries=1 --timeout=3 -O /dev/null http://127.0.0.1:8080/actuator/health/liveness || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

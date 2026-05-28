@@ -1,0 +1,70 @@
+# sensenran-guzi 本地开发数据栈（macOS / Apple Silicon 友好）
+#
+# 服务：MySQL + Redis + MinIO，业务后端用 IDEA / mvn spring-boot:run 直接跑。
+#
+# 端口决策（本机已有 brew mysql 服务占 3306 + redis-local 容器占 6379，sensenran 必须偏移）：
+#   - MySQL  3307:3306        ★ 偏移：本机 brew mysql 服务占 3306
+#   - Redis  6380:6379        ★ 偏移：Kevin 本机长期跑 redis-local 占 6379
+#   - MinIO  9000:9000 / 9001:9001   本机空闲，保持 ruoyi 默认
+# application-dev.yml redis.port + datasource.url 已同步配置到偏移端口。
+#
+# 容器名：sensenran-dev-* 前缀，避免与 dongjiaoshan 同源 docker-compose-dev.yml（容器名 dev-mysql / dev-redis / dev-minio）冲突。
+# 即使 Kevin 同时跑 dongjiaoshan + sensenran 也能共存（容器名 + Redis 端口都已隔离；MySQL/MinIO 端口不冲突的前提是另一项目栈关闭）。
+#
+# 账号密码：与 ruoyi-admin/src/main/resources/application-dev.yml 默认值对齐（root/root + ruoyi123），请勿改。
+#
+# 数据：named volume，重置只需 `docker compose -f script/docker/dev-compose.yml down -v`。
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: sensenran-dev-mysql
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: ry-vue
+    ports:
+      - "3307:3306"
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      - --init-connect=SET NAMES utf8mb4
+      - --skip-character-set-client-handshake
+      - --explicit_defaults_for_timestamp=true
+      - --lower_case_table_names=1
+    volumes:
+      - sensenran-dev-mysql-data:/var/lib/mysql
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.2.8
+    container_name: sensenran-dev-redis
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "6380:6379"
+    command: redis-server --requirepass "ruoyi123" --appendonly yes
+    volumes:
+      - sensenran-dev-redis-data:/data
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: sensenran-dev-minio
+    environment:
+      TZ: Asia/Shanghai
+      MINIO_ROOT_USER: ruoyi
+      MINIO_ROOT_PASSWORD: ruoyi123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server --address ':9000' --console-address ':9001' /data
+    volumes:
+      - sensenran-dev-minio-data:/data
+    restart: unless-stopped
+
+volumes:
+  sensenran-dev-mysql-data:
+  sensenran-dev-redis-data:
+  sensenran-dev-minio-data:

@@ -1,0 +1,68 @@
+name: Deploy Staging (Backend)
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Trigger deploy on server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST_STAGING }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY_STAGING }}
+          command_timeout: 30m
+          script: |
+            set -e
+            REPO_DIR=/www/wwwroot/api.sensenran-guzi.com
+            COMPOSE="docker compose -f script/docker/docker-compose.deploy.yml"
+
+            cd "$REPO_DIR"
+            [ -f .env ] || { echo "ERROR: .env missing" >&2; exit 1; }
+
+            echo "==> Pulling latest staging branch"
+            git fetch origin staging
+            git reset --hard origin/staging
+
+            echo "==> Stopping old container to free memory for Maven build"
+            DEPLOY_ENV=staging $COMPOSE stop ruoyi-admin || true
+
+            echo "==> Building new image (multi-stage Maven build)"
+            export DOCKER_BUILDKIT=1
+            export COMPOSE_DOCKER_CLI_BUILD=1
+            DEPLOY_ENV=staging $COMPOSE build ruoyi-admin
+
+            echo "==> Starting new container"
+            DEPLOY_ENV=staging $COMPOSE up -d ruoyi-admin
+
+            echo "==> Brief wait for app to settle (60s)..."
+            sleep 60
+
+            echo "==> Best-effort smoke test (does NOT fail the deploy):"
+            # 连接到端口就算"上线"，HTTP 状态码不卡判定（可能 200/404/503，都说明进程在跑）
+            for i in $(seq 1 12); do
+              if curl -s -o /dev/null --max-time 3 http://127.0.0.1:8080/; then
+                echo "✅ Port 8080 responding at attempt $i"
+                break
+              fi
+              echo "[$i] port not responding yet"
+              sleep 5
+            done
+
+            echo "==> Container status:"
+            DEPLOY_ENV=staging $COMPOSE ps
+            echo "==> Last 80 lines of app log:"
+            DEPLOY_ENV=staging $COMPOSE logs --tail=80 ruoyi-admin || true
+
+            # 永远 exit 0：部署完成就算成功，健康状态自己 SSH 上去看
+            exit 0

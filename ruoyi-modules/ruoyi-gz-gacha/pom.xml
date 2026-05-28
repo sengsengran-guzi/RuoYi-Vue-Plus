@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <parent>
+        <groupId>org.dromara</groupId>
+        <artifactId>ruoyi-modules</artifactId>
+        <version>${revision}</version>
+    </parent>
+    <modelVersion>4.0.0</modelVersion>
+
+    <artifactId>ruoyi-gz-gacha</artifactId>
+
+    <description>
+        谷子宇宙扭蛋机（V1.1）：机器 / 奖品 / 抽奖事务 / 库存扣减 / 概率随机 / 火花券 V2 占位
+        D01 GZ-SYS-001 阶段仅 HelloController 占位（模块先建，V1.1 启动时填业务）
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-gz-common</artifactId>
+            <version>${revision}</version>
+        </dependency>
+    </dependencies>
+
+</project>

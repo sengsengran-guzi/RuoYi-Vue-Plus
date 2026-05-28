@@ -3,9 +3,9 @@ spring.servlet.multipart.location: /ruoyi/server/temp
 
 --- # 监控中心配置
 spring.boot.admin.client:
-  # 增加客户端开关
-  enabled: true
-  url: http://localhost:9090/admin
+  # 增加客户端开关（prod 默认 false，避免 9090 端口未启动导致连接失败日志刷屏；本地需要时 BOOT_ADMIN_ENABLED=true 启用）
+  enabled: ${BOOT_ADMIN_ENABLED:false}
+  url: ${BOOT_ADMIN_URL:http://localhost:9090/admin}
   instance:
     service-host-type: IP
     metadata:
@@ -16,7 +16,8 @@ spring.boot.admin.client:
 
 --- # snail-job 配置
 snail-job:
-  enabled: true
+  # prod 默认 false（同 boot admin 理由，sensenran V1.0 暂不接 snail-job 集群；本地启用 SNAIL_JOB_ENABLED=true）
+  enabled: ${SNAIL_JOB_ENABLED:false}
   # 需要在 SnailJob 后台组管理创建对应名称的组,然后创建任务的时候选择对应的组,才能正确分派任务
   group: "ruoyi_group"
   # SnailJob 接入验证令牌 详见 script/sql/ry_job.sql `sj_group_config`表
@@ -50,9 +51,10 @@ spring:
           driverClassName: com.mysql.cj.jdbc.Driver
           # jdbc 所有参数配置参考 https://lionli.blog.csdn.net/article/details/122018562
           # rewriteBatchedStatements=true 批处理优化 大幅提升批量插入更新删除性能(对数据库有性能损耗 使用批量操作应考虑性能问题)
-          url: jdbc:mysql://localhost:3306/ry-vue?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8&autoReconnect=true&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true&nullCatalogMeansCurrent=true
-          username: root
-          password: root
+          # prod 走 env var 注入（CI workflow + .env 文件）；默认占位待 Kevin 阿里云 RDS 购买后填实际 endpoint（GZ-SYS-001 AC 2.4）
+          url: ${MASTER_DB_URL:jdbc:mysql://localhost:3306/ry-vue?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=false&serverTimezone=Asia/Shanghai&autoReconnect=true&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true&nullCatalogMeansCurrent=true}
+          username: ${MASTER_DB_USERNAME:root}
+          password: ${MASTER_DB_PASSWORD:root}
 #        # 从库数据源
 #        slave:
 #          lazy: true
@@ -98,18 +100,15 @@ spring:
 --- # redis 单机配置(单机与集群只能开启一个另一个需要注释掉)
 spring.data:
   redis:
-    # 地址
-    host: localhost
-    # 端口，默认为6379
-    port: 6379
-    # 数据库索引
-    database: 0
-    # redis 密码必须配置
-    password: ruoyi123
+    # prod 走 env var 注入（docker-compose.deploy.yml 已默认设 REDIS_HOST=redis 服务名 + REDIS_PORT=6379；阿里云 Redis 时由 Kevin 填实际 endpoint）
+    host: ${REDIS_HOST:localhost}
+    port: ${REDIS_PORT:6379}
+    database: ${REDIS_DATABASE:0}
+    password: ${REDIS_PASSWORD:ruoyi123}
     # 连接超时时间
     timeout: 10s
     # 是否开启ssl
-    ssl.enabled: false
+    ssl.enabled: ${REDIS_SSL_ENABLED:false}
 
 # redisson 配置
 redisson:

@@ -15,6 +15,13 @@
         <module>ruoyi-job</module>
         <module>ruoyi-system</module>
         <module>ruoyi-workflow</module>
+        <!-- 谷子宇宙业务模块（D01 由 GZ-SYS-001 创建） -->
+        <module>ruoyi-gz-common</module>
+        <module>ruoyi-gz-bean</module>
+        <module>ruoyi-gz-user</module>
+        <module>ruoyi-gz-news</module>
+        <module>ruoyi-gz-ord</module>
+        <module>ruoyi-gz-gacha</module>
     </modules>
 
     <artifactId>ruoyi-modules</artifactId>
