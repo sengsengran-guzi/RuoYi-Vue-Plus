@@ -115,6 +115,27 @@ public class GzUserServiceImpl implements IGzUserService {
         return baseMapper.selectVoById(id);
     }
 
+    @Override
+    public GzUser bindMobile(Long userId, String mobile) {
+        if (ObjectUtil.isNull(userId)) {
+            throw new IllegalArgumentException("userId is null");
+        }
+        if (StrUtil.isBlank(mobile) || mobile.length() != 11) {
+            throw new IllegalArgumentException("invalid mobile");
+        }
+        GzUser user = baseMapper.selectById(userId);
+        if (user == null) {
+            throw new IllegalArgumentException("user not found: " + userId);
+        }
+        user.setMobile(mobile);
+        // 状态由 authorized 升级为 phone_bound（doc/10 §1 状态机）
+        user.setStatus("phone_bound");
+        baseMapper.updateById(user);
+        log.info("[gz-user] bindMobile userId={} mobile=***{} status=phone_bound",
+            userId, mobile.substring(Math.max(0, mobile.length() - 4)));
+        return user;
+    }
+
     /**
      * 构建查询 wrapper —— 多租户 / 软删由拦截器自动 append，本方法只显式拼业务过滤。
      */

@@ -74,6 +74,11 @@
             <groupId>org.dromara</groupId>
             <artifactId>ruoyi-common-oss</artifactId>
         </dependency>
+        <!-- GZ-SYS-006 操作日志 — 复用 ruoyi ExcelUtil / ExcelDictConvert（导出 .xlsx）-->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-excel</artifactId>
+        </dependency>
 
         <!-- 单元测试（GZ-SYS-005 AC 7） -->
         <dependency>

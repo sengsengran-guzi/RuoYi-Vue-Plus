@@ -282,3 +282,19 @@ wx:
     session-key-ttl-seconds: 86400
     # 业务 token TTL（秒），默认 7 天（doc/10 §1 状态机注释）
     token-ttl-seconds: 604800
+
+--- # 关闭 dev 验证码（kevin-qa Tier 1B Playwright admin E2E 自动化 — Redisson Fury 序列化与 redis-cli SET 不兼容，无法注入绕过；上线前 prod profile 不受影响）
+captcha:
+  enable: false
+
+--- # 关闭 dev API 加密（kevin-qa Tier 1B curl API 契约测试 + Playwright E2E — 前端 RSA 加密无法在 curl 层面复现；上线前 prod profile 不受影响）
+api-decrypt:
+  enabled: false
+
+--- # 拼豆核销码签名密钥（GZ-BEAN-004）
+# dev 固定值方便本地复现；staging / prod 走 env var ${GZ_BEAN_QR_SECRET}
+# HMAC-SHA256(booking_no + sess_date + seat_id, signing-secret) 截 32 位 = verify_code
+gz:
+  bean:
+    qr:
+      signing-secret: ${GZ_BEAN_QR_SECRET:dev-sensenran-guzi-qr-secret-2026}

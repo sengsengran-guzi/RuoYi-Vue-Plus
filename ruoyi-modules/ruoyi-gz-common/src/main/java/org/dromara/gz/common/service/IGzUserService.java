@@ -56,4 +56,19 @@ public interface IGzUserService {
      * @return VO（不存在时 null）
      */
     GzUserVO selectVoById(Long id);
+
+    /**
+     * 绑定/更新用户手机号（GZ-BEAN-004 拼豆预约前置）。
+     *
+     * <p>doc/10 §1.N8 + §3.N6：拼豆预约必须收手机号，mp 端 {@code wx.getPhoneNumber}
+     * 授权后端拿到 phoneNumber 直接更新 gz_user.mobile。</p>
+     *
+     * <p>V1.0 简化：service 层接受明文 mobile（11 位中国手机号）。
+     * 如果未来切换 encryptedData + session_key 解密链路，由 controller 层先解密。</p>
+     *
+     * @param userId 用户 ID
+     * @param mobile 手机号（11 位）
+     * @return 更新后的用户 entity
+     */
+    GzUser bindMobile(Long userId, String mobile);
 }
