@@ -1,10 +1,60 @@
+# sensenran-guzi 生产/预发部署栈
+#
+# 使用（必须从 RuoYi-Vue-Plus/ 根目录跑，--env-file 是 compose 解析 ${VAR} 的来源）：
+#   cd RuoYi-Vue-Plus
+#   cp .env.example .env  （首次，按注释填写）
+#   docker compose --env-file .env -f script/docker/docker-compose.deploy.yml up -d --build
+#
+# 服务：MySQL + Redis + ruoyi-admin（OSS 使用阿里云 OSS，在 admin 网页配置 sys_oss_config，不在此处）
+#
+# 端口策略：
+#   - MySQL 3306 → 暴露到宿主机（运维 Navicat 直连，需配防火墙白名单）
+#   - Redis 6379 → 不暴露到宿主机（仅容器网络内访问，更安全）
+#   - ruoyi-admin 8080 → 暴露到宿主机 127.0.0.1:8080（宝塔 nginx 反代）
+
 services:
+  mysql:
+    image: mysql:8.0
+    container_name: gz-mysql-${DEPLOY_ENV:?DEPLOY_ENV is required}
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-ry-vue}
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      - --init-connect=SET NAMES utf8mb4
+      - --skip-character-set-client-handshake
+      - --explicit_defaults_for_timestamp=true
+      - --lower_case_table_names=1
+      - --max_connections=500
+    ports:
+      # 暴露 3306 到宿主机（运维 Navicat 直连）
+      # ⚠️ 服务器防火墙必须配置白名单，仅允许运维 IP 访问
+      - "3306:3306"
+    volumes:
+      - ../../mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
   redis:
     image: redis:7-alpine
-    container_name: gz-redis-${DEPLOY_ENV:?DEPLOY_ENV is required}
+    container_name: gz-redis-${DEPLOY_ENV:?}
     restart: unless-stopped
-    env_file:
-      - ../../.env
+    environment:
+      TZ: Asia/Shanghai
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
     # 用 $$ 转义，让密码在容器内 shell 展开（而不是 compose 解析时）
     command: ["sh", "-c", "redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes"]
     volumes:
@@ -24,36 +74,41 @@ services:
   ruoyi-admin:
     build:
       # context 指向仓库根目录（compose 文件在 script/docker/ 下）
-      # Maven multi-stage build 需要根 pom.xml + 所有模块源码
+      # 多阶段 Dockerfile 在仓库根目录，构建产物 ruoyi-admin.jar
       context: ../..
       dockerfile: Dockerfile
-    image: sensenran-guzi/ruoyi-admin:${DEPLOY_ENV:?DEPLOY_ENV is required}
+    image: sensenran-guzi/ruoyi-admin:${DEPLOY_ENV:?}
     container_name: gz-ruoyi-admin-${DEPLOY_ENV:?}
     restart: unless-stopped
     depends_on:
+      mysql:
+        condition: service_healthy
       redis:
         condition: service_healthy
-    # 暴露 8080 给宿主机（宝塔 nginx 反代 127.0.0.1:8080）
+    # 仅暴露给宿主机 127.0.0.1（宝塔 nginx 反代时用），不直接对公网
     ports:
-      - "8080:8080"
-    env_file:
-      - ../../.env
+      - "127.0.0.1:8080:8080"
     environment:
       SPRING_PROFILES_ACTIVE: prod
       TZ: Asia/Shanghai
-      # Redis 用 docker 服务名解析（覆盖 .env 里的 REDIS_HOST / REDIS_PORT）
+      # 数据库走 docker 服务名解析（覆盖 application-prod.yml 的 MASTER_DB_URL 默认值）
+      MASTER_DB_URL: "jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-ry-vue}?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=false&serverTimezone=Asia/Shanghai&autoReconnect=true&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true&nullCatalogMeansCurrent=true"
+      MASTER_DB_USERNAME: root
+      MASTER_DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
+      # Redis 用 docker 服务名解析
       REDIS_HOST: redis
       REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
     volumes:
       - ../../logs:/app/logs
     healthcheck:
-      # 用 liveness probe（只检查进程存活，不连下游服务，比 /actuator/health 健壮）
+      # liveness probe（只检查进程存活，不连下游服务，比 /actuator/health 健壮）
       # Spring Boot 3.x 默认开启 liveness/readiness probe
-      test: ["CMD-SHELL", "wget -q --tries=1 --timeout=3 -O /dev/null http://127.0.0.1:8080/actuator/health/liveness || exit 1"]
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:8080/actuator/health/liveness || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 60s
+      start_period: 90s
     logging:
       driver: json-file
       options:
