@@ -77,4 +77,23 @@ public class GzBeanBookingVO implements Serializable {
     private LocalDateTime createTime;
 
     private String remark;
+
+    // ============================================================
+    //  GZ-BEAN-005 派生字段（非 DB 列，service 层填充；@AutoMapper 不映射）
+    // ============================================================
+
+    /**
+     * 核销码 QR payload（mp 详情页渲染二维码用）。
+     *
+     * <p>格式 {@code "BK|{bookingNo}|{verifyCode}"}（{@link org.dromara.gz.bean.service.internal.QrCodeSigner}）。
+     * <b>不持久化</b>：service 层按 (bookingNo + sessDate + seatId) 用 HMAC 即时重算，与 BEAN-004 submit 返回口径一致。
+     * verifyCode 本身仍不暴露（doc/11 §3.6 敏感），仅以拼接进 payload 的形式给前端渲染。</p>
+     */
+    private String qrPayload;
+
+    /** 门店名（mp 详情页顶部展示；service join gz_bean_store 填充） */
+    private String storeName;
+
+    /** 门店地址（mp 详情页顶部展示；service join gz_bean_store 填充） */
+    private String storeAddress;
 }

@@ -23,6 +23,12 @@
             <version>${revision}</version>
         </dependency>
 
+        <!-- GZ-BEAN-009 no_show cron：SnailJob 执行器（AbstractJobExecutor / @JobExecutor / JobArgs / ExecuteResult）-->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-job</artifactId>
+        </dependency>
+
         <!-- GZ-BEAN-001 单元测试（Mockito + JUnit 5）-->
         <dependency>
             <groupId>org.springframework.boot</groupId>

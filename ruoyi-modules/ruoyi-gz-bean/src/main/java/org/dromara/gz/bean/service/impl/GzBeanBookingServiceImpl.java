@@ -10,6 +10,7 @@ import org.dromara.common.core.exception.ServiceException;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.redis.utils.RedisUtils;
+import org.dromara.common.tenant.helper.TenantHelper;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingSubmitBo;
 import org.dromara.gz.bean.domain.entity.GzBeanBooking;
@@ -37,6 +38,7 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 拼豆预约服务实现（GZ-BEAN-004）。
@@ -63,9 +65,12 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     private static final String STATUS_PENDING = "pending";
     private static final String STATUS_USED = "used";
     private static final String STATUS_CANCELLED = "cancelled";
+    private static final String STATUS_NO_SHOW = "no_show";
 
     private static final String OPERATOR_USER = "user";
     private static final String OPERATOR_ADMIN = "admin";
+    /** cron 系统操作者（doc/11 §3.5 operator_type 口径 system；operator_id 为 null） */
+    private static final String OPERATOR_SYSTEM = "system";
 
     /** Redis 锁前缀：同用户提交（防连点） */
     private static final String LOCK_USER_SUBMIT_PREFIX = "gz:bean:lock:user_submit:";
@@ -264,7 +269,61 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         if (booking == null) {
             throw new ServiceException(GzBeanErrorCode.BOOKING_NOT_FOUND_MSG, GzBeanErrorCode.BOOKING_NOT_FOUND);
         }
+        return doVerify(booking, verifiedBy, "店员手动核销");
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public GzBeanBookingVO verifyByQrPayload(String qrPayload, String verifiedBy) {
+        // ① 解析 payload "BK|{bookingNo}|{verifyCode}"（doc/10 §3 E8 — 格式非法直接拒）
+        if (StrUtil.isBlank(qrPayload)) {
+            throw new ServiceException(GzBeanErrorCode.QR_PAYLOAD_MALFORMED_MSG, GzBeanErrorCode.QR_PAYLOAD_MALFORMED);
+        }
+        String[] parts = qrPayload.split("\\|", -1);
+        // 期望 3 段：["BK", bookingNo, verifyCode]
+        if (parts.length != 3 || !"BK".equals(parts[0])
+            || StrUtil.isBlank(parts[1]) || StrUtil.isBlank(parts[2])) {
+            log.warn("[bean-verify-scan] malformed qrPayload (masked len={})", qrPayload.length());
+            throw new ServiceException(GzBeanErrorCode.QR_PAYLOAD_MALFORMED_MSG, GzBeanErrorCode.QR_PAYLOAD_MALFORMED);
+        }
+        String bookingNo = parts[1];
+        String verifyCode = parts[2];
+
+        // ② 按 bookingNo 回表
+        GzBeanBooking booking = bookingMapper.selectByBookingNo(bookingNo);
+        if (booking == null) {
+            log.warn("[bean-verify-scan] booking not found bookingNo={}", bookingNo);
+            throw new ServiceException(GzBeanErrorCode.BOOKING_NOT_FOUND_MSG, GzBeanErrorCode.BOOKING_NOT_FOUND);
+        }
+
+        // ③ HMAC 校签（口径与 BEAN-004 submit / BEAN-005 详情即时重算一致）
+        boolean signOk = qrCodeSigner.verify(
+            booking.getBookingNo(), booking.getSessDate(), booking.getSeatId(), verifyCode);
+        if (!signOk) {
+            log.warn("[bean-verify-scan] signature mismatch bookingNo={} (篡改 / 非本店码)", bookingNo);
+            throw new ServiceException(GzBeanErrorCode.QR_SIGNATURE_INVALID_MSG, GzBeanErrorCode.QR_SIGNATURE_INVALID);
+        }
+
+        // ④ 校签通过 → 复用与手动核销同一底层
+        log.info("[bean-verify-scan] signature ok bookingNo={} by={}", bookingNo, verifiedBy);
+        return doVerify(booking, verifiedBy, "店员扫码核销");
+    }
+
+    /**
+     * 核销底层（手动 / 扫码共用，GZ-BEAN-008）。
+     *
+     * <p>status=pending 守卫（doc/10 §3 E6/E7 已核销 / 已取消 / 已过期一律拒）→ UPDATE used
+     * + verifyTime + verifiedBy → dedupToken 切 booking_no 释放座位占位 → 写一条 admin booking_log。
+     * 调用方已确保 booking 非 null，且在 {@code @Transactional} 方法内（本方法不再单独标注事务）。</p>
+     *
+     * @param booking    已查出的预约（非 null）
+     * @param verifiedBy 核销操作人（admin username）
+     * @param logNote    审计日志备注（区分手动 / 扫码入口）
+     * @return 核销后 VO
+     */
+    private GzBeanBookingVO doVerify(GzBeanBooking booking, String verifiedBy, String logNote) {
         if (!STATUS_PENDING.equals(booking.getStatus())) {
+            // doc/10 §3 E6/E7：已核销 / 已取消 / 已过期 → 拼当前状态中文，admin 端按 INVALID_STATUS code 映射文案
             throw new ServiceException(GzBeanErrorCode.INVALID_STATUS_MSG + "（当前状态：" + booking.getStatus() + "）",
                 GzBeanErrorCode.INVALID_STATUS);
         }
@@ -282,16 +341,16 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         }
 
         bookingLogMapper.insert(GzBeanBookingLog.builder()
-            .bookingId(bookingId)
+            .bookingId(booking.getId())
             .fromStatus(fromStatus)
             .toStatus(STATUS_USED)
             .operatorType(OPERATOR_ADMIN)
             .operatorId(verifiedBy)
-            .note("店员核销")
+            .note(logNote)
             .delFlag("0")
             .build());
 
-        return selectVoById(bookingId);
+        return selectVoById(booking.getId());
     }
 
     // ============================================================
@@ -335,6 +394,74 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     }
 
     // ============================================================
+    //  no_show 批量标记（GZ-BEAN-009 凌晨 2 点 cron）
+    // ============================================================
+
+    @Override
+    public NoShowMarkResult markNoShowBatch() {
+        // cron 无登录态 → 关多租户拦截器全租户扫（V1.0 仅 '1001'，等价于只扫 '1001'）。
+        return TenantHelper.ignore(() -> {
+            List<Long> expiredIds = bookingMapper.selectExpiredPendingIds();
+            int scanned = expiredIds.size();
+            if (scanned == 0) {
+                log.info("[bean-noshow] no expired pending bookings, skip");
+                return new NoShowMarkResult(0, 0, 0, 0);
+            }
+            log.info("[bean-noshow] scan {} expired pending bookings, start marking", scanned);
+
+            LocalDateTime markTime = LocalDateTime.now();
+            int marked = 0;
+            int skipped = 0;
+            int failed = 0;
+
+            for (Long id : expiredIds) {
+                try {
+                    int affected = markOneNoShow(id, markTime);
+                    if (affected == 1) {
+                        marked++;
+                    } else {
+                        // affected=0：已被并发 / 上轮 cron 改成 used/cancelled/no_show（幂等跳过，AC 5）
+                        skipped++;
+                        log.info("[bean-noshow] booking id={} already non-pending, skip (idempotent)", id);
+                    }
+                } catch (Exception ex) {
+                    // 单条失败不中断整批（AC 4）— 记录后继续下一条，不静默吞（CLAUDE.md §6 #7）
+                    failed++;
+                    log.error("[bean-noshow] mark no_show FAILED bookingId={}, continue next", id, ex);
+                }
+            }
+
+            log.info("[bean-noshow] done. scanned={} marked={} skipped={} failed={}",
+                scanned, marked, skipped, failed);
+            return new NoShowMarkResult(scanned, marked, skipped, failed);
+        });
+    }
+
+    /**
+     * 单条 no_show 标记 + 审计日志（GZ-BEAN-009）。protected 便于单测 spy 验证调用与异常隔离。
+     *
+     * <p>条件 UPDATE（{@code WHERE status='pending'}）天然原子幂等：affected=1 才写 booking_log，
+     * affected=0（已非 pending）不写日志直接返回，让调用方计入 skipped。</p>
+     *
+     * @return 受影响行数（1 = 标记成功 / 0 = 幂等跳过）
+     */
+    protected int markOneNoShow(Long bookingId, LocalDateTime markTime) {
+        int affected = bookingMapper.markNoShow(bookingId, markTime);
+        if (affected == 1) {
+            bookingLogMapper.insert(GzBeanBookingLog.builder()
+                .bookingId(bookingId)
+                .fromStatus(STATUS_PENDING)
+                .toStatus(STATUS_NO_SHOW)
+                .operatorType(OPERATOR_SYSTEM)
+                .operatorId(null)
+                .note("系统定时标记未到店（凌晨 2 点 cron）")
+                .delFlag("0")
+                .build());
+        }
+        return affected;
+    }
+
+    // ============================================================
     //  查询
     // ============================================================
 
@@ -345,26 +472,108 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .eq(StrUtil.isNotBlank(status), GzBeanBooking::getStatus, status)
             .orderByDesc(GzBeanBooking::getSessDate)
             .orderByDesc(GzBeanBooking::getSlotStart);
-        return bookingMapper.selectVoList(wrapper);
+        List<GzBeanBookingVO> list = bookingMapper.selectVoList(wrapper);
+        // 列表（BEAN-006）也展示 storeName → 批量 enrich 避免 N+1；列表不需要 qrPayload（详情页才渲码）。
+        enrichStoreInfoBatch(list);
+        return list;
     }
 
     @Override
     public GzBeanBookingVO selectVoById(Long id) {
-        return bookingMapper.selectVoById(id);
+        GzBeanBookingVO vo = bookingMapper.selectVoById(id);
+        if (vo == null) {
+            return null;
+        }
+        // 门店名 + 地址（详情页顶部 / 列表卡片用）
+        enrichStoreInfo(vo);
+        // 核销码 QR payload（详情页渲码用，BEAN-005）：按 bookingNo + sessDate + seatId 即时重算，
+        // 口径与 BEAN-004 submit 返回一致；payload 不持久化（doc/11 §3.6 verifyCode 不入 VO 字段）。
+        vo.setQrPayload(buildQrPayload(vo));
+        return vo;
+    }
+
+    /**
+     * 单条填充门店名 + 地址（GZ-BEAN-005）。store 查不到时静默留空（V1.0 单店，理论上必有；
+     * 容错防 store 被软删后历史预约详情仍可打开）。
+     */
+    private void enrichStoreInfo(GzBeanBookingVO vo) {
+        if (vo == null || vo.getStoreId() == null) {
+            return;
+        }
+        GzBeanStore store = storeMapper.selectById(vo.getStoreId());
+        if (store != null) {
+            vo.setStoreName(store.getName());
+            vo.setStoreAddress(store.getAddress());
+        }
+    }
+
+    /**
+     * 批量填充门店名 + 地址（GZ-BEAN-005）。一次性把列表涉及的 store 查回（去重 storeId），
+     * 避免逐条 selectById 的 N+1。V1.0 单店量小，但 BEAN-006 列表复用此方法故按批量写。
+     */
+    private void enrichStoreInfoBatch(List<GzBeanBookingVO> list) {
+        if (list == null || list.isEmpty()) {
+            return;
+        }
+        List<Long> storeIds = list.stream()
+            .map(GzBeanBookingVO::getStoreId)
+            .filter(java.util.Objects::nonNull)
+            .distinct()
+            .toList();
+        if (storeIds.isEmpty()) {
+            return;
+        }
+        Map<Long, GzBeanStore> storeMap = storeMapper.selectByIds(storeIds).stream()
+            .collect(java.util.stream.Collectors.toMap(GzBeanStore::getId, s -> s, (a, b) -> a));
+        for (GzBeanBookingVO vo : list) {
+            GzBeanStore store = vo.getStoreId() == null ? null : storeMap.get(vo.getStoreId());
+            if (store != null) {
+                vo.setStoreName(store.getName());
+                vo.setStoreAddress(store.getAddress());
+            }
+        }
+    }
+
+    /**
+     * 按 VO 字段即时重算 QR payload（GZ-BEAN-005）。
+     *
+     * <p>必要字段（bookingNo / sessDate / seatId）任一缺失则返 null（前端见空降级显示 bookingNo 文本，
+     * doc/10 §3 R4 兜底）。verifyCode 走 {@link QrCodeSigner#sign} 重算，不读 DB 持久列。</p>
+     */
+    private String buildQrPayload(GzBeanBookingVO vo) {
+        if (StrUtil.isBlank(vo.getBookingNo()) || vo.getSessDate() == null || vo.getSeatId() == null) {
+            return null;
+        }
+        String verifyCode = qrCodeSigner.sign(vo.getBookingNo(), vo.getSessDate(), vo.getSeatId());
+        return qrCodeSigner.buildQrPayload(vo.getBookingNo(), verifyCode);
     }
 
     @Override
     public TableDataInfo<GzBeanBookingVO> selectPageList(GzBeanBookingQueryBo query, PageQuery pageQuery) {
+        return selectPageList(query, pageQuery, null);
+    }
+
+    @Override
+    public TableDataInfo<GzBeanBookingVO> selectPageList(GzBeanBookingQueryBo query, PageQuery pageQuery, Long staffStoreId) {
+        // store_id 权限隔离（GZ-BEAN-008 强约束 #6）：
+        //   staff 绑定门店（staffStoreId != null）→ 强制按其门店，忽略前端传入的 query.storeId（防越权看别店）；
+        //   owner / superadmin（staffStoreId == null）→ 受 query.storeId 可选筛选（不限制）。
+        Long effectiveStoreId = staffStoreId != null ? staffStoreId : query.getStoreId();
+        boolean hasStatusList = query.getStatusList() != null && !query.getStatusList().isEmpty();
         LambdaQueryWrapper<GzBeanBooking> wrapper = Wrappers.<GzBeanBooking>lambdaQuery()
-            .eq(query.getStoreId() != null, GzBeanBooking::getStoreId, query.getStoreId())
+            .eq(effectiveStoreId != null, GzBeanBooking::getStoreId, effectiveStoreId)
             .ge(query.getSessDateFrom() != null, GzBeanBooking::getSessDate, query.getSessDateFrom())
             .le(query.getSessDateTo() != null, GzBeanBooking::getSessDate, query.getSessDateTo())
-            .eq(StrUtil.isNotBlank(query.getStatus()), GzBeanBooking::getStatus, query.getStatus())
+            // 状态多选优先（IN），否则回落单值 status（兼容旧调用）
+            .in(hasStatusList, GzBeanBooking::getStatus, query.getStatusList())
+            .eq(!hasStatusList && StrUtil.isNotBlank(query.getStatus()), GzBeanBooking::getStatus, query.getStatus())
             .like(StrUtil.isNotBlank(query.getBookingNo()), GzBeanBooking::getBookingNo, query.getBookingNo())
             .like(StrUtil.isNotBlank(query.getMobile()), GzBeanBooking::getMobileSnapshot, query.getMobile())
             .orderByDesc(GzBeanBooking::getSessDate)
             .orderByDesc(GzBeanBooking::getSlotStart);
         Page<GzBeanBookingVO> page = bookingMapper.selectVoPage(pageQuery.build(), wrapper);
+        // 列表展示门店名 → 批量 enrich（复用 BEAN-005 私有方法，避免 N+1）
+        enrichStoreInfoBatch(page.getRecords());
         return TableDataInfo.build(page);
     }
 

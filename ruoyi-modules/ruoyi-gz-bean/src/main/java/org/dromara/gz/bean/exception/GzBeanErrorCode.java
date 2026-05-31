@@ -47,6 +47,17 @@ public final class GzBeanErrorCode {
     public static final int INVALID_STATUS = 4008;
     public static final String INVALID_STATUS_MSG = "预约状态不允许此操作";
 
+    /** 核销码 QR payload 格式非法（不是 "BK|{no}|{code}" 三段，doc/10 §3 E8） */
+    public static final int QR_PAYLOAD_MALFORMED = 4009;
+    public static final String QR_PAYLOAD_MALFORMED_MSG = "核销码格式无法识别，请重新截图";
+
+    /** 核销码签名校验不通过（被篡改 / 非本店码，doc/10 §3 E8） */
+    public static final int QR_SIGNATURE_INVALID = 4010;
+    public static final String QR_SIGNATURE_INVALID_MSG = "核销码无效或已被篡改";
+
+    /** 扫码命中的状态分支文案（admin 端按 code 映射，doc/10 §3 E6/E7）：
+     *  已核销 / 已取消 / 已过期 共用 INVALID_STATUS（4008），由 service 拼当前状态中文返回。*/
+
     private GzBeanErrorCode() {
     }
 }

@@ -6,6 +6,7 @@ import org.springframework.format.annotation.DateTimeFormat;
 import java.io.Serial;
 import java.io.Serializable;
 import java.time.LocalDate;
+import java.util.List;
 
 /**
  * admin 端预约查询参数（GZ-BEAN-004）。
@@ -29,8 +30,11 @@ public class GzBeanBookingQueryBo implements Serializable {
     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)
     private LocalDate sessDateTo;
 
-    /** 状态 pending / used / cancelled / no_show */
+    /** 状态 pending / used / cancelled / no_show（单值，兼容旧调用） */
     private String status;
+
+    /** 状态多选（GZ-BEAN-008 admin 列表筛选）；非空时 IN (...)，优先于 status 单值 */
+    private List<String> statusList;
 
     /** 业务码搜索 */
     private String bookingNo;
