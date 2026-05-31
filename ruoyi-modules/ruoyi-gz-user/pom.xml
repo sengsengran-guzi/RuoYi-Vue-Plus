@@ -22,6 +22,13 @@
             <artifactId>ruoyi-gz-common</artifactId>
             <version>${revision}</version>
         </dependency>
+
+        <!-- GZ-USER-002/003 单元测试（Mockito + JUnit 5）-->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
 </project>

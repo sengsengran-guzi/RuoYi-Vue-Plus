@@ -91,6 +91,27 @@ spring:
     deserialization:
       # 允许对象忽略json中不存在的属性
       fail_on_unknown_properties: false
+  # Flyway 数据库版本管理（sensenran：业务 DDL 启动自动跑，告别手工导入）
+  # 连接信息 url/user/password 走各 profile（dev/prod）—— 因 ruoyi 用 dynamic-datasource，
+  # Flyway 必须用独立连接而非动态数据源 bean，故显式配置在 application-<env>.yml
+  flyway:
+    enabled: true
+    # 独立连接，复用各 profile 的 master 数据源（占位符按激活 profile 解析 dev/prod）
+    url: ${spring.datasource.dynamic.datasource.master.url}
+    user: ${spring.datasource.dynamic.datasource.master.username}
+    password: ${spring.datasource.dynamic.datasource.master.password}
+    # 迁移脚本位置（V<yyyyMMddHHmm>__<TICKET>-<desc>.sql，CLAUDE.md §6 #5）
+    locations: classpath:db/migration
+    # ruoyi 自带 ~59 张表由 script/sql 导入作为基线；gz 业务表全部交给 Flyway 从 V1 建
+    # baseline-version=0 + baseline-on-migrate：空库(仅 ruoyi base)首启 → 自动基线于 0 → 跑全部 gz 迁移
+    baseline-on-migrate: true
+    baseline-version: 0
+    baseline-description: ruoyi-base-before-flyway
+    table: flyway_schema_history
+    encoding: UTF-8
+    # 严格顺序（不允许乱序补跑）+ 启动校验已应用脚本 checksum（迁移文件一旦应用不可改）
+    out-of-order: false
+    validate-on-migrate: true
 
 # Sa-Token配置
 sa-token:
