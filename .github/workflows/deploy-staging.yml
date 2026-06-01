@@ -25,7 +25,8 @@ jobs:
           script: |
             set -e
             REPO_DIR=/www/wwwroot/api.sensenran-guzi.com
-            COMPOSE="docker compose -f script/docker/docker-compose.deploy.yml"
+            # 显式 --env-file：compose 默认从 compose 文件父目录找 .env（script/docker/），但实际 .env 在 REPO_DIR/ 根
+            COMPOSE="docker compose --env-file .env -f script/docker/docker-compose.deploy.yml"
 
             cd "$REPO_DIR"
             [ -f .env ] || { echo "ERROR: .env missing" >&2; exit 1; }
