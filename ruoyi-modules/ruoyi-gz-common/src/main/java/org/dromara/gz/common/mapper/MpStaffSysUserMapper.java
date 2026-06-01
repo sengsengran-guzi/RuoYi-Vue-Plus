@@ -6,6 +6,7 @@ import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
 import org.apache.ibatis.annotations.Update;
 import org.dromara.gz.common.domain.dto.StaffSysUserCheck;
+import org.dromara.gz.common.domain.vo.StaffCandidateVO;
 
 import java.util.List;
 
@@ -70,4 +71,59 @@ public interface MpStaffSysUserMapper {
     @InterceptorIgnore(tenantLine = "true")
     @Update("UPDATE gz_user SET staff_user_id = NULL WHERE id = #{gzUserId}")
     int unbindStaffById(@Param("gzUserId") Long gzUserId);
+
+    /**
+     * 按绑定的 staff_user_id 清空所有 gz_user.staff_user_id（删除 sys_user 时清悬挂，GZ-SYS-007 AC9）。
+     *
+     * <p>当某店员 sys_user 被 admin 物理删除（{@code deleteUserByIds}）后，曾绑定它的 gz_user 行
+     * 会指向一个已不存在的 user_id（悬挂引用）。此方法把这些行的 staff_user_id 一并置 NULL，
+     * 避免悬挂（resolve 时虽已降级纯顾客，但 DB 留脏引用不利运营排查）。旁路 tenant 拦截器覆盖全部租户。</p>
+     *
+     * @param staffUserId 被删除的 sys_user.user_id
+     * @return 影响行数（被清空绑定的 gz_user 数）
+     */
+    @InterceptorIgnore(tenantLine = "true")
+    @Update("UPDATE gz_user SET staff_user_id = NULL WHERE staff_user_id = #{staffUserId}")
+    int clearStaffBindingByStaffUserId(@Param("staffUserId") Long staffUserId);
+
+    /**
+     * 给指定 gz_user 设置 / 改绑 staff_user_id（owner 自助绑定，GZ-SYS-007 AC10）。
+     *
+     * <p>显式 SQL 直接 UPDATE（不用 LambdaUpdateWrapper，与 {@link #unbindStaffById} 同口径）。
+     * 旁路 tenant 拦截器，按全局唯一 id 更新；同租户校验在 service 层做（ADR 安全红线"租户一致"）。</p>
+     *
+     * @param gzUserId    要绑定的 gz_user.id
+     * @param staffUserId 目标 sys_user.user_id
+     * @return 影响行数
+     */
+    @InterceptorIgnore(tenantLine = "true")
+    @Update("UPDATE gz_user SET staff_user_id = #{staffUserId} WHERE id = #{gzUserId}")
+    int bindStaffById(@Param("gzUserId") Long gzUserId, @Param("staffUserId") Long staffUserId);
+
+    /**
+     * 查指定租户下可绑定的店员 sys_user 候选（owner 绑定时下拉选择，GZ-SYS-007 AC10）。
+     *
+     * <p>候选 = 同租户 + 正常(status='0') + 未软删(del_flag='0')。不暴露密码/邮箱等敏感字段。
+     * 旁路 tenant 拦截器，由参数显式传入 tenantId（owner 当前登录租户）做过滤。
+     * 可按 user_name / nick_name 模糊（keyword 为空则不过滤）。最多回 100 条防爆量。</p>
+     *
+     * @param tenantId owner 当前租户（'1001'）
+     * @param keyword  账号名 / 昵称模糊关键字（可空）
+     * @return 候选店员列表
+     */
+    @InterceptorIgnore(tenantLine = "true")
+    @Select("""
+        <script>
+        SELECT user_id AS userId, user_name AS userName, nick_name AS nickName
+        FROM sys_user
+        WHERE tenant_id = #{tenantId} AND status = '0' AND del_flag = '0'
+        <if test="keyword != null and keyword != ''">
+          AND (user_name LIKE CONCAT('%', #{keyword}, '%') OR nick_name LIKE CONCAT('%', #{keyword}, '%'))
+        </if>
+        ORDER BY user_id ASC
+        LIMIT 100
+        </script>
+        """)
+    List<StaffCandidateVO> selectStaffCandidates(@Param("tenantId") String tenantId,
+                                                 @Param("keyword") String keyword);
 }

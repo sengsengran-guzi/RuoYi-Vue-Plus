@@ -1,7 +1,14 @@
 package org.dromara.gz.common.service;
 
+import org.dromara.common.mybatis.core.page.PageQuery;
+import org.dromara.common.mybatis.core.page.TableDataInfo;
+import org.dromara.gz.common.domain.bo.StaffBindingQueryBo;
 import org.dromara.gz.common.domain.dto.MpStaffPermission;
 import org.dromara.gz.common.domain.entity.GzUser;
+import org.dromara.gz.common.domain.vo.StaffBindingVO;
+import org.dromara.gz.common.domain.vo.StaffCandidateVO;
+
+import java.util.List;
 
 /**
  * mp 管理端权限底座服务（ADR-0004 / GZ-SYS-007）。
@@ -67,4 +74,40 @@ public interface IMpStaffPermissionService {
      * @return true=该用户原为店员并已解绑+踢出；false=本就非店员（无操作）
      */
     boolean unbindStaffAndKickout(Long gzUserId);
+
+    /**
+     * 分页查询 C 端用户 + 当前店员绑定快照（admin owner 自助绑定列表，GZ-SYS-007 AC10）。
+     *
+     * <p>按 openid / 手机号 / user_no 模糊查 gz_user（走多租户 + 软删自动过滤），对每行
+     * 已绑定的 staff_user_id 补查 sys_user 快照（账号名 / 昵称 / 是否有效）。</p>
+     *
+     * @param query     搜索条件（可全空）
+     * @param pageQuery 分页
+     * @return 绑定管理列表
+     */
+    TableDataInfo<StaffBindingVO> selectBindingPage(StaffBindingQueryBo query, PageQuery pageQuery);
+
+    /**
+     * 查可绑定的店员 sys_user 候选（owner 绑定时下拉，GZ-SYS-007 AC10）。
+     *
+     * <p>同当前 owner 租户 + 正常 + 未软删的 sys_user，按账号名 / 昵称模糊（keyword 可空）。</p>
+     *
+     * @param keyword 模糊关键字（可空）
+     * @return 候选店员列表
+     */
+    List<StaffCandidateVO> listStaffCandidates(String keyword);
+
+    /**
+     * owner 给某 gz_user 设 / 改绑店员身份（GZ-SYS-007 AC10）。
+     *
+     * <p>校验：gz_user 存在 + 目标 sys_user 存在且同租户(1001) + 正常 + 未软删；通过则 UPDATE
+     * gz_user.staff_user_id。绑定后该用户下次 mp 登录（或现有会话刷新）即获店员权限。
+     * 若该 gz_user 原已绑别的 sys_user → 先踢其现有会话（旧权限即时失效）再改绑。</p>
+     *
+     * @param gzUserId    要绑定的 gz_user.id
+     * @param staffUserId 目标店员 sys_user.user_id
+     * @return true=绑定成功
+     * @throws org.dromara.common.core.exception.ServiceException 校验不通过（gz_user/sys_user 不存在、跨租户、已停用/软删）
+     */
+    boolean bindStaff(Long gzUserId, Long staffUserId);
 }

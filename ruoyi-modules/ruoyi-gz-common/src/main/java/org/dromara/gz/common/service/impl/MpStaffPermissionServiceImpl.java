@@ -1,15 +1,25 @@
 package org.dromara.gz.common.service.impl;
 
 import cn.dev33.satoken.stp.StpUtil;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.dromara.common.core.constant.SystemConstants;
 import org.dromara.common.core.enums.UserType;
+import org.dromara.common.core.exception.ServiceException;
 import org.dromara.common.core.service.PermissionService;
+import org.dromara.common.mybatis.core.page.PageQuery;
+import org.dromara.common.mybatis.core.page.TableDataInfo;
+import org.dromara.common.satoken.utils.LoginHelper;
+import org.dromara.gz.common.domain.bo.StaffBindingQueryBo;
 import org.dromara.gz.common.domain.dto.MpStaffPermission;
 import org.dromara.gz.common.domain.dto.StaffSysUserCheck;
 import org.dromara.gz.common.domain.entity.GzUser;
+import org.dromara.gz.common.domain.vo.GzUserVO;
+import org.dromara.gz.common.domain.vo.StaffBindingVO;
+import org.dromara.gz.common.domain.vo.StaffCandidateVO;
 import org.dromara.gz.common.mapper.GzUserMapper;
 import org.dromara.gz.common.mapper.MpStaffSysUserMapper;
 import org.dromara.gz.common.service.IMpStaffPermissionService;
@@ -148,6 +158,105 @@ public class MpStaffPermissionServiceImpl implements IMpStaffPermissionService {
         }
 
         log.info("[mp-staff] 解绑 gz_user={}（原绑 sys_user={}）+ 即时踢出会话", gzUserId, staffUserId);
+        return true;
+    }
+
+    // ── AC10: owner admin 自助绑定管理 ──────────────────────────────────────
+
+    @Override
+    public TableDataInfo<StaffBindingVO> selectBindingPage(StaffBindingQueryBo query, PageQuery pageQuery) {
+        // gz_user 走多租户 + 软删自动过滤（与 GzUserController 同口径）
+        LambdaQueryWrapper<GzUser> lqw = new LambdaQueryWrapper<GzUser>()
+            .like(StringUtils.isNotBlank(query.getOpenid()), GzUser::getOpenid, query.getOpenid())
+            .like(StringUtils.isNotBlank(query.getMobile()), GzUser::getMobile, query.getMobile())
+            .like(StringUtils.isNotBlank(query.getUserNo()), GzUser::getUserNo, query.getUserNo())
+            .isNotNull(Boolean.TRUE.equals(query.getBoundOnly()), GzUser::getStaffUserId)
+            .orderByDesc(GzUser::getId);
+
+        Page<GzUserVO> page = gzUserMapper.selectVoPage(pageQuery.build(), lqw);
+
+        List<StaffBindingVO> rows = page.getRecords().stream().map(u -> {
+            StaffBindingVO vo = new StaffBindingVO();
+            vo.setId(u.getId());
+            vo.setUserNo(u.getUserNo());
+            vo.setOpenid(u.getOpenid());
+            vo.setNickname(u.getNickname());
+            vo.setMobile(u.getMobile());
+            vo.setAvatarUrl(u.getAvatarUrl());
+            return vo;
+        }).toList();
+
+        // 补当前绑定的 sys_user 快照（逐行直查；列表页 size 默认 10，量小）
+        for (StaffBindingVO vo : rows) {
+            GzUser entity = gzUserMapper.selectById(vo.getId());
+            Long staffUserId = entity == null ? null : entity.getStaffUserId();
+            vo.setStaffUserId(staffUserId);
+            if (staffUserId != null) {
+                StaffSysUserCheck check = staffSysUserMapper.selectCheckById(staffUserId);
+                if (check != null) {
+                    vo.setStaffUserName(check.getUserName());
+                    vo.setStaffNickName(check.getNickName());
+                    boolean active = SystemConstants.NORMAL.equals(check.getDelFlag())
+                        && SystemConstants.NORMAL.equals(check.getStatus())
+                        && StringUtils.equals(entity.getTenantId(), check.getTenantId());
+                    vo.setStaffActive(active);
+                } else {
+                    // 绑了一个已不存在的 sys_user（悬挂）— 标失效，供 owner 排查
+                    vo.setStaffActive(false);
+                }
+            }
+        }
+
+        TableDataInfo<StaffBindingVO> result = TableDataInfo.build();
+        result.setRows(rows);
+        result.setTotal(page.getTotal());
+        return result;
+    }
+
+    @Override
+    public List<StaffCandidateVO> listStaffCandidates(String keyword) {
+        String tenantId = LoginHelper.getTenantId();
+        return staffSysUserMapper.selectStaffCandidates(tenantId, StringUtils.trimToNull(keyword));
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public boolean bindStaff(Long gzUserId, Long staffUserId) {
+        if (gzUserId == null || staffUserId == null) {
+            throw new ServiceException("gzUserId 与 staffUserId 不能为空");
+        }
+        GzUser gzUser = gzUserMapper.selectById(gzUserId);
+        if (gzUser == null) {
+            throw new ServiceException("C 端用户不存在或已删除：" + gzUserId);
+        }
+        // 校验目标 sys_user：存在 + 同租户 + 正常 + 未软删（ADR 安全红线"租户一致"）
+        StaffSysUserCheck check = staffSysUserMapper.selectCheckById(staffUserId);
+        if (check == null) {
+            throw new ServiceException("店员账号不存在：" + staffUserId);
+        }
+        if (!SystemConstants.NORMAL.equals(check.getDelFlag())) {
+            throw new ServiceException("店员账号已删除，不能绑定");
+        }
+        if (!SystemConstants.NORMAL.equals(check.getStatus())) {
+            throw new ServiceException("店员账号已停用，不能绑定");
+        }
+        if (!StringUtils.equals(gzUser.getTenantId(), check.getTenantId())) {
+            throw new ServiceException("C 端用户与店员账号不同租户，不能绑定");
+        }
+
+        Long oldStaffUserId = gzUser.getStaffUserId();
+        // 改绑：若原已绑别的店员，先踢其现有会话（旧权限即时失效）再改绑
+        if (oldStaffUserId != null && !oldStaffUserId.equals(staffUserId)) {
+            try {
+                StpUtil.logout(UserType.APP_USER.getUserType() + ":" + gzUserId);
+            } catch (Exception e) {
+                log.warn("[mp-staff] 改绑前踢出 gz_user={} 旧会话失败: {}", gzUserId, e.getMessage());
+            }
+        }
+
+        staffSysUserMapper.bindStaffById(gzUserId, staffUserId);
+        log.info("[mp-staff] owner 绑定 gz_user={} → sys_user={}({})（原绑={}）",
+            gzUserId, staffUserId, check.getUserName(), oldStaffUserId);
         return true;
     }
 }
