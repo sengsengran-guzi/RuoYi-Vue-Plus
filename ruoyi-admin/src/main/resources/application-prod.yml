@@ -283,3 +283,16 @@ gz:
   bean:
     qr:
       signing-secret: ${GZ_BEAN_QR_SECRET:CHANGE_ME_BEFORE_PROD_DEPLOY}
+  # 微信支付通道（GZ-PAY-001）— 商户号下证前先保持 mock；下证 + Kevin 核对主体后改 client-mode=real。
+  # 强约束 #4：apiV3Key / 商户私钥不入 git，全部走 env var；空缺时 real profile @PostConstruct fail-fast。
+  pay:
+    client-mode: ${WECHAT_PAY_CLIENT_MODE:mock}
+    appid: ${WECHAT_PAY_APPID:CHANGE_ME_BEFORE_PROD_DEPLOY}
+    mch-id: ${WECHAT_PAY_MCH_ID:}
+    api-v3-key: ${WECHAT_PAY_API_V3_KEY:}
+    mch-cert-serial: ${WECHAT_PAY_CERT_SERIAL:}
+    private-key-path: ${WECHAT_PAY_PRIVATE_KEY_PATH:}
+    cert-path: ${WECHAT_PAY_CERT_PATH:}
+    notify-url: ${WECHAT_PAY_NOTIFY_URL:}
+    test:
+      amount-cent: 1

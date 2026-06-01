@@ -23,6 +23,19 @@
             <version>${revision}</version>
         </dependency>
 
+        <!-- GZ-NEWS-003 富文本 XSS 白名单清洗：jsoup Safelist.relaxed + 额外去危险节点（ticket AC4 / D2） -->
+        <dependency>
+            <groupId>org.jsoup</groupId>
+            <artifactId>jsoup</artifactId>
+            <version>1.17.2</version>
+        </dependency>
+
+        <!-- GZ-NEWS-004 定时发布 cron：SnailJob 执行器（@JobExecutor / JobArgs / ExecuteResult / SnailJobLog） -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-job</artifactId>
+        </dependency>
+
         <!-- GZ-NEWS-001 单元测试（Mockito + JUnit 5），与 ruoyi-gz-bean 同款 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

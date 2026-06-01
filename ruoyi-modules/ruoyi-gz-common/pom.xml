@@ -80,6 +80,27 @@
             <artifactId>ruoyi-common-excel</artifactId>
         </dependency>
 
+        <!-- GZ-PAY-001 超时关单 cron：SnailJob 执行器（@JobExecutor / JobArgs / ExecuteResult）。
+             下游 ADMIN-003（Wave 2）同样复用本依赖 —— 已在此一次性加好。 -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-job</artifactId>
+        </dependency>
+
+        <!-- GZ-ADMIN-003 看板手动刷新限流：@RateLimiter（强约束 #5，防误点并发触发快照 cron）。 -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-ratelimiter</artifactId>
+        </dependency>
+
+        <!-- GZ-PAY-001 微信支付 V3 官方 SDK（决策 D1，仓库内无其他 wxpay 包 → 无版本冲突）。
+             dev / 单测走 MockWechatPayClient 不实连；商户号到位后 real profile 用此 SDK。 -->
+        <dependency>
+            <groupId>com.github.wechatpay-apiv3</groupId>
+            <artifactId>wechatpay-java</artifactId>
+            <version>0.2.17</version>
+        </dependency>
+
         <!-- 单元测试（GZ-SYS-005 AC 7） -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

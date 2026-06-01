@@ -299,3 +299,10 @@ gz:
   bean:
     qr:
       signing-secret: ${GZ_BEAN_QR_SECRET:dev-sensenran-guzi-qr-secret-2026}
+  # 微信支付通道（GZ-PAY-001）— dev 走 mock（商户号未到位 + dev 无 HTTPS 接不了真回调）。
+  # 商户号到位后 staging/prod 切 client-mode=real + 注入 env var（见 application-prod.yml）。
+  pay:
+    client-mode: mock
+    appid: ${WECHAT_PAY_APPID:wx_dev_placeholder}
+    test:
+      amount-cent: 1
