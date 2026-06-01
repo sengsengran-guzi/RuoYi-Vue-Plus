@@ -85,9 +85,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # 仅暴露给宿主机 127.0.0.1（宝塔 nginx 反代时用），不直接对公网
+    # ⚠️ 调试期临时暴露公网 8080（域名+HTTPS 未就绪，小程序开发者工具需直连服务器后端）
+    # 上线前必须改回 "127.0.0.1:8080:8080"（仅宿主机回环，由宝塔 nginx 反代 + HTTPS）
     ports:
-      - "127.0.0.1:8080:8080"
+      - "8080:8080"
     environment:
       SPRING_PROFILES_ACTIVE: prod
       TZ: Asia/Shanghai
