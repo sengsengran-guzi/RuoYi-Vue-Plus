@@ -79,7 +79,7 @@ public interface GzNewsArticleMapper extends BaseMapperPlus<GzNewsArticle, GzNew
     @Update("<script>"
         + "UPDATE gz_news_article "
         + "SET status = 'published', publish_time = schedule_publish_time, update_time = now() "
-        + "WHERE status = 'scheduled' AND schedule_publish_time <= now() AND del_flag = '0' "
+        + "WHERE status = 'scheduled' AND schedule_publish_time &lt;= now() AND del_flag = '0' "
         + "AND id IN "
         + "<foreach collection='ids' item='id' open='(' separator=',' close=')'>#{id}</foreach>"
         + "</script>")

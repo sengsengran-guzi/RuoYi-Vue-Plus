@@ -112,6 +112,9 @@ spring:
     # 严格顺序（不允许乱序补跑）+ 启动校验已应用脚本 checksum（迁移文件一旦应用不可改）
     out-of-order: false
     validate-on-migrate: true
+    # 不使用 Flyway 占位符替换：迁移脚本即最终 SQL，注释中可自由写 ${ENV_VAR}（如支付 env var 名）
+    # 而不被当成 ${...} 占位符 hard-fail。env var 注入由应用运行时负责，不经 Flyway。
+    placeholder-replacement: false
 
 # Sa-Token配置
 sa-token:

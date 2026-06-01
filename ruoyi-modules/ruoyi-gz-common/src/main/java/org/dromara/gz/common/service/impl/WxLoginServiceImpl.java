@@ -11,10 +11,12 @@ import org.dromara.common.core.enums.UserType;
 import org.dromara.common.core.exception.ServiceException;
 import org.dromara.common.core.utils.ServletUtils;
 import org.dromara.common.satoken.utils.LoginHelper;
+import org.dromara.gz.common.domain.dto.MpStaffPermission;
 import org.dromara.gz.common.domain.dto.WxLoginRequest;
 import org.dromara.gz.common.domain.entity.GzUser;
 import org.dromara.gz.common.domain.vo.WxLoginVO;
 import org.dromara.gz.common.service.IGzUserService;
+import org.dromara.gz.common.service.IMpStaffPermissionService;
 import org.dromara.gz.common.service.IWxLoginService;
 import org.dromara.gz.common.wechat.SessionKeyStore;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
@@ -59,6 +61,7 @@ public class WxLoginServiceImpl implements IWxLoginService {
     private final WxMiniappProperties properties;
     private final IGzUserService gzUserService;
     private final SessionKeyStore sessionKeyStore;
+    private final IMpStaffPermissionService mpStaffPermissionService;
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -99,8 +102,11 @@ public class WxLoginServiceImpl implements IWxLoginService {
      * <p>对齐 ruoyi sa-token 多端机制（{@code clientid} header 由 mp 端注入；
      * token TTL 由 {@link WxMiniappProperties#getTokenTtlSeconds()} 控制，默认 7 天）。</p>
      *
-     * <p>menuPermission / rolePermission 不预填 — C 端 mp 用户不走菜单权限，业务路由用
-     * {@code @SaIgnore} + 业务层 {@code LoginHelper.getUserId()} 判定登录态即可。</p>
+     * <p><b>menuPermission / rolePermission 条件装载</b>（ADR-0004 mp 管理端权限底座）：
+     * 纯顾客（gz_user.staff_user_id 为 NULL）不带任何权限 — 业务路由用 {@code LoginHelper.getUserId()}
+     * 判定登录态即可。已绑定 sys_user 的店员 → 由 {@link IMpStaffPermissionService#resolve} 加载其
+     * ruoyi RBAC 角色 + 菜单权限装进 LoginUser，使 mp 管理端点能直接用标准 {@code @SaCheckPermission}
+     * （SaPermissionImpl 对当前 token 的 LoginUser 不区分 userType，直接返回其 menuPermission）。</p>
      *
      * <p><b>BUG-SYS-002-01 修复（2026-05-28）</b>：sa-token session 必须写入 {@code clientid} extra，
      * 否则 {@code ruoyi-common-security} 的 {@code SecurityConfig.check} 在第 68 行
@@ -115,6 +121,16 @@ public class WxLoginServiceImpl implements IWxLoginService {
         loginUser.setNickname(user.getNickname());
         loginUser.setUserType(UserType.APP_USER.getUserType());
         loginUser.setDeviceType("mp");
+
+        // ADR-0004：若绑定店员 sys_user → 加载其 ruoyi RBAC 权限到本 app_user 会话
+        MpStaffPermission staffPerm = mpStaffPermissionService.resolve(user);
+        if (staffPerm.isStaff()) {
+            loginUser.setRolePermission(staffPerm.getRolePermission());
+            loginUser.setMenuPermission(staffPerm.getMenuPermission());
+            log.info("[wx-login] 店员登录 gzUserId={} → 加载 sys_user={} 权限（roles={} perms={}）",
+                user.getId(), staffPerm.getStaffUserId(),
+                staffPerm.getRolePermission().size(), staffPerm.getMenuPermission().size());
+        }
 
         String clientId = resolveClientId();
 

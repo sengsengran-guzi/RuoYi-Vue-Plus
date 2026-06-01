@@ -84,6 +84,16 @@ public class GzUser extends TenantEntity {
     /** 是否禁用 0=正常 / 1=已禁用 */
     private Integer isDisabled;
 
+    /**
+     * 绑定的 ruoyi 店员账号 sys_user.user_id（ADR-0004 mp 管理端权限底座）。
+     *
+     * <p>NULL = 纯顾客（mp 登录不加载任何 RBAC）；非空 = 店员，登录时把该 sys_user 的
+     * 角色 + 菜单权限载入当前 app_user 会话，使 mp 管理端点能用标准 {@code @SaCheckPermission}。
+     * 绑定的 sys_user 须同租户(1001) + status 正常 + 未禁用，否则登录时降级为纯顾客
+     * （校验在 {@code WxLoginServiceImpl} / {@code MpStaffPermissionService}）。</p>
+     */
+    private Long staffUserId;
+
     /** 软删标志（0=正常 / 2=删除，对齐 ruoyi） */
     @TableLogic
     private String delFlag;

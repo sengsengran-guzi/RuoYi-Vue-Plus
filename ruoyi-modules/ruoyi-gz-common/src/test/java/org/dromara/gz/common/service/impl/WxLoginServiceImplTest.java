@@ -2,10 +2,12 @@ package org.dromara.gz.common.service.impl;
 
 import cn.dev33.satoken.stp.StpUtil;
 import org.dromara.common.core.exception.ServiceException;
+import org.dromara.gz.common.domain.dto.MpStaffPermission;
 import org.dromara.gz.common.domain.dto.WxLoginRequest;
 import org.dromara.gz.common.domain.entity.GzUser;
 import org.dromara.gz.common.domain.vo.WxLoginVO;
 import org.dromara.gz.common.service.IGzUserService;
+import org.dromara.gz.common.service.IMpStaffPermissionService;
 import org.dromara.gz.common.wechat.SessionKeyStore;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
 import org.dromara.gz.common.wechat.WxLoginAdapter;
@@ -54,6 +56,9 @@ class WxLoginServiceImplTest {
     @Mock
     private SessionKeyStore sessionKeyStore;
 
+    @Mock
+    private IMpStaffPermissionService mpStaffPermissionService;
+
     private WxMiniappProperties properties;
 
     private WxLoginServiceImpl wxLoginService;
@@ -61,7 +66,8 @@ class WxLoginServiceImplTest {
     @BeforeEach
     void setUp() {
         properties = new WxMiniappProperties();
-        wxLoginService = new WxLoginServiceImpl(wxLoginAdapter, properties, gzUserService, sessionKeyStore);
+        wxLoginService = new WxLoginServiceImpl(
+            wxLoginAdapter, properties, gzUserService, sessionKeyStore, mpStaffPermissionService);
     }
 
     @Test
@@ -89,6 +95,8 @@ class WxLoginServiceImplTest {
         fresh.setTenantId("1001");
         when(gzUserService.upsertByOpenid(eq(mockSession), eq("测试用户"), eq("https://example.com/avatar.png")))
             .thenReturn(fresh);
+        // 新用户为纯顾客（未绑定店员）— issueToken 内 resolve 返回空载荷
+        when(mpStaffPermissionService.resolve(any())).thenReturn(MpStaffPermission.customer());
 
         WxLoginRequest req = new WxLoginRequest();
         req.setCode("test-code-12345");
@@ -135,6 +143,7 @@ class WxLoginServiceImplTest {
             .build();
         existing.setTenantId("1001");
         when(gzUserService.upsertByOpenid(eq(mockSession), anyString(), anyString())).thenReturn(existing);
+        when(mpStaffPermissionService.resolve(any())).thenReturn(MpStaffPermission.customer());
 
         WxLoginRequest req = new WxLoginRequest();
         req.setCode("existing-code");

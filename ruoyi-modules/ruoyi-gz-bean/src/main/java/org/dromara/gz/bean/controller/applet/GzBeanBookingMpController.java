@@ -1,11 +1,15 @@
 package org.dromara.gz.bean.controller.applet;
 
+import cn.dev33.satoken.annotation.SaCheckPermission;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.domain.R;
+import org.dromara.common.log.annotation.Log;
+import org.dromara.common.log.enums.BusinessType;
 import org.dromara.common.satoken.utils.LoginHelper;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingSubmitBo;
+import org.dromara.gz.bean.domain.bo.GzBeanBookingVerifyScanBo;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingMpSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
 import org.dromara.gz.bean.service.IGzBeanBookingService;
@@ -145,5 +149,42 @@ public class GzBeanBookingMpController {
         }
         GzBeanBookingVO vo = bookingService.cancel(id, "user", String.valueOf(userId));
         return R.ok(vo);
+    }
+
+    /**
+     * mp 店员扫码核销（GZ-BEAN-011 / ADR-0004 决策 2）。
+     *
+     * <p>店员在 mp 个人中心「管理」区「核销」→ {@code wx.scanCode} 扫顾客预约码（payload
+     * {@code "BK|{bookingNo}|{verifyCode}"}）→ 调本端点。<b>复用</b> admin 同款
+     * {@code GzBeanBookingServiceImpl#verifyByQrPayload}（解析 + HMAC 校签 + pending→used），
+     * 不复制业务逻辑（CLAUDE.md 逻辑复用纪律）。</p>
+     *
+     * <p><b>权限</b>：{@code @SaCheckPermission("gz:bean:booking:verify")} —— 与 admin 同一权限 key、
+     * 同一套 ruoyi RBAC（已授 owner+staff）。纯顾客 app_user token 不带此权限 → sa-token 拦截 403
+     * （ADR-0004 底座：GZ-SYS-007 登录时把绑定店员的权限装进 app_user 会话）。</p>
+     *
+     * <pre>
+     * POST /app/gz/bean/booking/verify-scan
+     * Headers: Authorization / clientid: mp-applet-sensenran-guzi
+     * Body:    { "qrPayload": "BK|BK20260601000001|a1b2c3..." }
+     *
+     * 200 OK   { "code": 200, "data": { ...核销后 VO，status=used... } }
+     * 业务错误（R.code，mp 端按 code 决定提示）：
+     *   4007 BOOKING_NOT_FOUND       → 「无效核销码（预约不存在）」
+     *   4008 INVALID_STATUS          → 「该预约已核销 / 已取消 / 已过期」（msg 含当前状态）
+     *   4009 QR_PAYLOAD_MALFORMED    → 「核销码格式无法识别」
+     *   4010 QR_SIGNATURE_INVALID    → 「核销码无效或已被篡改」
+     * 403（无 verify 权限 / 纯顾客）→ sa-token NotPermissionException
+     * </pre>
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @Log(title = "拼豆预约扫码核销(mp)", businessType = BusinessType.UPDATE)
+    @PostMapping("/verify-scan")
+    public R<GzBeanBookingVO> verifyScan(@Validated @RequestBody GzBeanBookingVerifyScanBo bo) {
+        // 核销操作人：app_user username = "wx:{openid}"（落库 verified_by + 审计日志）
+        String operator = LoginHelper.getUsername();
+        log.info("[bean-booking-mp] verify-scan by={} payloadLen={}",
+            operator, bo.getQrPayload() == null ? 0 : bo.getQrPayload().length());
+        return R.ok(bookingService.verifyByQrPayload(bo.getQrPayload(), operator));
     }
 }
