@@ -100,6 +100,10 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      # 微信小程序真实 AppID/Secret（甲方提供）— 缺省 wxMOCK 时后端走 WxMockLoginAdapter（登录/手机号全 mock）。
+      # 配齐后自动切 WxRealLoginAdapter（jscode2session）+ WxRealPhoneAdapter（getuserphonenumber）。
+      WX_MA_APPID: ${WX_MA_APPID:-wxMOCK}
+      WX_MA_SECRET: ${WX_MA_SECRET:-}
     volumes:
       - ../../logs:/app/logs
     healthcheck:
