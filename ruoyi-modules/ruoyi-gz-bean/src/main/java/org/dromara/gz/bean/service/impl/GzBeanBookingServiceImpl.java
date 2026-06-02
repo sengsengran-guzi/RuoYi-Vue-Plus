@@ -19,6 +19,7 @@ import org.dromara.gz.bean.domain.entity.GzBeanSeat;
 import org.dromara.gz.bean.domain.entity.GzBeanStore;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingMpSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
+import org.dromara.gz.bean.domain.vo.GzBeanStaffOverviewVO;
 import org.dromara.gz.bean.exception.GzBeanErrorCode;
 import org.dromara.gz.bean.mapper.GzBeanBookingLogMapper;
 import org.dromara.gz.bean.mapper.GzBeanBookingMapper;
@@ -476,6 +477,54 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         // 列表（BEAN-006）也展示 storeName → 批量 enrich 避免 N+1；列表不需要 qrPayload（详情页才渲码）。
         enrichStoreInfoBatch(list);
         return list;
+    }
+
+    @Override
+    public GzBeanStaffOverviewVO selectStaffOverview(Long userId) {
+        if (userId == null) {
+            throw new ServiceException("未登录");
+        }
+        GzUser user = gzUserMapper.selectById(userId);
+        if (user == null) {
+            throw new ServiceException("user.notFound");
+        }
+        // 租户取自店员 gz_user.tenant_id（mp JWT tenant 不可靠，见 submit 注释同因）。
+        // V1.0 单租户单店 → 关多租户拦截器后显式按该租户 scope，避免 mp 会话 tenant 解析穿透。
+        String tenantId = user.getTenantId();
+        LocalDate today = LocalDate.now();
+        return TenantHelper.ignore(() -> {
+            long todayTotal = bookingMapper.selectCount(Wrappers.<GzBeanBooking>lambdaQuery()
+                .eq(GzBeanBooking::getTenantId, tenantId)
+                .eq(GzBeanBooking::getSessDate, today));
+            long todayPending = bookingMapper.selectCount(Wrappers.<GzBeanBooking>lambdaQuery()
+                .eq(GzBeanBooking::getTenantId, tenantId)
+                .eq(GzBeanBooking::getSessDate, today)
+                .eq(GzBeanBooking::getStatus, STATUS_PENDING));
+            long todayUsed = bookingMapper.selectCount(Wrappers.<GzBeanBooking>lambdaQuery()
+                .eq(GzBeanBooking::getTenantId, tenantId)
+                .eq(GzBeanBooking::getSessDate, today)
+                .eq(GzBeanBooking::getStatus, STATUS_USED));
+            long upcomingPending = bookingMapper.selectCount(Wrappers.<GzBeanBooking>lambdaQuery()
+                .eq(GzBeanBooking::getTenantId, tenantId)
+                .gt(GzBeanBooking::getSessDate, today)
+                .eq(GzBeanBooking::getStatus, STATUS_PENDING));
+            // 待到店列表：pending 且 sess_date >= 今天，按到店日/时段升序（最近的排最前），≤50
+            List<GzBeanBookingVO> pendingList = bookingMapper.selectVoList(Wrappers.<GzBeanBooking>lambdaQuery()
+                .eq(GzBeanBooking::getTenantId, tenantId)
+                .eq(GzBeanBooking::getStatus, STATUS_PENDING)
+                .ge(GzBeanBooking::getSessDate, today)
+                .orderByAsc(GzBeanBooking::getSessDate)
+                .orderByAsc(GzBeanBooking::getSlotStart)
+                .last("LIMIT 50"));
+            enrichStoreInfoBatch(pendingList);
+            return GzBeanStaffOverviewVO.builder()
+                .todayTotal(todayTotal)
+                .todayPending(todayPending)
+                .todayUsed(todayUsed)
+                .upcomingPending(upcomingPending)
+                .pendingList(pendingList)
+                .build();
+        });
     }
 
     @Override

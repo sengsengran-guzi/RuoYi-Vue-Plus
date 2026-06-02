@@ -6,6 +6,7 @@ import org.dromara.gz.bean.domain.bo.GzBeanBookingQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingSubmitBo;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingMpSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
+import org.dromara.gz.bean.domain.vo.GzBeanStaffOverviewVO;
 
 import java.time.LocalDate;
 import java.time.LocalTime;
@@ -154,6 +155,17 @@ public interface IGzBeanBookingService {
      * @param status 可选状态筛选
      */
     List<GzBeanBookingVO> selectMyMpList(Long userId, String status);
+
+    /**
+     * mp 店员/管理者经营概览（GZ-BEAN-008 扩展 — 小程序预约看板）。
+     *
+     * <p>4 个数（今日预约 / 今日待核销 / 今日已核销 / 未来待到店）+ 待到店预约列表
+     * （status=pending 且 sess_date≥今天，升序，≤50）。租户取自登录店员 gz_user.tenant_id
+     * （mp JWT tenant 不可靠，不依赖 LoginHelper），V1.0 单租户单店。</p>
+     *
+     * @param userId 当前登录店员的 gz_user ID
+     */
+    GzBeanStaffOverviewVO selectStaffOverview(Long userId);
 
     /**
      * 按 ID 查 VO（admin / mp 共用，权限由 Controller 层控制）。

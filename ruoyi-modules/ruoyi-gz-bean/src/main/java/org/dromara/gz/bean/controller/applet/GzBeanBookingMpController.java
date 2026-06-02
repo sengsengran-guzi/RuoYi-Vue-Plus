@@ -12,6 +12,7 @@ import org.dromara.gz.bean.domain.bo.GzBeanBookingSubmitBo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingVerifyScanBo;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingMpSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
+import org.dromara.gz.bean.domain.vo.GzBeanStaffOverviewVO;
 import org.dromara.gz.bean.service.IGzBeanBookingService;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -106,6 +107,28 @@ public class GzBeanBookingMpController {
             return R.fail(401, "未登录");
         }
         return R.ok(bookingService.selectMyMpList(userId, status));
+    }
+
+    /**
+     * mp 店员/管理者经营概览（GZ-BEAN-008 扩展 — 小程序「预约看板」）。
+     *
+     * <p>给绑定店员（owner/staff）在小程序看全店预约心里有数：4 个数 + 待到店列表。
+     * <b>权限</b>：{@code gz:bean:booking:list}（与 admin 列表同一 key，已授 owner+staff）。
+     * 纯顾客 app_user token 不带此权限 → sa-token 403。</p>
+     *
+     * <pre>
+     * GET /app/gz/bean/booking/staff/overview
+     * 200 OK { "code":200, "data": { todayTotal, todayPending, todayUsed, upcomingPending, pendingList:[...] } }
+     * </pre>
+     */
+    @SaCheckPermission("gz:bean:booking:list")
+    @GetMapping("/staff/overview")
+    public R<GzBeanStaffOverviewVO> staffOverview() {
+        Long userId = LoginHelper.getUserId();
+        if (userId == null) {
+            return R.fail(401, "未登录");
+        }
+        return R.ok(bookingService.selectStaffOverview(userId));
     }
 
     /**
