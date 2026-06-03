@@ -7,6 +7,10 @@ import org.dromara.gz.common.domain.entity.GzUser;
 import org.dromara.gz.common.domain.vo.GzUserVO;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
 
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+
 /**
  * gz_user 服务（GZ-SYS-003）。
  *
@@ -71,4 +75,23 @@ public interface IGzUserService {
      * @return 更新后的用户 entity
      */
     GzUser bindMobile(Long userId, String mobile);
+
+    /**
+     * 按手机号模糊解析用户 id 集合（GZ-ORD-105 admin 订单按手机号查单）。
+     *
+     * <p>admin 订单列表的 userPhone 模糊筛选：先在 gz_user 用 {@code mobile LIKE %?%} 解析命中
+     * user_id，再用结果集过滤 gz_ord_order.user_id（解耦订单模块与用户表，不写跨表 JOIN）。</p>
+     *
+     * @param mobileLike 手机号模糊串（空 / null → 返回空列表，调用方据此判定「无匹配」）
+     * @return 命中 user_id 列表（无匹配 → 空列表）
+     */
+    List<Long> selectIdsByMobileLike(String mobileLike);
+
+    /**
+     * 批量按 id 取用户（GZ-ORD-105 admin 订单列表回填手机号 / 昵称，防 N+1）。
+     *
+     * @param ids 用户 id 集合（空 → 空 map）
+     * @return id → GzUserVO 映射（含 mobile / nickname；缺失 id 不在 map 内）
+     */
+    Map<Long, GzUserVO> selectVoMapByIds(Collection<Long> ids);
 }

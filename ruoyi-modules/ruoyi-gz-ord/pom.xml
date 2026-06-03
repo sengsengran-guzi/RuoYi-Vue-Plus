@@ -13,7 +13,7 @@
 
     <description>
         谷子宇宙预定货品（V1.1）：商品 / SKU / 订单 / 物流 7→2 节点 / 三类订单聚合
-        D01 GZ-SYS-001 阶段仅 HelloController 占位（模块先建，V1.1 启动时填业务）
+        GZ-ORD-101 起填实：预购商品 + SKU 数据模型 + admin CRUD + 截止下架 SnailJob
     </description>
 
     <dependencies>
@@ -21,6 +21,35 @@
             <groupId>org.dromara</groupId>
             <artifactId>ruoyi-gz-common</artifactId>
             <version>${revision}</version>
+        </dependency>
+
+        <!-- GZ-ORD-104 跨域下单：取收货地址（IGzUserAddressService.getByIdForUser 校验归属 + snapshot）。
+             gz-user → gz-common 单向，gz-ord 依赖 gz-user 不构成循环（gz-user 不依赖 gz-ord）。 -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-gz-user</artifactId>
+            <version>${revision}</version>
+        </dependency>
+
+        <!-- GZ-ORD-101 商品富文本 description_html 写入白名单清洗：jsoup（复用 gz-news 同款，不引新依赖） -->
+        <dependency>
+            <groupId>org.jsoup</groupId>
+            <artifactId>jsoup</artifactId>
+            <version>1.17.2</version>
+        </dependency>
+
+        <!-- GZ-ORD-101 截止下架 cron：SnailJob 执行器（@JobExecutor / JobArgs / ExecuteResult / SnailJobLog）。
+             仓库调度框架 = SnailJob（com.aizuda），非 Quartz；gz-ord 原空脚手架无此依赖，本 ticket 显式新增。 -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-job</artifactId>
+        </dependency>
+
+        <!-- GZ-ORD-101 单元测试（Mockito + JUnit 5），与 ruoyi-gz-news / ruoyi-gz-bean 同款 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 

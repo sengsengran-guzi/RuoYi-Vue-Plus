@@ -8,16 +8,26 @@ import com.wechat.pay.java.core.notification.NotificationParser;
 import com.wechat.pay.java.core.notification.RequestParam;
 import com.wechat.pay.java.service.payments.jsapi.JsapiServiceExtension;
 import com.wechat.pay.java.service.payments.jsapi.model.Amount;
+import com.wechat.pay.java.service.payments.jsapi.model.CloseOrderRequest;
 import com.wechat.pay.java.service.payments.jsapi.model.Payer;
 import com.wechat.pay.java.service.payments.jsapi.model.PrepayRequest;
 import com.wechat.pay.java.service.payments.jsapi.model.PrepayWithRequestPaymentResponse;
+import com.wechat.pay.java.service.payments.jsapi.model.QueryOrderByOutTradeNoRequest;
 import com.wechat.pay.java.service.payments.model.Transaction;
+import com.wechat.pay.java.service.refund.RefundService;
+import com.wechat.pay.java.service.refund.model.AmountReq;
+import com.wechat.pay.java.service.refund.model.CreateRequest;
+import com.wechat.pay.java.service.refund.model.Refund;
+import com.wechat.pay.java.service.refund.model.RefundNotification;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.dromara.common.core.exception.ServiceException;
 import org.dromara.gz.common.pay.config.WechatPayProperties;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
+
+import java.time.LocalDate;
 
 /**
  * 微信支付 V3 通道真实实现（GZ-PAY-001 AC 9，官方 SDK wechatpay-java，决策 D1）。
@@ -46,6 +56,7 @@ public class WechatPayV3ClientImpl implements IWechatPayClient {
 
     private Config config;
     private JsapiServiceExtension jsapiService;
+    private RefundService refundService;
     private NotificationParser notificationParser;
 
     /**
@@ -67,6 +78,7 @@ public class WechatPayV3ClientImpl implements IWechatPayClient {
             .apiV3Key(props.getApiV3Key())
             .build();
         this.jsapiService = new JsapiServiceExtension.Builder().config(config).signType("RSA").build();
+        this.refundService = new RefundService.Builder().config(config).build();
         this.notificationParser = new NotificationParser((NotificationConfig) config);
         log.info("[gz-pay] WechatPayV3ClientImpl 初始化完成（real，mch_id={}）", mask(props.getMchId()));
     }
@@ -133,6 +145,105 @@ public class WechatPayV3ClientImpl implements IWechatPayClient {
         } catch (ValidationException e) {
             // 验签失败 → 转业务异常，不静默（AC 6 / CLAUDE.md §6 #7）
             throw new WechatPayVerifyException("微信回调验签失败: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public QueryResult queryByOutTradeNo(String outTradeNo) {
+        QueryOrderByOutTradeNoRequest request = new QueryOrderByOutTradeNoRequest();
+        request.setMchid(props.getMchId());
+        request.setOutTradeNo(outTradeNo);
+        Transaction tx = jsapiService.queryOrderByOutTradeNo(request);
+        Long payerTotal = tx.getAmount() != null && tx.getAmount().getPayerTotal() != null
+            ? tx.getAmount().getPayerTotal().longValue() : null;
+        String tradeState = tx.getTradeState() != null ? tx.getTradeState().name() : null;
+        log.info("[gz-pay] queryByOutTradeNo out_trade_no={} → trade_state={}", outTradeNo, tradeState);
+        // fee_cent 留 null（查单不含通道费，由 PAY-104 拉 fundflowbill 回写）；rawBody 用 SDK toString 入审计
+        return new QueryResult(tx.getOutTradeNo(), tx.getTransactionId(), tradeState, payerTotal, null, tx.toString());
+    }
+
+    @Override
+    public void closeOrder(String outTradeNo) {
+        CloseOrderRequest request = new CloseOrderRequest();
+        request.setMchid(props.getMchId());
+        request.setOutTradeNo(outTradeNo);
+        jsapiService.closeOrder(request);
+        log.info("[gz-pay] closeOrder out_trade_no={}（微信侧关单成功）", outTradeNo);
+    }
+
+    /**
+     * 拉取资金账单（GZ-PAY-104，doc/11 F4.3 / F9.2）。
+     *
+     * <p><b>真实流程</b>（商户号下证后实现）：① 用 SDK 调
+     * {@code GET /v3/bill/fundflowbill?bill_date=yyyy-MM-dd&account_type=BASIC}（自动签名 + 验签平台证书）
+     * 拿响应 {@code download_url} + {@code hash_type=SHA1} + {@code hash_value} → ② 用同一商户认证 GET
+     * {@code download_url} 取 gzip 二进制 → ③ GZIPInputStream 解压成 UTF-8 CSV 文本 → ④ 校验下载文件 sha1
+     * = {@code hash_value}（service 也会复校，AC3）→ 返回 {@link FundFlowBill}。</p>
+     *
+     * <p><b>降级现状</b>（外部前置风险，ticket §备注 / D08 README R1）：商户号 + cert + apiV3Key 未到位，
+     * 真实账单格式（列序 / 手续费列名）以官方文档为准但<b>未做真实端到端验证</b>。本卡 DoD 仅认 mock 全链路；
+     * real 路径在 buffer 期商户配置就绪后联调补打。当前 real 模式直接 fail-fast 抛错，避免 prod 半实现裸奔
+     * 灌脏 fee_cent。</p>
+     *
+     * @param billDate 账单业务日
+     * @return 资金账单（CSV + sha1）
+     */
+    @Override
+    public FundFlowBill downloadFundFlowBill(LocalDate billDate) {
+        // 真实端到端联调依赖甲方商户配置（外部前置风险）。real 模式未联调前 fail-fast，
+        // 不返回半实现结果污染 fee_cent 回写（CLAUDE.md §6 #7 不吞异常 / 不灌脏数据）。
+        throw new ServiceException(
+            "WechatPayV3ClientImpl.downloadFundFlowBill 待商户号下证后联调（GZ-PAY-104 外部前置风险）。" +
+            "联调步骤见本方法 javadoc；当前请用 gz.pay.client-mode=mock 跑 mock 全链路自测。bill_date=" + billDate);
+    }
+
+    // ============================================================
+    //  GZ-PAY-103 退款 / 退款回调（real 实现）
+    // ============================================================
+
+    @Override
+    public RefundResult refund(RefundRequest req) {
+        CreateRequest request = new CreateRequest();
+        request.setOutTradeNo(req.outTradeNo());
+        request.setOutRefundNo(req.outRefundNo());
+        request.setReason(req.reason());
+        request.setNotifyUrl(req.notifyUrl());
+
+        AmountReq amount = new AmountReq();
+        amount.setRefund(req.refundAmountCent());
+        amount.setTotal(req.totalAmountCent());
+        amount.setCurrency("CNY");
+        request.setAmount(amount);
+
+        // SDK 同步提交退款申请；受理失败抛 SDK 运行时异常 → service 捕获回滚 paid（doc/10 §6.E4）
+        Refund refund = refundService.create(request);
+        String status = refund.getStatus() != null ? refund.getStatus().name() : null;
+        log.info("[gz-pay] refund out_trade_no={} out_refund_no={} → refund_id={} status={}",
+            req.outTradeNo(), req.outRefundNo(), refund.getRefundId(), status);
+        return new RefundResult(refund.getRefundId(), status, refund.toString());
+    }
+
+    @Override
+    public RefundCallbackResult parseAndVerifyRefundNotify(NotifyContext ctx) {
+        RequestParam requestParam = new RequestParam.Builder()
+            .serialNumber(ctx.serial())
+            .nonce(ctx.nonce())
+            .signature(ctx.signature())
+            .timestamp(ctx.timestamp())
+            .body(ctx.body())
+            .build();
+        try {
+            // 复用同一套 SDK NotificationParser AES-GCM 验签 + 解密（强约束 #2），解析为退款回调模型
+            RefundNotification rn = notificationParser.parse(requestParam, RefundNotification.class);
+            String refundStatus = rn.getRefundStatus() != null ? rn.getRefundStatus().name() : null;
+            return new RefundCallbackResult(
+                rn.getRefundId(),
+                rn.getOutRefundNo(),
+                rn.getOutTradeNo(),
+                refundStatus,
+                rn.toString());
+        } catch (ValidationException e) {
+            throw new WechatPayVerifyException("微信退款回调验签失败: " + e.getMessage(), e);
         }
     }
 

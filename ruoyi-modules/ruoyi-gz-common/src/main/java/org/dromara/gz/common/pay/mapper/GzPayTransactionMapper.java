@@ -108,6 +108,106 @@ public interface GzPayTransactionMapper extends BaseMapperPlus<GzPayTransaction,
     int markTimeout(@Param("id") Long id, @Param("closedTime") LocalDateTime closedTime);
 
     /**
+     * 扫主动查单兜底窗口内的 pending 订单 id（GZ-PAY-102 AC 2，doc/10 §6.N7）。
+     *
+     * <p>条件：{@code status='pending'} AND 创建时间在 [now-24h, now-5min]（超 5min 才查，避免和
+     * 正常回调抢；超 24h 老单不查，由 AC 8 关单逻辑兜底）+ {@code LIMIT 100}（防雪崩，单轮控量）。
+     * 多租户由 service 用 {@code TenantHelper.ignore} 全租户扫（cron 无登录态，与超时关单同思路）。</p>
+     *
+     * @param windowStart 窗口下界（now - 24h）
+     * @param windowEnd   窗口上界（now - 5min）
+     * @param limit       单轮上限（100）
+     * @return 待查单的 pending 订单 id 列表
+     */
+    @Select("SELECT id FROM gz_pay_transaction " +
+        "WHERE status = 'pending' AND del_flag = '0' " +
+        "AND create_time >= #{windowStart} AND create_time < #{windowEnd} " +
+        "ORDER BY id LIMIT #{limit}")
+    List<Long> selectReconcilePendingIds(@Param("windowStart") LocalDateTime windowStart,
+                                         @Param("windowEnd") LocalDateTime windowEnd,
+                                         @Param("limit") int limit);
+
+    /**
+     * 行级锁加载订单（GZ-PAY-102 AC 4 / AC 5，{@code SELECT ... FOR UPDATE}）。
+     *
+     * <p>主动查单补单在锁行后做状态判定 + 推进，与被动回调走同一幂等基础（强约束 #1）。
+     * 必须在事务内调用；锁定后行被并发查单 / 回调阻塞直到本事务提交（防双推进）。</p>
+     *
+     * @param id 订单 id
+     * @return 锁定的订单行（无则 null）
+     */
+    @Select("SELECT * FROM gz_pay_transaction WHERE id = #{id} AND del_flag = '0' FOR UPDATE")
+    GzPayTransaction selectByIdForUpdate(@Param("id") Long id);
+
+    /**
+     * 条件 UPDATE 标记订单关闭（GZ-PAY-102 AC 7：微信侧 CLOSED / REVOKED → 本地 closed）。
+     *
+     * <p>WHERE 含 {@code status='pending'} 守卫 → 原子 + 幂等（已非 pending 则 affected=0 跳过）。</p>
+     *
+     * @param id         订单 id
+     * @param closedTime 关闭时间
+     * @return 受影响行数（1 = 标记成功 / 0 = 已非 pending，幂等跳过）
+     */
+    @Update("UPDATE gz_pay_transaction " +
+        "SET status = 'closed', closed_time = #{closedTime}, version = version + 1 " +
+        "WHERE id = #{id} AND status = 'pending' AND del_flag = '0'")
+    int markClosed(@Param("id") Long id, @Param("closedTime") LocalDateTime closedTime);
+
+    /**
+     * 条件 UPDATE 标记订单失败（GZ-PAY-102 AC 7：微信侧 PAYERROR → 本地 failed）。
+     *
+     * <p>WHERE 含 {@code status='pending'} 守卫 → 原子 + 幂等。failed 态不写 closed_time（非关单语义）。</p>
+     *
+     * @param id 订单 id
+     * @return 受影响行数（1 = 标记成功 / 0 = 已非 pending，幂等跳过）
+     */
+    @Update("UPDATE gz_pay_transaction " +
+        "SET status = 'failed', version = version + 1 " +
+        "WHERE id = #{id} AND status = 'pending' AND del_flag = '0'")
+    int markFailed(@Param("id") Long id);
+
+    /**
+     * 退款申请：paid → refunding（GZ-PAY-103 AC 2，条件 UPDATE 原子推进）。
+     *
+     * <p>WHERE 含 {@code status='paid'} 守卫 → 原子：affected=1 推进成功 / affected=0 已非 paid
+     * （已退款 / 已 refunding 等，防并发重复发起，与 countActiveByTransactionId 双重防护）。</p>
+     *
+     * @param id 支付交易行 id
+     * @return 受影响行数（1 = 成功推进 refunding / 0 = 已非 paid，拒绝退款）
+     */
+    @Update("UPDATE gz_pay_transaction " +
+        "SET status = 'refunding', version = version + 1 " +
+        "WHERE id = #{id} AND status = 'paid' AND del_flag = '0'")
+    int markRefunding(@Param("id") Long id);
+
+    /**
+     * 退款回调 SUCCESS：refunding → refunded（GZ-PAY-103 AC 3）。
+     *
+     * <p>WHERE 含 {@code status='refunding'} 守卫 → 原子 + 幂等。</p>
+     *
+     * @param id 支付交易行 id
+     * @return 受影响行数（1 = 推进成功 / 0 = 已非 refunding，幂等跳过）
+     */
+    @Update("UPDATE gz_pay_transaction " +
+        "SET status = 'refunded', version = version + 1 " +
+        "WHERE id = #{id} AND status = 'refunding' AND del_flag = '0'")
+    int markRefunded(@Param("id") Long id);
+
+    /**
+     * 退款受理失败回滚：refunding → paid（GZ-PAY-103 AC 2，doc/10 §6.E4）。
+     *
+     * <p>WHERE 含 {@code status='refunding'} 守卫 → 原子。微信受理失败时把交易行回滚回 paid，
+     * 允许 admin 重新发起退款。</p>
+     *
+     * @param id 支付交易行 id
+     * @return 受影响行数（1 = 回滚成功 / 0 = 已非 refunding）
+     */
+    @Update("UPDATE gz_pay_transaction " +
+        "SET status = 'paid', version = version + 1 " +
+        "WHERE id = #{id} AND status = 'refunding' AND del_flag = '0'")
+    int rollbackRefundingToPaid(@Param("id") Long id);
+
+    /**
      * 取当日某业务类型已生成的最大日内序号（out_trade_no 生成用，doc/10 §6 Q6.3）。
      *
      * <p>out_trade_no 格式 {@code <PREFIX>-yyyyMMdd-6位序号}，按 prefix + 日期 LIKE 取当日最大序号 + 1。

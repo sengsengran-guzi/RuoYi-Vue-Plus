@@ -3,10 +3,13 @@ package org.dromara.gz.common.pay.service.internal;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.extern.slf4j.Slf4j;
+import org.dromara.common.core.exception.ServiceException;
 import org.dromara.gz.common.pay.config.WechatPayProperties;
+import org.dromara.gz.common.pay.service.internal.bill.FundFlowBillCsvBuilder;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
+import java.time.LocalDate;
 import java.util.UUID;
 
 /**
@@ -36,6 +39,40 @@ public class MockWechatPayClient implements IWechatPayClient {
     public static final String MOCK_PREPAY_PREFIX = "mock_prepay_";
 
     private final ObjectMapper objectMapper = new ObjectMapper();
+
+    /**
+     * 测试可注入的查单 trade_state（GZ-PAY-102 AC3）。默认 NOTPAY（未支付）—— 单测据此覆盖
+     * SUCCESS / NOTPAY / USERPAYING / CLOSED / REVOKED / PAYERROR 各分支。
+     */
+    private String queryTradeState = "NOTPAY";
+
+    /**
+     * 测试可注入的查单 payer_total（GZ-PAY-102）。SUCCESS 场景下回填到 QueryResult.payerTotal。
+     */
+    private Long queryPayerTotal;
+
+    /**
+     * mock 关单调用计数（GZ-PAY-102 AC8 断言用：超 30min NOTPAY → closeOrder 被调）。
+     */
+    private int closeOrderCallCount;
+
+    /**
+     * 测试可注入的资金账单 CSV 覆盖（GZ-PAY-104 AC7）。非 null 时 {@link #downloadFundFlowBill} 直接返回它，
+     * 由调用方（单测）构造含「正常匹配 / 孤儿 / 缺账」的可控账单。null 时返回内置默认 mock 账单。
+     */
+    private String overrideBillCsv;
+
+    /**
+     * 测试可注入的 hash 覆盖（GZ-PAY-104 AC3）。非 null 时 {@link #downloadFundFlowBill} 返回它作为微信声明
+     * hash —— 与 CSV 真实 sha1 不一致即驱动 service 校验失败抛错路径。null 时返回 CSV 真实 sha1（匹配）。
+     */
+    private String overrideHashValue;
+
+    /**
+     * 测试可注入的退款受理失败开关（GZ-PAY-103 AC9）。true → {@link #refund} 抛异常模拟微信受理失败，
+     * 驱动 service「受理失败 → gz_pay_refund=failed + transaction 回滚 paid」分支。默认 false（受理成功）。
+     */
+    private boolean refundAcceptFail = false;
 
     public MockWechatPayClient(WechatPayProperties properties) {
         log.warn("[gz-pay] MockWechatPayClient 已激活（client-mode != real）—— 不连真实微信通道，仅供 dev/单测/商户号未到位降级。");
@@ -94,5 +131,153 @@ public class MockWechatPayClient implements IWechatPayClient {
         node.put("trade_state", "SUCCESS");
         node.put("payer_total", payerTotal);
         return node.toString();
+    }
+
+    // ============================================================
+    //  GZ-PAY-102 主动查单 / 关单（mock 实现）
+    // ============================================================
+
+    @Override
+    public QueryResult queryByOutTradeNo(String outTradeNo) {
+        String txnId = "SUCCESS".equalsIgnoreCase(queryTradeState) ? "mock_query_txn_" + outTradeNo : null;
+        Long payerTotal = "SUCCESS".equalsIgnoreCase(queryTradeState) ? queryPayerTotal : null;
+        String rawBody = "{\"out_trade_no\":\"" + outTradeNo + "\",\"trade_state\":\"" + queryTradeState
+            + "\",\"transaction_id\":" + (txnId == null ? "null" : "\"" + txnId + "\"")
+            + ",\"source\":\"query\"}";
+        log.info("[gz-pay-mock] queryByOutTradeNo out_trade_no={} → trade_state={}", outTradeNo, queryTradeState);
+        return new QueryResult(outTradeNo, txnId, queryTradeState, payerTotal, null, rawBody);
+    }
+
+    @Override
+    public void closeOrder(String outTradeNo) {
+        closeOrderCallCount++;
+        log.info("[gz-pay-mock] closeOrder out_trade_no={}（mock 直接成功，累计调 {} 次）", outTradeNo, closeOrderCallCount);
+    }
+
+    /**
+     * 单测注入查单 trade_state（GZ-PAY-102 AC3）。驱动 scanAndReconcile 各分支。
+     *
+     * @param tradeState SUCCESS / NOTPAY / USERPAYING / CLOSED / REVOKED / PAYERROR
+     */
+    public void setQueryTradeState(String tradeState) {
+        this.queryTradeState = tradeState;
+    }
+
+    /**
+     * 单测注入 SUCCESS 场景的 payer_total（分）。
+     *
+     * @param payerTotalCent 用户实付金额（分）
+     */
+    public void setQueryPayerTotal(Long payerTotalCent) {
+        this.queryPayerTotal = payerTotalCent;
+    }
+
+    /**
+     * 取 mock 关单累计调用次数（GZ-PAY-102 AC8 断言：超 30min NOTPAY → closeOrder 被调）。
+     *
+     * @return closeOrder 累计调用次数
+     */
+    public int getCloseOrderCallCount() {
+        return closeOrderCallCount;
+    }
+
+    // ============================================================
+    //  GZ-PAY-103 退款 / 退款回调（mock 实现）
+    // ============================================================
+
+    @Override
+    public RefundResult refund(RefundRequest req) {
+        if (refundAcceptFail) {
+            // 模拟微信受理失败（余额不足 / 参数错误等）—— service 据此回滚 paid（AC9 受理失败分支）
+            throw new ServiceException("[gz-pay-mock] 模拟退款受理失败 out_refund_no=" + req.outRefundNo());
+        }
+        String refundId = "mock_refund_id_" + req.outRefundNo();
+        log.info("[gz-pay-mock] refund out_trade_no={} out_refund_no={} amount={} → 受理成功 refund_id={}（PROCESSING）",
+            req.outTradeNo(), req.outRefundNo(), req.refundAmountCent(), refundId);
+        String rawBody = "{\"out_refund_no\":\"" + req.outRefundNo() + "\",\"refund_id\":\"" + refundId
+            + "\",\"status\":\"PROCESSING\"}";
+        return new RefundResult(refundId, "PROCESSING", rawBody);
+    }
+
+    @Override
+    public RefundCallbackResult parseAndVerifyRefundNotify(NotifyContext ctx) {
+        // mock 不验签：把 body 当已解密 JSON 解析。body 非法 → throw（模拟验签/解析失败路径）。
+        try {
+            ObjectNode node = (ObjectNode) objectMapper.readTree(ctx.body());
+            String refundId = node.path("refund_id").asText(null);
+            String outRefundNo = node.path("out_refund_no").asText(null);
+            String outTradeNo = node.path("out_trade_no").asText(null);
+            String refundStatus = node.path("refund_status").asText("SUCCESS");
+            if (outRefundNo == null || refundId == null) {
+                throw new WechatPayVerifyException("mock 退款回调 body 缺 out_refund_no / refund_id");
+            }
+            return new RefundCallbackResult(refundId, outRefundNo, outTradeNo, refundStatus, ctx.body());
+        } catch (WechatPayVerifyException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new WechatPayVerifyException("mock 退款回调 body 解析失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 构造 mock 退款回调 body（GZ-PAY-103 单测 / 模拟退款回调用）。
+     *
+     * @param outTradeNo   原业务支付订单号
+     * @param outRefundNo  商户退款单号（refund_no）
+     * @param refundId     模拟微信退款单号
+     * @param refundStatus 退款状态（SUCCESS / ABNORMAL / CLOSED）
+     * @return JSON body 字符串
+     */
+    public String buildMockRefundCallbackBody(String outTradeNo, String outRefundNo, String refundId, String refundStatus) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("out_trade_no", outTradeNo);
+        node.put("out_refund_no", outRefundNo);
+        node.put("refund_id", refundId);
+        node.put("refund_status", refundStatus);
+        return node.toString();
+    }
+
+    /**
+     * 单测注入退款受理失败（GZ-PAY-103 AC9：true → refund 抛异常驱动回滚 paid 分支）。
+     *
+     * @param fail true = 模拟受理失败
+     */
+    public void setRefundAcceptFail(boolean fail) {
+        this.refundAcceptFail = fail;
+    }
+
+    // ============================================================
+    //  GZ-PAY-104 资金账单（mock 实现）
+    // ============================================================
+
+    @Override
+    public FundFlowBill downloadFundFlowBill(LocalDate billDate) {
+        String csv = overrideBillCsv != null
+            ? overrideBillCsv
+            : FundFlowBillCsvBuilder.defaultMockBill(billDate);
+        // 默认返回 CSV 真实 sha1（service 校验通过）；overrideHashValue 非 null 时返回坏 hash 驱动校验失败路径
+        String hash = overrideHashValue != null
+            ? overrideHashValue
+            : FundFlowBillCsvBuilder.sha1Hex(csv);
+        log.info("[gz-pay-mock] downloadFundFlowBill bill_date={} → {} 行 CSV（mock）", billDate, csv.split("\n").length);
+        return new FundFlowBill(billDate, csv, hash);
+    }
+
+    /**
+     * 单测注入资金账单 CSV（GZ-PAY-104 AC7）。传 null 恢复内置默认账单。
+     *
+     * @param csv 完整 CSV 文本（含表头 + 数据行 + 汇总行）
+     */
+    public void setOverrideBillCsv(String csv) {
+        this.overrideBillCsv = csv;
+    }
+
+    /**
+     * 单测注入微信声明 hash（GZ-PAY-104 AC3：传与 CSV 不符的 hash 制造校验失败）。传 null 恢复真实 sha1。
+     *
+     * @param hash 微信声明 sha1
+     */
+    public void setOverrideHashValue(String hash) {
+        this.overrideHashValue = hash;
     }
 }

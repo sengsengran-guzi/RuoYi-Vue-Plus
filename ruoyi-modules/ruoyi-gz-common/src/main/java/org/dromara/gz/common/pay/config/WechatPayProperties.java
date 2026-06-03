@@ -45,6 +45,9 @@ public class WechatPayProperties {
     /** 回调地址完整 URL（统一下单 notify_url 传给微信，需含域名；real 必填） */
     private String notifyUrl;
 
+    /** 退款回调地址完整 URL（GZ-PAY-103，退款申请 refund_notify_url 传给微信，需含域名；real 必填） */
+    private String refundNotifyUrl;
+
     /** 测试单配置 */
     private Test test = new Test();
 

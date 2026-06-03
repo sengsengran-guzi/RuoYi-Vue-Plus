@@ -136,6 +136,32 @@ public class GzUserServiceImpl implements IGzUserService {
         return user;
     }
 
+    @Override
+    public java.util.List<Long> selectIdsByMobileLike(String mobileLike) {
+        if (StrUtil.isBlank(mobileLike)) {
+            return java.util.Collections.emptyList();
+        }
+        LambdaQueryWrapper<GzUser> lqw = new LambdaQueryWrapper<GzUser>()
+            .select(GzUser::getId)
+            .like(GzUser::getMobile, mobileLike);
+        return baseMapper.selectList(lqw).stream()
+            .map(GzUser::getId)
+            .toList();
+    }
+
+    @Override
+    public java.util.Map<Long, GzUserVO> selectVoMapByIds(java.util.Collection<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return java.util.Collections.emptyMap();
+        }
+        java.util.List<GzUserVO> list = baseMapper.selectVoByIds(ids);
+        java.util.Map<Long, GzUserVO> map = new java.util.HashMap<>(list.size());
+        for (GzUserVO vo : list) {
+            map.put(vo.getId(), vo);
+        }
+        return map;
+    }
+
     /**
      * 构建查询 wrapper —— 多租户 / 软删由拦截器自动 append，本方法只显式拼业务过滤。
      */

@@ -2,6 +2,7 @@ package org.dromara.gz.common.pay.service;
 
 import org.dromara.common.tenant.helper.TenantHelper;
 import org.dromara.gz.common.pay.config.WechatPayProperties;
+import org.dromara.gz.common.pay.domain.bo.CreateOrderBo;
 import org.dromara.gz.common.pay.domain.bo.GzPayTestCreateBo;
 import org.dromara.gz.common.pay.domain.entity.GzPayCallbackLog;
 import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
@@ -17,6 +18,7 @@ import org.dromara.gz.common.pay.service.internal.IWechatPayClient.JsapiPayParam
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.NotifyContext;
 import org.dromara.gz.common.pay.service.internal.PayOrderNoGenerator;
 import org.dromara.gz.common.pay.service.internal.WechatPayVerifyException;
+import org.dromara.gz.common.pay.service.spi.PayCallbackDispatcher;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -67,6 +69,9 @@ class GzPayTransactionServiceImplTest {
     @Mock
     private IWechatPayClient wechatPayClient;
 
+    @Mock
+    private PayCallbackDispatcher callbackDispatcher;
+
     private WechatPayProperties payProperties;
 
     private GzPayTransactionServiceImpl service;
@@ -77,7 +82,7 @@ class GzPayTransactionServiceImplTest {
         payProperties.setClientMode("mock");
         payProperties.getTest().setAmountCent(1L);
         service = new GzPayTransactionServiceImpl(
-            transactionMapper, callbackLogMapper, orderNoGenerator, wechatPayClient, payProperties);
+            transactionMapper, callbackLogMapper, orderNoGenerator, wechatPayClient, payProperties, callbackDispatcher);
     }
 
     // ============================================================
@@ -132,6 +137,8 @@ class GzPayTransactionServiceImplTest {
         verify(transactionMapper).markPaid(eq(1001L), eq(0), eq("wx_txn_1"), any(), any());
         // received + processed 两条审计日志
         verify(callbackLogMapper, times(2)).insert(any(GzPayCallbackLog.class));
+        // markPaid 成功 → SPI 分发被调一次（test 单 dispatcher 内部跳过，但 service 仍调 dispatch）
+        verify(callbackDispatcher, times(1)).dispatch(any(GzPayTransaction.class));
     }
 
     // ============================================================
@@ -157,6 +164,8 @@ class GzPayTransactionServiceImplTest {
         verify(transactionMapper, never()).markPaid(anyLong(), any(), anyString(), any(), any());
         // received + duplicated 两条
         verify(callbackLogMapper, times(2)).insert(any(GzPayCallbackLog.class));
+        // 已 paid 重复回调 → 不重复分发 SPI handler（AC 6 第一道防线：onPaid 至多一次）
+        verify(callbackDispatcher, never()).dispatch(any(GzPayTransaction.class));
     }
 
     // ============================================================
@@ -203,6 +212,8 @@ class GzPayTransactionServiceImplTest {
         verify(transactionMapper).markPaid(eq(1001L), eq(0), eq("wx_txn_1"), any(), any());
         // received + duplicated 两条
         verify(callbackLogMapper, times(2)).insert(any(GzPayCallbackLog.class));
+        // 乐观锁 affected=0（并发已处理）→ 不重复分发 SPI handler（AC 6 第二道防线）
+        verify(callbackDispatcher, never()).dispatch(any(GzPayTransaction.class));
     }
 
     // ============================================================
@@ -230,5 +241,202 @@ class GzPayTransactionServiceImplTest {
             verify(transactionMapper).markTimeout(eq(2001L), any());
             verify(transactionMapper).markTimeout(eq(2002L), any());
         }
+    }
+
+    // ============================================================
+    //  PAY-101 AC 1：通用业务建单（createBusinessOrder）
+    // ============================================================
+
+    @Test
+    @DisplayName("PAY-101 AC 1：createBusinessOrder(preorder) → 落 created + business_type/business_order_no 写入 + created→pending")
+    void createBusinessOrder_preorder_happyPath() {
+        CreateOrderBo bo = CreateOrderBo.builder()
+            .businessType(org.dromara.gz.common.pay.enums.PayBusinessType.PREORDER)
+            .businessOrderNo("PREORD-ORDER-001")
+            .amountCent(9900L)
+            .openid("openid_buyer")
+            .userId(2001L)
+            .description("谷子宇宙预购单")
+            .build();
+
+        when(orderNoGenerator.generate(org.dromara.gz.common.pay.enums.PayBusinessType.PREORDER))
+            .thenReturn("PREORD-20260604-000001");
+        org.mockito.ArgumentCaptor<GzPayTransaction> insertCap = org.mockito.ArgumentCaptor.forClass(GzPayTransaction.class);
+        doAnswer(inv -> {
+            GzPayTransaction tx = inv.getArgument(0);
+            tx.setId(3001L);
+            return 1;
+        }).when(transactionMapper).insert(insertCap.capture());
+        when(wechatPayClient.createJsapiOrder(any())).thenReturn("mock_prepay_PREORD-20260604-000001");
+        when(transactionMapper.markPending(eq(3001L), anyString())).thenReturn(1);
+        when(wechatPayClient.buildPayParams(anyString()))
+            .thenReturn(new JsapiPayParams("1717480000", "noncestr", "prepay_id=mock_prepay_x", "RSA", "paysign_x"));
+
+        MpPayParamsVO vo = service.createBusinessOrder(bo);
+
+        assertNotNull(vo);
+        assertEquals("PREORD-20260604-000001", vo.getOutTradeNo());
+        // AC 3：business_type 分流真源 + business_order_no 落 transaction 表（fee_cent 留 NULL，强约束 #7）
+        GzPayTransaction inserted = insertCap.getValue();
+        assertEquals("preorder", inserted.getBusinessType());
+        assertEquals("PREORD-ORDER-001", inserted.getBusinessOrderNo());
+        assertEquals(9900L, inserted.getAmountCent());
+        assertEquals(2001L, inserted.getUserId());
+        assertEquals(PayStatus.CREATED, inserted.getStatus());
+        assertNull(inserted.getFeeCent(), "fee_cent 建单时留 NULL（PAY-104 回写）");
+        assertNotNull(inserted.getExpireTime());
+        verify(transactionMapper).markPending(eq(3001L), eq("mock_prepay_PREORD-20260604-000001"));
+    }
+
+    @Test
+    @DisplayName("PAY-101 AC 2：未知 business_type → IllegalArgumentException（前缀映射缺失早失败）")
+    void createBusinessOrder_unknownType_fails() {
+        CreateOrderBo bo = CreateOrderBo.builder()
+            .businessType("unknown_biz")
+            .businessOrderNo("X-001")
+            .amountCent(100L)
+            .openid("openid_x")
+            .userId(1L)
+            .description("x")
+            .build();
+
+        assertThrows(IllegalArgumentException.class, () -> service.createBusinessOrder(bo));
+        verify(transactionMapper, never()).insert(any(GzPayTransaction.class));
+    }
+
+    // ============================================================
+    //  PAY-101 AC 5/9：SPI 路由分发（preorder 回调 → dispatch 命中，传 paid 交易行）
+    // ============================================================
+
+    @Test
+    @DisplayName("PAY-101 AC 5：preorder 回调 markPaid 成功 → dispatch 被调一次 + 传入 paid 交易行（business_type/business_order_no/transaction_id 齐全）")
+    void handlePaymentNotify_preorder_spiDispatched() {
+        NotifyContext ctx = new NotifyContext("0", "n", "sig", "serial", "{}");
+        when(wechatPayClient.parseAndVerifyNotify(ctx)).thenReturn(
+            new CallbackResult("wx_txn_pre", "PREORD-20260604-000001", "SUCCESS", 9900L, null, "{decrypted}"));
+
+        GzPayTransaction tx = new GzPayTransaction();
+        tx.setId(3001L);
+        tx.setVersion(1);
+        tx.setStatus(PayStatus.PENDING);
+        tx.setBusinessType(org.dromara.gz.common.pay.enums.PayBusinessType.PREORDER);
+        tx.setBusinessOrderNo("PREORD-ORDER-001");
+        tx.setOutTradeNo("PREORD-20260604-000001");
+        when(transactionMapper.selectByOutTradeNo("PREORD-20260604-000001")).thenReturn(tx);
+        when(transactionMapper.markPaid(eq(3001L), eq(1), eq("wx_txn_pre"), any(), any())).thenReturn(1);
+
+        boolean ok = service.handlePaymentNotify(ctx);
+
+        assertTrue(ok);
+        org.mockito.ArgumentCaptor<GzPayTransaction> cap = org.mockito.ArgumentCaptor.forClass(GzPayTransaction.class);
+        verify(callbackDispatcher, times(1)).dispatch(cap.capture());
+        GzPayTransaction dispatched = cap.getValue();
+        assertEquals("preorder", dispatched.getBusinessType());
+        assertEquals("PREORD-ORDER-001", dispatched.getBusinessOrderNo());
+        assertEquals("wx_txn_pre", dispatched.getTransactionId(), "dispatch 前已把 transaction_id 同步进内存对象");
+        assertEquals(PayStatus.PAID, dispatched.getStatus());
+    }
+
+    // ============================================================
+    //  PAY-101 AC 5：handler 抛异常 → 透传 → 整笔事务回滚（callback_log processed 不写）
+    // ============================================================
+
+    @Test
+    @DisplayName("PAY-101 AC 5：SPI handler 抛异常 → 异常透传（整笔事务回滚让微信重试）+ processed 日志未写")
+    void handlePaymentNotify_handlerThrows_propagatesForRollback() {
+        NotifyContext ctx = new NotifyContext("0", "n", "sig", "serial", "{}");
+        when(wechatPayClient.parseAndVerifyNotify(ctx)).thenReturn(
+            new CallbackResult("wx_txn_pre", "PREORD-20260604-000001", "SUCCESS", 9900L, null, "{decrypted}"));
+
+        GzPayTransaction tx = new GzPayTransaction();
+        tx.setId(3001L);
+        tx.setVersion(1);
+        tx.setStatus(PayStatus.PENDING);
+        tx.setBusinessType(org.dromara.gz.common.pay.enums.PayBusinessType.PREORDER);
+        tx.setBusinessOrderNo("PREORD-ORDER-001");
+        when(transactionMapper.selectByOutTradeNo("PREORD-20260604-000001")).thenReturn(tx);
+        when(transactionMapper.markPaid(eq(3001L), eq(1), eq("wx_txn_pre"), any(), any())).thenReturn(1);
+        // handler 业务异常（如 gz_ord_order 出单失败）
+        doThrow(new RuntimeException("预购出单失败：库存归还冲突"))
+            .when(callbackDispatcher).dispatch(any(GzPayTransaction.class));
+
+        RuntimeException ex = assertThrows(RuntimeException.class, () -> service.handlePaymentNotify(ctx));
+        assertTrue(ex.getMessage().contains("出单失败"));
+        // markPaid 已调（但事务会回滚）；processed 日志在 dispatch 之后 → 未写（仅 received 1 条）
+        verify(transactionMapper).markPaid(eq(3001L), eq(1), eq("wx_txn_pre"), any(), any());
+        verify(callbackLogMapper, times(1)).insert(any(GzPayCallbackLog.class));
+    }
+
+    // ============================================================
+    //  PAY-102 AC 4/5：主动查单补单单点（reconcilePaid）—— 回调与查单共用同一 markPaid+SPI+log 核心
+    // ============================================================
+
+    @Test
+    @DisplayName("PAY-102 AC4：reconcilePaid 锁行 pending → markPaid + dispatch 一次 + processed 日志（与回调同一补单单点）")
+    void reconcilePaid_pending_marksPaidAndDispatchOnce() {
+        GzPayTransaction tx = new GzPayTransaction();
+        tx.setId(5001L);
+        tx.setVersion(2);
+        tx.setStatus(PayStatus.PENDING);
+        tx.setBusinessType(org.dromara.gz.common.pay.enums.PayBusinessType.PREORDER);
+        tx.setBusinessOrderNo("PREORD-ORDER-Q1");
+        tx.setOutTradeNo("PREORD-20260608-000009");
+        when(transactionMapper.selectByIdForUpdate(5001L)).thenReturn(tx);
+        when(transactionMapper.markPaid(eq(5001L), eq(2), eq("wx_q_9"), any(), any())).thenReturn(1);
+
+        IGzPayTransactionService.ReconcileOutcome outcome =
+            service.reconcilePaid(5001L, "wx_q_9", null, "{\"trade_state\":\"SUCCESS\",\"source\":\"query\"}");
+
+        assertEquals(IGzPayTransactionService.ReconcileOutcome.PAID, outcome);
+        // 行锁加载（与回调走 selectByOutTradeNo 不同入口，但补单核心相同）
+        verify(transactionMapper).selectByIdForUpdate(5001L);
+        verify(transactionMapper).markPaid(eq(5001L), eq(2), eq("wx_q_9"), any(), any());
+        // SPI 分发一次（test 单 dispatcher 内跳过，但 service 仍调 dispatch）
+        verify(callbackDispatcher, times(1)).dispatch(any(GzPayTransaction.class));
+        // callback_log processed 一条（raw_body = 查单报文，决策 D5 来源区分）
+        verify(callbackLogMapper, times(1)).insert(any(GzPayCallbackLog.class));
+    }
+
+    @Test
+    @DisplayName("PAY-102 AC5：reconcilePaid 锁行已 paid（并发回调先推进）→ SKIPPED_TERMINAL，不二次 markPaid / 不二次 dispatch")
+    void reconcilePaid_alreadyPaid_idempotentSkip() {
+        GzPayTransaction tx = new GzPayTransaction();
+        tx.setId(5001L);
+        tx.setVersion(3);
+        tx.setStatus(PayStatus.PAID); // 并发被动回调已推进
+        tx.setOutTradeNo("PREORD-20260608-000009");
+        when(transactionMapper.selectByIdForUpdate(5001L)).thenReturn(tx);
+
+        IGzPayTransactionService.ReconcileOutcome outcome =
+            service.reconcilePaid(5001L, "wx_q_9", null, "{\"trade_state\":\"SUCCESS\"}");
+
+        assertEquals(IGzPayTransactionService.ReconcileOutcome.SKIPPED_TERMINAL, outcome);
+        verify(transactionMapper, never()).markPaid(anyLong(), any(), anyString(), any(), any());
+        verify(callbackDispatcher, never()).dispatch(any(GzPayTransaction.class));
+        // 已终态不写 callback_log（不重复审计）
+        verify(callbackLogMapper, never()).insert(any(GzPayCallbackLog.class));
+    }
+
+    @Test
+    @DisplayName("PAY-102 AC5：reconcilePaid 锁行后乐观锁冲突（markPaid affected=0）→ 标 duplicated，不 dispatch")
+    void reconcilePaid_optimisticConflict_duplicated() {
+        GzPayTransaction tx = new GzPayTransaction();
+        tx.setId(5001L);
+        tx.setVersion(2);
+        tx.setStatus(PayStatus.PENDING);
+        tx.setBusinessType(org.dromara.gz.common.pay.enums.PayBusinessType.PREORDER);
+        tx.setOutTradeNo("PREORD-20260608-000009");
+        when(transactionMapper.selectByIdForUpdate(5001L)).thenReturn(tx);
+        // 行锁内仍 pending，但 markPaid 时 version 漂移（理论上行锁后不应发生，防御性兜底）→ affected=0
+        when(transactionMapper.markPaid(eq(5001L), eq(2), eq("wx_q_9"), any(), any())).thenReturn(0);
+
+        IGzPayTransactionService.ReconcileOutcome outcome =
+            service.reconcilePaid(5001L, "wx_q_9", null, "{\"trade_state\":\"SUCCESS\"}");
+
+        assertEquals(IGzPayTransactionService.ReconcileOutcome.SKIPPED_TERMINAL, outcome,
+            "行锁内 markPaid affected=0（并发已处理）→ 归 SKIPPED_TERMINAL，不计补单（幂等）");
+        verify(callbackDispatcher, never()).dispatch(any(GzPayTransaction.class));
+        // duplicated 一条 callback_log（审计并发冲突）
+        verify(callbackLogMapper, times(1)).insert(any(GzPayCallbackLog.class));
     }
 }

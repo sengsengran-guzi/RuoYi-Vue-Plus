@@ -12,6 +12,7 @@ import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.tenant.helper.TenantHelper;
 import org.dromara.gz.common.pay.config.WechatPayProperties;
+import org.dromara.gz.common.pay.domain.bo.CreateOrderBo;
 import org.dromara.gz.common.pay.domain.bo.GzPayTestCreateBo;
 import org.dromara.gz.common.pay.domain.bo.GzPayTransactionQueryBo;
 import org.dromara.gz.common.pay.domain.entity.GzPayCallbackLog;
@@ -30,6 +31,7 @@ import org.dromara.gz.common.pay.service.internal.IWechatPayClient.NotifyContext
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.UnifiedOrderRequest;
 import org.dromara.gz.common.pay.service.internal.PayOrderNoGenerator;
 import org.dromara.gz.common.pay.service.internal.WechatPayVerifyException;
+import org.dromara.gz.common.pay.service.spi.PayCallbackDispatcher;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -74,9 +76,10 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
     private final PayOrderNoGenerator orderNoGenerator;
     private final IWechatPayClient wechatPayClient;
     private final WechatPayProperties payProperties;
+    private final PayCallbackDispatcher callbackDispatcher;
 
     // ============================================================
-    //  AC 4 统一下单
+    //  AC 4（PAY-001 test 单）/ AC 1（PAY-101 业务建单）统一下单
     // ============================================================
 
     @Override
@@ -87,15 +90,41 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
             throw new ServiceException("测试单金额须在 1-100 分之间");
         }
         String openid = StrUtil.isNotBlank(bo.getOpenid()) ? bo.getOpenid() : "mock_openid_admin_test";
+        // 复用通用建单底层（PAY-101 AC 1 / 决策 D3：test 单 = 业务建单的特例）
+        return createOrderInternal(PayBusinessType.TEST, null, amountCent, openid, loginUserId, "谷子宇宙通道测试单");
+    }
 
-        // ① 建单 created + expire_time=now+5min
-        GzPayTransaction tx = createCreatedTransaction(amountCent, openid, loginUserId);
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public MpPayParamsVO createBusinessOrder(CreateOrderBo bo) {
+        // 校验 business_type 合法（顺带验出 out_trade_no 前缀映射存在，未知 type 早失败）
+        PayBusinessType.toOutTradePrefix(bo.getBusinessType());
+        if (bo.getAmountCent() == null || bo.getAmountCent() < 1) {
+            throw new ServiceException("amount_cent 至少 1 分");
+        }
+        if (StrUtil.isBlank(bo.getOpenid())) {
+            throw new ServiceException("openid 不能为空");
+        }
+        return createOrderInternal(bo.getBusinessType(), bo.getBusinessOrderNo(), bo.getAmountCent(),
+            bo.getOpenid(), bo.getUserId(), bo.getDescription());
+    }
+
+    /**
+     * 通用建单底层（PAY-101 AC 1 / 决策 D3）：test 单与业务单共用同一条「建 created → 统一下单 →
+     * created→pending → 5 参签名」链路。
+     *
+     * <p>{@code fee_cent} 留 NULL（强约束 #7：V3 回调不含通道费，由 PAY-104 拉 fundflowbill 异步回写）。</p>
+     */
+    private MpPayParamsVO createOrderInternal(String businessType, String businessOrderNo, long amountCent,
+                                              String openid, Long userId, String description) {
+        // ① 建单 created + expire_time=now+5min（fee_cent 留 NULL）
+        GzPayTransaction tx = createCreatedTransaction(businessType, businessOrderNo, amountCent, openid, userId);
 
         // ② 调通道统一下单拿 prepay_id（mock 返回固定值 / real 调微信）
         String prepayId;
         try {
             prepayId = wechatPayClient.createJsapiOrder(
-                new UnifiedOrderRequest(tx.getOutTradeNo(), amountCent, openid, "谷子宇宙通道测试单"));
+                new UnifiedOrderRequest(tx.getOutTradeNo(), amountCent, openid, description));
         } catch (Exception e) {
             // 通道失败 → 标 failed（doc/10 §2 通道失败态）
             tx.setStatus(PayStatus.FAILED);
@@ -112,7 +141,8 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
 
         // ④ 算 5 参签名返回 mp
         JsapiPayParams p = wechatPayClient.buildPayParams(prepayId);
-        log.info("[gz-pay] 测试单创建 out_trade_no={} amount={} prepay_id={}", tx.getOutTradeNo(), amountCent, prepayId);
+        log.info("[gz-pay] 建单成功 business_type={} out_trade_no={} business_order_no={} amount={} prepay_id={}",
+            businessType, tx.getOutTradeNo(), businessOrderNo, amountCent, prepayId);
         return MpPayParamsVO.builder()
             .timeStamp(p.timeStamp())
             .nonceStr(p.nonceStr())
@@ -126,20 +156,22 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
     /**
      * 建 created 单（out_trade_no 撞 UNIQUE 重试）。
      */
-    private GzPayTransaction createCreatedTransaction(long amountCent, String openid, Long loginUserId) {
+    private GzPayTransaction createCreatedTransaction(String businessType, String businessOrderNo,
+                                                      long amountCent, String openid, Long userId) {
         LocalDateTime now = LocalDateTime.now();
         DuplicateKeyException lastDup = null;
         for (int i = 0; i < OUT_TRADE_NO_RETRY; i++) {
-            String outTradeNo = orderNoGenerator.generate(PayBusinessType.TEST);
+            String outTradeNo = orderNoGenerator.generate(businessType);
             GzPayTransaction tx = GzPayTransaction.builder()
                 .outTradeNo(outTradeNo)
-                .businessType(PayBusinessType.TEST)
-                .businessOrderNo(null)
-                .userId(loginUserId)
+                .businessType(businessType)
+                .businessOrderNo(businessOrderNo)
+                .userId(userId)
                 .openid(openid)
                 .channelCode("wechat_pay_v3")
                 .amountCent(amountCent)
                 .currency("CNY")
+                // fee_cent 留 NULL（强约束 #7：PAY-104 拉 fundflowbill 回写）
                 .status(PayStatus.CREATED)
                 .expireTime(now.plusMinutes(EXPIRE_MINUTES))
                 .version(0)
@@ -152,7 +184,7 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
                 log.warn("[gz-pay] out_trade_no 撞 UNIQUE 重试 {}/{}：{}", i + 1, OUT_TRADE_NO_RETRY, outTradeNo);
             }
         }
-        throw new ServiceException("生成测试单失败（out_trade_no 连续冲突）", lastDup);
+        throw new ServiceException("生成订单失败（out_trade_no 连续冲突）", lastDup);
     }
 
     // ============================================================
@@ -193,23 +225,82 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
             return true;
         }
 
+        // ④⑤⑥ 走幂等补单单点（markPaid 乐观锁 → SPI 分发 → callback_log）。
+        //      与 PAY-102 主动查单补单共用同一段代码（强约束 #1 单点维护），来源不同仅 raw_body / signature 区分。
+        applyPaid(tx, result.transactionId(), result.feeCent(), result.outTradeNo(),
+            result.decryptedBody(), ctx.signature());
+        return true;
+    }
+
+    /**
+     * 幂等补单单点（PAY-101 回调 + PAY-102 主动查单共用，强约束 #1 / 决策 D4）。
+     *
+     * <p>对已确认 SUCCESS 且当前 {@code pending} 的交易行执行 ④乐观锁 markPaid → ⑤SPI 业务分发 →
+     * ⑥callback_log。被动回调与主动查单<b>都调本方法</b>，杜绝两套 paid 推进逻辑脱钩。</p>
+     *
+     * <p>调用方须保证：tx 已加载（回调走 selectByOutTradeNo / 查单走 selectByIdForUpdate 行锁）且
+     * 当前确为 pending（已 paid 提前 duplicated 返回）。</p>
+     *
+     * @param tx            待推进交易行（pending）
+     * @param transactionId 微信交易号
+     * @param feeCent       通道手续费（查单 / 回调均 null，PAY-104 回写）
+     * @param outTradeNo    业务订单号（写 callback_log）
+     * @param rawBody       回调解密 JSON / 查单返回报文（入 callback_log raw_body，决策 D5 来源区分）
+     * @param signature     回调 Wechatpay-Signature（查单无验签头 → null）
+     * @return true = 本次真正推进 paid + dispatch；false = 乐观锁冲突（affected=0）按 duplicated 处理
+     */
+    private boolean applyPaid(GzPayTransaction tx, String transactionId, Long feeCent,
+                             String outTradeNo, String rawBody, String signature) {
         // ④ 乐观锁 UPDATE pending → paid（version + status 双守卫，AC 7）
-        int affected = transactionMapper.markPaid(
-            tx.getId(), tx.getVersion(), result.transactionId(), result.feeCent(), LocalDateTime.now());
+        LocalDateTime paidTime = LocalDateTime.now();
+        int affected = transactionMapper.markPaid(tx.getId(), tx.getVersion(), transactionId, feeCent, paidTime);
         if (affected == 0) {
-            // 并发回调已抢先推进 / version 漂移 → 视为重复
-            writeCallbackLog(result.transactionId(), result.outTradeNo(), result.decryptedBody(),
-                ctx.signature(), CB_DUPLICATED, "乐观锁冲突（affected=0），并发已处理");
-            log.info("[gz-pay] 乐观锁冲突视为重复回调 out_trade_no={}", result.outTradeNo());
-            return true;
+            // 并发回调 / 查单已抢先推进 / version 漂移 → 视为重复（不重复分发 SPI handler，AC 5/6 第二道防线）
+            writeCallbackLog(transactionId, outTradeNo, rawBody, signature,
+                CB_DUPLICATED, "乐观锁冲突（affected=0），并发已处理");
+            log.info("[gz-pay] 乐观锁冲突视为重复 out_trade_no={}", outTradeNo);
+            return false;
         }
 
-        // ⑤ callback_log processed
-        writeCallbackLog(result.transactionId(), result.outTradeNo(), result.decryptedBody(),
-            ctx.signature(), CB_PROCESSED, null);
-        log.info("[gz-pay] 回调处理成功 out_trade_no={} → paid transaction_id={}",
-            result.outTradeNo(), result.transactionId());
+        // ⑤ SPI 业务分发（AC 4/5）：pending→paid 成功后、callback_log processed 前，按 business_type
+        //    路由到业务 handler（同事务 REQUIRED）。test 单无 handler → dispatcher 跳过不报错。
+        //    handler 抛异常 → 向上透传 → 整笔事务回滚（交易行回 pending）→ 下一轮回调/查单重试（doc/10 §6.E2）。
+        //    把 markPaid 后最新字段同步进内存对象传给 handler（业务方据 business_order_no 出单）。
+        tx.setStatus(PayStatus.PAID);
+        tx.setTransactionId(transactionId);
+        tx.setFeeCent(feeCent);
+        tx.setPaidTime(paidTime);
+        callbackDispatcher.dispatch(tx);
+
+        // ⑥ callback_log processed
+        writeCallbackLog(transactionId, outTradeNo, rawBody, signature, CB_PROCESSED, null);
+        log.info("[gz-pay] 补单成功 out_trade_no={} business_type={} → paid transaction_id={}",
+            outTradeNo, tx.getBusinessType(), transactionId);
         return true;
+    }
+
+    // ============================================================
+    //  GZ-PAY-102 主动查单补单单点（行锁 → 状态判定 → 复用 applyPaid）
+    // ============================================================
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public ReconcileOutcome reconcilePaid(Long txId, String transactionId, Long feeCent, String rawBody) {
+        // SELECT ... FOR UPDATE 锁行（AC 4/5）：与回调走同一幂等基础，并发查单 / 回调互斥
+        GzPayTransaction tx = transactionMapper.selectByIdForUpdate(txId);
+        if (tx == null) {
+            log.warn("[gz-pay] 查单补单订单不存在 id={}", txId);
+            return ReconcileOutcome.SKIPPED_NOT_FOUND;
+        }
+        // 已终态（paid / refunding / refunded / closed / timeout / failed）→ 不二次推进、不二次 dispatch（AC 5 幂等）
+        if (!PayStatus.PENDING.equals(tx.getStatus())) {
+            log.info("[gz-pay] 查单补单跳过（非 pending）out_trade_no={} status={}", tx.getOutTradeNo(), tx.getStatus());
+            return ReconcileOutcome.SKIPPED_TERMINAL;
+        }
+        // 仅 pending 才走补单单点（与回调完全相同的 markPaid + SPI + callback_log，强约束 #1）
+        boolean reallyPaid = applyPaid(tx, transactionId, feeCent, tx.getOutTradeNo(), rawBody, null);
+        // 行锁内仍出现 affected=0（version 漂移，理论罕见）→ 归并发已处理，幂等跳过（不计补单）
+        return reallyPaid ? ReconcileOutcome.PAID : ReconcileOutcome.SKIPPED_TERMINAL;
     }
 
     private void writeCallbackLog(String transactionId, String outTradeNo, String rawBody,

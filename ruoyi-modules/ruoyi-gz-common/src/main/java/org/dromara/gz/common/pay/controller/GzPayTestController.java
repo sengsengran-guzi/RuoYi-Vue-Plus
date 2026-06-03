@@ -8,6 +8,7 @@ import org.dromara.common.core.exception.ServiceException;
 import org.dromara.common.satoken.utils.LoginHelper;
 import org.dromara.common.web.core.BaseController;
 import org.dromara.gz.common.pay.config.WechatPayProperties;
+import org.dromara.gz.common.pay.domain.bo.CreateOrderBo;
 import org.dromara.gz.common.pay.domain.bo.GzPayTestCreateBo;
 import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
 import org.dromara.gz.common.pay.domain.vo.MpPayParamsVO;
@@ -56,6 +57,25 @@ public class GzPayTestController extends BaseController {
         Long loginUserId = LoginHelper.getUserId();
         log.info("[gz-pay-test] create-order amount={} by userId={}", bo.getAmountCent(), loginUserId);
         return R.ok(transactionService.createTestOrder(bo, loginUserId));
+    }
+
+    /**
+     * 发起业务支付单（PAY-101 AC 1 / AC 10 mock 全链路自测驱动入口）。
+     *
+     * <p>dev/staging 联调用：构造 {@link CreateOrderBo}（business_type=preorder / gacha + 模拟
+     * business_order_no）走 {@code createBusinessOrder} → 拿 out_trade_no → 再调
+     * {@code /simulate-callback} 驱动 SPI 路由 + 出单。<b>生产</b>业务下单走 ORD-104 / GACHA 各自的
+     * 下单事务（在那里注入 service 调 {@code createBusinessOrder}），不走本测试入口（R8：prod 关 perm）。</p>
+     *
+     * @param bo 业务建单入参
+     * @return mp 端 5 参 + out_trade_no
+     */
+    @SaCheckPermission("gz:pay:test")
+    @PostMapping("/create-business-order")
+    public R<MpPayParamsVO> createBusinessOrder(@Validated @RequestBody CreateOrderBo bo) {
+        log.info("[gz-pay-test] create-business-order business_type={} business_order_no={} amount={}",
+            bo.getBusinessType(), bo.getBusinessOrderNo(), bo.getAmountCent());
+        return R.ok(transactionService.createBusinessOrder(bo));
     }
 
     /**

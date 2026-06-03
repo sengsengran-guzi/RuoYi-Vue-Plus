@@ -1,5 +1,7 @@
 package org.dromara.gz.common.pay.service.internal;
 
+import java.time.LocalDate;
+
 /**
  * 微信支付 V3 通道客户端抽象（GZ-PAY-001 AC 9，决策 D2）。
  *
@@ -47,9 +49,141 @@ public interface IWechatPayClient {
     CallbackResult parseAndVerifyNotify(NotifyContext ctx);
 
     /**
+     * 按 out_trade_no 主动查单（GZ-PAY-102，doc/10 §6.N7 主动查单兜底）。
+     *
+     * <p>对应微信 V3 {@code GET /v3/pay/transactions/out-trade-no/{out_trade_no}?mchid=...}。
+     * 用于回调丢失 / 延迟时主动核对微信侧真实交易状态（{@code trade_state}）。</p>
+     *
+     * <p>real 实现用 SDK {@code JsapiService.queryOrderByOutTradeNo} 拿 {@link Transaction}；
+     * mock（{@link MockWechatPayClient}）返回可配置 {@code tradeState}（默认 NOTPAY），驱动单测覆盖
+     * SUCCESS / NOTPAY / USERPAYING / CLOSED / REVOKED / PAYERROR 各分支。</p>
+     *
+     * @param outTradeNo 业务订单号
+     * @return 查单结果（trade_state / transaction_id / payer_total / 原始报文）；订单微信侧不存在时
+     *         trade_state 实现按微信约定返回（real 抛 SDK NOT_FOUND，mock 不模拟此态）
+     */
+    QueryResult queryByOutTradeNo(String outTradeNo);
+
+    /**
+     * 关闭订单（GZ-PAY-102 AC 8，doc/10 §6 状态机 pending → timeout 防偷付）。
+     *
+     * <p>对应微信 V3 {@code POST /v3/pay/transactions/out-trade-no/{out_trade_no}/close}。
+     * 用户超 30min 仍未付（查单仍 NOTPAY）时调用，避免用户事后偷付造成本地与微信不一致。</p>
+     *
+     * <p>real 用 SDK {@code JsapiService.closeOrder}；mock 直接返回成功（不连微信）。关单接口幂等：
+     * 微信侧已关闭 / 已支付时重复调用按微信约定（real 实现透传 SDK 行为）。</p>
+     *
+     * @param outTradeNo 业务订单号
+     */
+    void closeOrder(String outTradeNo);
+
+    /**
+     * 拉取资金账单（GZ-PAY-104，doc/11 F4.3 / F9.2 / doc/10 §10 E6）。
+     *
+     * <p>资金账单（{@code /v3/bill/fundflowbill}）是 {@code gz_pay_transaction.fee_cent}（真实通道
+     * 手续费）的<b>唯一来源</b>：V3 支付回调 body 不含 fee，固定费率也不算数（doc/10 §10 E6）。</p>
+     *
+     * <p>real 实现两步：① 调 {@code /v3/bill/fundflowbill?bill_date=yyyy-MM-dd} 拿
+     * {@code download_url}（含 token）+ {@code hash_type}(SHA1) + {@code hash_value} →
+     * ② 下载 gzip 文件解压成 CSV 文本。本方法返回<b>已解压的 CSV 文本</b> + 微信声明的
+     * {@code hash_value}（service 据此自算 sha1 校验，不匹配抛错告警，AC3）。mock 返回构造的 CSV +
+     * 与之匹配的 sha1（可通过 {@code corruptHash} 控制制造校验失败路径，仅 mock 用）。</p>
+     *
+     * <p>账单 T+1 可用；跑批默认处理"前一业务日"（北京时间）。</p>
+     *
+     * @param billDate 账单业务日（yyyy-MM-dd）
+     * @return 已解压 CSV 文本 + 微信声明的 sha1 hash（service 自校验）
+     */
+    FundFlowBill downloadFundFlowBill(LocalDate billDate);
+
+    /**
+     * 发起全额退款（GZ-PAY-103，doc/10 §6.N9 → {@code POST /v3/refund/domestic/refunds}）。
+     *
+     * <p>V1.1 仅全额退款（一笔对一单）：{@code refundAmountCent} = 原支付单 {@code amount_cent}，
+     * {@code totalAmountCent} = 原订单总额（微信要求传原单总额做校验，全额退款两者相等）。</p>
+     *
+     * <p>real 用 SDK {@code RefundService.create} 提交退款申请（同步返回受理结果），最终退款结果走异步
+     * 退款回调 {@link #parseAndVerifyRefundNotify}；mock（{@link MockWechatPayClient}）默认返回受理成功，
+     * 可注入 {@code refundAcceptFail} 驱动「受理失败 → 回滚 paid」分支（AC 9）。</p>
+     *
+     * @param req 退款请求（out_trade_no / out_refund_no / refundAmountCent / totalAmountCent / reason / notifyUrl）
+     * @return 受理结果（微信退款单号 refund_id + 受理状态；受理失败 real 抛 SDK 异常 / mock 抛业务异常）
+     */
+    RefundResult refund(RefundRequest req);
+
+    /**
+     * 解析 + 验签微信退款回调（GZ-PAY-103，doc/10 §6.N10，独立 endpoint {@code /api/pay/v3/refund-notify}）。
+     *
+     * <p>退款回调 resource 语义与支付回调不同（退款单维度，含 {@code refund_status} 而非 {@code trade_state}）。
+     * real 复用同一套 SDK {@code NotificationParser} 的 AES-GCM 验签 + 解密机制（与支付回调同套，强约束 #2），
+     * 但解析成 {@link RefundCallbackResult}（refund_id / out_refund_no / out_trade_no / refund_status）；
+     * mock 把 body 当已解密 JSON 解析。</p>
+     *
+     * @param ctx 回调原始 HTTP 上下文（headers + body，复用 {@link NotifyContext}）
+     * @return 解密后的退款回调结果
+     * @throws WechatPayVerifyException 验签失败
+     */
+    RefundCallbackResult parseAndVerifyRefundNotify(NotifyContext ctx);
+
+    /**
      * 统一下单请求。
      */
     record UnifiedOrderRequest(String outTradeNo, long amountCent, String openid, String description) {
+    }
+
+    /**
+     * 退款请求（GZ-PAY-103，{@link #refund}）。
+     *
+     * @param outTradeNo      原业务支付订单号（关联原支付单）
+     * @param outRefundNo     商户退款单号（refund_no，全局唯一，对应微信 out_refund_no）
+     * @param refundAmountCent 退款金额（分，全额 = 原单 amount_cent）
+     * @param totalAmountCent  原订单总额（分，微信校验用，全额退款 = refundAmountCent）
+     * @param reason          退款原因
+     * @param notifyUrl       退款回调地址（/api/pay/v3/refund-notify 完整 URL）
+     */
+    record RefundRequest(String outTradeNo, String outRefundNo, long refundAmountCent,
+                         long totalAmountCent, String reason, String notifyUrl) {
+    }
+
+    /**
+     * 退款受理结果（GZ-PAY-103，{@link #refund} 同步返回）。
+     *
+     * <p>{@code refundId} = 微信退款单号（wechat_refund_id，受理即返回）；{@code status} = 微信退款单
+     * 状态（{@code PROCESSING} 处理中 / {@code SUCCESS} 已成功 / {@code ABNORMAL} 异常 / {@code CLOSED} 已关闭）。
+     * 受理成功通常 {@code PROCESSING}，最终结果走异步退款回调。</p>
+     *
+     * @param refundId 微信退款单号（wechat_refund_id）
+     * @param status   退款单受理状态
+     * @param rawBody  受理返回原始报文（入审计）
+     */
+    record RefundResult(String refundId, String status, String rawBody) {
+    }
+
+    /**
+     * 退款回调解析结果（GZ-PAY-103，{@link #parseAndVerifyRefundNotify}）。
+     *
+     * <p>{@code refundStatus} 取值（微信 V3 退款回调约定）：{@code SUCCESS}（退款成功）/
+     * {@code ABNORMAL}（退款异常）/ {@code CLOSED}（退款关闭）。SUCCESS → 推进 refunded；
+     * ABNORMAL/CLOSED → 标 failed 留人工（doc/10 §6.E4）。</p>
+     *
+     * @param refundId      微信退款单号（wechat_refund_id，幂等基础）
+     * @param outRefundNo   商户退款单号（refund_no）
+     * @param outTradeNo    原业务支付订单号
+     * @param refundStatus  退款状态（SUCCESS / ABNORMAL / CLOSED）
+     * @param decryptedBody 解密后完整 JSON（入 callback_log raw_body）
+     */
+    record RefundCallbackResult(String refundId, String outRefundNo, String outTradeNo,
+                                String refundStatus, String decryptedBody) {
+    }
+
+    /**
+     * 资金账单下载结果（已解压 CSV + 微信声明的 sha1 hash，GZ-PAY-104）。
+     *
+     * @param billDate     账单业务日
+     * @param csvContent   已 gzip 解压的完整 CSV 文本（含表头 + 数据行 + 汇总行）
+     * @param hashValue    微信声明的文件 sha1（service 自算 csvContent 的 sha1 比对，AC3）
+     */
+    record FundFlowBill(LocalDate billDate, String csvContent, String hashValue) {
     }
 
     /**
@@ -76,5 +210,24 @@ public interface IWechatPayClient {
      */
     record CallbackResult(String transactionId, String outTradeNo, String tradeState,
                           Long payerTotal, Long feeCent, String decryptedBody) {
+    }
+
+    /**
+     * 主动查单结果（GZ-PAY-102，{@link #queryByOutTradeNo}）。
+     *
+     * <p>{@code tradeState} 取值（微信 V3 约定）：{@code SUCCESS}（已支付）/ {@code NOTPAY}（未支付）/
+     * {@code USERPAYING}（支付中）/ {@code CLOSED}（已关闭）/ {@code REVOKED}（已撤销）/
+     * {@code PAYERROR}（支付失败）/ {@code REFUND}（转入退款）。{@code rawBody} 入 callback_log raw_body
+     * （区分查单补单 vs 被动通知补单的来源，决策 D5：靠 raw_body 来源而非新增列）。</p>
+     *
+     * @param outTradeNo    业务订单号
+     * @param transactionId 微信交易号（NOTPAY 等未成交态可能为 null）
+     * @param tradeState    交易状态
+     * @param payerTotal    用户实际支付金额（分，未成交为 null）
+     * @param feeCent       通道手续费（分，查单不给，real 填 null，由 PAY-104 对账回写）
+     * @param rawBody       查单返回原始报文（入 callback_log raw_body）
+     */
+    record QueryResult(String outTradeNo, String transactionId, String tradeState,
+                       Long payerTotal, Long feeCent, String rawBody) {
     }
 }
