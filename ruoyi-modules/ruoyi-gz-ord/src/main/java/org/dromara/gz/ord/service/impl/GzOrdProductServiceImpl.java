@@ -92,18 +92,20 @@ public class GzOrdProductServiceImpl implements IGzOrdProductService {
 
     @Override
     public TableDataInfo<GzOrdProductAdminVO> selectAdminPage(GzOrdProductQueryBo query, PageQuery pageQuery) {
-        LambdaQueryWrapper<GzOrdProduct> lqw = Wrappers.<GzOrdProduct>lambdaQuery()
-            .like(StrUtil.isNotBlank(query.getName()), GzOrdProduct::getName, query.getName())
-            .eq(StrUtil.isNotBlank(query.getStatus()), GzOrdProduct::getStatus, query.getStatus())
-            .eq(StrUtil.isNotBlank(query.getIpTag()), GzOrdProduct::getIpTag, query.getIpTag())
+        LambdaQueryWrapper<GzOrdProduct> lqw = buildAdminQueryWrapper(query)
             // 列表不投影 description_html（MEDIUMTEXT 大字段，省内存/带宽）
             .select(GzOrdProduct.class, f -> !"descriptionHtml".equals(f.getProperty()))
             .orderByDesc(GzOrdProduct::getSortNo)
             .orderByDesc(GzOrdProduct::getCreateTime);
         Page<GzOrdProduct> page = baseMapper.selectPage(pageQuery.build(), lqw);
         Page<GzOrdProductAdminVO> voPage = new Page<>(page.getCurrent(), page.getSize(), page.getTotal());
-        // 列表不含 SKU 列表（详情才查；列表如需 SKU 摘要可后续加，当前省 N+1）
-        voPage.setRecords(page.getRecords().stream().map(e -> toAdminVO(e, false)).toList());
+        // SKU 数批量统计（一次 GROUP BY，避免逐行 N+1）
+        Map<Long, Integer> skuCountMap = batchSkuCount(page.getRecords());
+        voPage.setRecords(page.getRecords().stream().map(e -> {
+            GzOrdProductAdminVO vo = toAdminVO(e, false);
+            vo.setSkuCount(skuCountMap.getOrDefault(e.getId(), 0));
+            return vo;
+        }).toList());
         return TableDataInfo.build(voPage);
     }
 
@@ -253,6 +255,286 @@ public class GzOrdProductServiceImpl implements IGzOrdProductService {
     }
 
     // ============================================================
+    //  GZ-ADMIN-101 AC 7 — 批量上下架（过滤 auto_off / 无 SKU / 已截止）
+    // ============================================================
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public org.dromara.gz.ord.domain.vo.GzOrdBatchStatusVO batchUpdateStatus(List<Long> ids, String targetStatus) {
+        if (!OrdProductStatusEnum.isManualTarget(targetStatus)) {
+            throw new ServiceException(GzOrdErrorCode.INVALID_STATUS_MSG, GzOrdErrorCode.INVALID_STATUS);
+        }
+        org.dromara.gz.ord.domain.vo.GzOrdBatchStatusVO result = new org.dromara.gz.ord.domain.vo.GzOrdBatchStatusVO();
+        if (ids == null || ids.isEmpty()) {
+            return result;
+        }
+        boolean toOnShelf = OrdProductStatusEnum.ON_SHELF.getCode().equals(targetStatus);
+        LocalDateTime now = LocalDateTime.now();
+        List<Long> applicable = new ArrayList<>();
+
+        for (Long id : ids) {
+            GzOrdProduct p = baseMapper.selectById(id);
+            if (p == null) {
+                result.addSkipped(id, "商品不存在");
+                continue;
+            }
+            if (toOnShelf) {
+                // 决策 D5：auto_off 不可被批量上架覆盖（截止已过）
+                if (OrdProductStatusEnum.AUTO_OFF.getCode().equals(p.getStatus())) {
+                    result.addSkipped(id, "已自动下架（截止日已过），不可批量上架");
+                    continue;
+                }
+                // 截止日已过（兜底 cron 漏跑，R5）
+                if (p.getDeadlineTime() != null && !p.getDeadlineTime().isAfter(now)) {
+                    result.addSkipped(id, "预订截止时间已过，不可上架");
+                    continue;
+                }
+                // 无 enabled SKU（R5）
+                Long enabledSkuCount = skuMapper.selectCount(
+                    Wrappers.<GzOrdSku>lambdaQuery()
+                        .eq(GzOrdSku::getProductId, id)
+                        .eq(GzOrdSku::getEnabled, 1));
+                if (enabledSkuCount == null || enabledSkuCount == 0) {
+                    result.addSkipped(id, "无启用规格（SKU），不可上架");
+                    continue;
+                }
+            }
+            applicable.add(id);
+            result.addSuccess(id);
+        }
+
+        if (!applicable.isEmpty()) {
+            // 一次 UPDATE ... WHERE id IN(...)（决策 D2；tenant_id 由租户拦截器自动 append）
+            GzOrdProduct update = new GzOrdProduct();
+            update.setStatus(targetStatus);
+            baseMapper.update(update, Wrappers.<GzOrdProduct>lambdaUpdate().in(GzOrdProduct::getId, applicable));
+            log.info("[gz-ord-product] BATCH-STATUS → {} success={} skipped={}",
+                targetStatus, applicable.size(), result.getSkipped().size());
+        }
+        return result;
+    }
+
+    // ============================================================
+    //  GZ-ADMIN-101 AC 8 — Excel 导出 / 导入
+    // ============================================================
+
+    @Override
+    public List<org.dromara.gz.ord.domain.excel.GzOrdProductExportVo> exportList(GzOrdProductQueryBo query) {
+        LambdaQueryWrapper<GzOrdProduct> lqw = buildAdminQueryWrapper(query)
+            .select(GzOrdProduct.class, f -> !"descriptionHtml".equals(f.getProperty()))
+            .orderByDesc(GzOrdProduct::getSortNo)
+            .orderByDesc(GzOrdProduct::getCreateTime);
+        List<GzOrdProduct> products = baseMapper.selectList(lqw);
+        if (products.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<Long> productIds = products.stream().map(GzOrdProduct::getId).toList();
+        List<GzOrdSku> skus = skuMapper.selectList(
+            Wrappers.<GzOrdSku>lambdaQuery()
+                .in(GzOrdSku::getProductId, productIds)
+                .orderByAsc(GzOrdSku::getProductId)
+                .orderByAsc(GzOrdSku::getSortNo)
+                .orderByAsc(GzOrdSku::getId));
+        Map<Long, List<GzOrdSku>> skuByProduct = skus.stream()
+            .collect(Collectors.groupingBy(GzOrdSku::getProductId));
+
+        DateTimeFormatter dt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+        List<org.dromara.gz.ord.domain.excel.GzOrdProductExportVo> rows = new ArrayList<>();
+        for (GzOrdProduct p : products) {
+            List<GzOrdSku> pSkus = skuByProduct.getOrDefault(p.getId(), Collections.emptyList());
+            if (pSkus.isEmpty()) {
+                rows.add(toExportRow(p, null, dt));
+            } else {
+                for (GzOrdSku sku : pSkus) {
+                    rows.add(toExportRow(p, sku, dt));
+                }
+            }
+        }
+        return rows;
+    }
+
+    private org.dromara.gz.ord.domain.excel.GzOrdProductExportVo toExportRow(
+        GzOrdProduct p, GzOrdSku sku, DateTimeFormatter dt) {
+        org.dromara.gz.ord.domain.excel.GzOrdProductExportVo row = new org.dromara.gz.ord.domain.excel.GzOrdProductExportVo();
+        row.setProductNo(p.getProductNo());
+        row.setName(p.getName());
+        row.setIpTag(p.getIpTag());
+        row.setStatusText(OrdProductStatusEnum.labelOf(p.getStatus()));
+        row.setDeadlineTime(p.getDeadlineTime() == null ? "" : p.getDeadlineTime().format(dt));
+        row.setDeliveryText(formatDeliveryText(p));
+        row.setSalesCount(p.getSalesCount());
+        if (sku != null) {
+            row.setSkuNo(sku.getSkuNo());
+            row.setSpecName(sku.getSpecName());
+            row.setPriceYuan(centToYuan(sku.getPriceCent()));
+            row.setStockTotal(sku.getStockTotal() == null ? "无限" : String.valueOf(sku.getStockTotal()));
+            row.setStockRemain(sku.getStockRemain() == null ? "无限" : String.valueOf(sku.getStockRemain()));
+            row.setEnabledText(Integer.valueOf(1).equals(sku.getEnabled()) ? "启用" : "停用");
+        }
+        return row;
+    }
+
+    private String centToYuan(Long cent) {
+        if (cent == null) {
+            return "";
+        }
+        return new java.math.BigDecimal(cent)
+            .movePointLeft(2)
+            .setScale(2, java.math.RoundingMode.HALF_UP)
+            .toPlainString();
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public org.dromara.gz.ord.domain.vo.GzOrdProductImportResultVO importData(
+        List<org.dromara.gz.ord.domain.excel.GzOrdProductImportVo> rows) {
+        org.dromara.gz.ord.domain.vo.GzOrdProductImportResultVO result =
+            new org.dromara.gz.ord.domain.vo.GzOrdProductImportResultVO();
+        if (rows == null || rows.isEmpty()) {
+            result.setSuccess(false);
+            result.addError(0, "导入文件无数据行");
+            return result;
+        }
+
+        DateTimeFormatter dtFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+        // 按商品名分组（保持出现顺序）；同名多行 = 一个商品 + 多 SKU
+        java.util.LinkedHashMap<String, GzOrdProductBo> grouped = new java.util.LinkedHashMap<>();
+
+        for (int i = 0; i < rows.size(); i++) {
+            int rowNo = i + 1;
+            org.dromara.gz.ord.domain.excel.GzOrdProductImportVo r = rows.get(i);
+            String name = StrUtil.trimToNull(r.getName());
+            if (name == null) {
+                result.addError(rowNo, "商品名不能为空");
+                continue;
+            }
+            // SKU 字段校验
+            String specName = StrUtil.trimToNull(r.getSpecName());
+            if (specName == null) {
+                result.addError(rowNo, "规格名不能为空");
+                continue;
+            }
+            Long priceCent = parsePriceYuanToCent(r.getPriceYuan());
+            if (priceCent == null) {
+                result.addError(rowNo, "单价格式非法（需 ≥ 0 的数字，元）");
+                continue;
+            }
+            Integer stockTotal = parseStock(r.getStockTotal());
+            if (stockTotal != null && stockTotal < 0) {
+                result.addError(rowNo, "库存不能为负");
+                continue;
+            }
+
+            GzOrdProductBo product = grouped.get(name);
+            if (product == null) {
+                // 首次出现该商品 → 校验商品级字段
+                product = new GzOrdProductBo();
+                product.setName(name);
+                product.setIpTag(StrUtil.trimToNull(r.getIpTag()));
+                LocalDateTime deadline = parseDateTime(r.getDeadlineTime(), dtFmt);
+                if (deadline == null) {
+                    result.addError(rowNo, "预订截止时间格式非法（需 yyyy-MM-dd HH:mm:ss）");
+                    continue;
+                }
+                product.setDeadlineTime(deadline);
+                String deliveryText = StrUtil.trimToNull(r.getDeliveryDateText());
+                LocalDate deliveryExact = parseDate(r.getDeliveryDateExact());
+                boolean hasText = deliveryText != null;
+                boolean hasExact = deliveryExact != null;
+                if (hasText == hasExact) {
+                    result.addError(rowNo, "到货文案 / 到货精确日必须二选一（F6.1）");
+                    continue;
+                }
+                product.setDeliveryDateText(deliveryText);
+                product.setDeliveryDateExact(deliveryExact);
+                product.setSkuList(new ArrayList<>());
+                grouped.put(name, product);
+            }
+
+            GzOrdSkuBo skuBo = new GzOrdSkuBo();
+            skuBo.setSpecName(specName);
+            skuBo.setPriceCent(priceCent);
+            skuBo.setStockTotal(stockTotal);
+            skuBo.setEnabled(1);
+            skuBo.setSortNo(product.getSkuList().size());
+            product.getSkuList().add(skuBo);
+        }
+
+        // 行级全失败回滚（决策 D5，不部分提交）
+        if (!result.getErrors().isEmpty()) {
+            result.setSuccess(false);
+            return result;
+        }
+
+        int productCount = 0;
+        int skuCount = 0;
+        for (GzOrdProductBo product : grouped.values()) {
+            if (product.getSkuList().isEmpty()) {
+                continue;
+            }
+            insertByBo(product);
+            productCount++;
+            skuCount += product.getSkuList().size();
+        }
+        result.setSuccess(true);
+        result.setProductCount(productCount);
+        result.setSkuCount(skuCount);
+        log.info("[gz-ord-product] IMPORT success products={} skus={}", productCount, skuCount);
+        return result;
+    }
+
+    /** 元字符串 → 分（非法 / 负数返回 null）。 */
+    private Long parsePriceYuanToCent(String yuanStr) {
+        if (StrUtil.isBlank(yuanStr)) {
+            return null;
+        }
+        try {
+            java.math.BigDecimal yuan = new java.math.BigDecimal(yuanStr.trim());
+            if (yuan.signum() < 0) {
+                return null;
+            }
+            return yuan.movePointRight(2).setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    /** 库存字符串 → Integer（空 / 「无限」 = null 无限）。 */
+    private Integer parseStock(String stockStr) {
+        if (StrUtil.isBlank(stockStr) || "无限".equals(stockStr.trim())) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(stockStr.trim());
+        } catch (NumberFormatException ex) {
+            // 非法库存 → 返回 -1 触发上层「库存不能为负」分支（避免静默当无限）
+            return -1;
+        }
+    }
+
+    private LocalDateTime parseDateTime(String s, DateTimeFormatter fmt) {
+        if (StrUtil.isBlank(s)) {
+            return null;
+        }
+        try {
+            return LocalDateTime.parse(s.trim(), fmt);
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    private LocalDate parseDate(String s) {
+        if (StrUtil.isBlank(s)) {
+            return null;
+        }
+        try {
+            return LocalDate.parse(s.trim(), DELIVERY_DATE_FMT);
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    // ============================================================
     //  GZ-ORD-102 — mp 端 C 端浏览（列表 + IP 标签）
     // ============================================================
 
@@ -368,6 +650,43 @@ public class GzOrdProductServiceImpl implements IGzOrdProductService {
     // ============================================================
     //  内部辅助
     // ============================================================
+
+    /**
+     * 批量统计各商品 SKU 数（一次查询 product_id 列分组计数，避免逐行 N+1，AC 3）。
+     */
+    private Map<Long, Integer> batchSkuCount(List<GzOrdProduct> products) {
+        if (products.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        List<Long> ids = products.stream().map(GzOrdProduct::getId).toList();
+        List<GzOrdSku> skus = skuMapper.selectList(
+            Wrappers.<GzOrdSku>lambdaQuery()
+                .select(GzOrdSku::getProductId)
+                .in(GzOrdSku::getProductId, ids));
+        Map<Long, Integer> result = new HashMap<>();
+        for (GzOrdSku sku : skus) {
+            result.merge(sku.getProductId(), 1, Integer::sum);
+        }
+        return result;
+    }
+
+    /**
+     * admin 列表 / 导出共用筛选 wrapper（name 模糊 / status / ipTag 精确 / deadline_time 范围，AC 2）。
+     * deadlineEnd 闭区间含当日（拼 23:59:59.999）。
+     */
+    private LambdaQueryWrapper<GzOrdProduct> buildAdminQueryWrapper(GzOrdProductQueryBo query) {
+        LambdaQueryWrapper<GzOrdProduct> lqw = Wrappers.<GzOrdProduct>lambdaQuery()
+            .like(StrUtil.isNotBlank(query.getName()), GzOrdProduct::getName, query.getName())
+            .eq(StrUtil.isNotBlank(query.getStatus()), GzOrdProduct::getStatus, query.getStatus())
+            .eq(StrUtil.isNotBlank(query.getIpTag()), GzOrdProduct::getIpTag, query.getIpTag());
+        if (StrUtil.isNotBlank(query.getDeadlineStart())) {
+            lqw.ge(GzOrdProduct::getDeadlineTime, LocalDate.parse(query.getDeadlineStart()).atStartOfDay());
+        }
+        if (StrUtil.isNotBlank(query.getDeadlineEnd())) {
+            lqw.le(GzOrdProduct::getDeadlineTime, LocalDate.parse(query.getDeadlineEnd()).atTime(23, 59, 59, 999_000_000));
+        }
+        return lqw;
+    }
 
     /**
      * 图集 gallery_image_ids（逗号分隔 file_id）→ 可访问签名 URL 列表（AC1）。
@@ -691,6 +1010,8 @@ public class GzOrdProductServiceImpl implements IGzOrdProductService {
         vo.setProductNo(e.getProductNo());
         vo.setName(e.getName());
         vo.setMainImageId(e.getMainImageId());
+        // 主图签名 URL（列表缩略图直用；NULL / 解析失败回退占位图，AC 3 / R4）
+        vo.setMainImageUrl(resolveImageUrl(e.getMainImageId()));
         vo.setGalleryImageIds(e.getGalleryImageIds());
         if (withDescription) {
             vo.setDescriptionHtml(e.getDescriptionHtml());

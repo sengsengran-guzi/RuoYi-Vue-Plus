@@ -150,6 +150,20 @@ public class GzUserServiceImpl implements IGzUserService {
     }
 
     @Override
+    public java.util.List<Long> selectIdsByKeyword(String keyword) {
+        if (StrUtil.isBlank(keyword)) {
+            return java.util.Collections.emptyList();
+        }
+        // 昵称 OR openid 模糊（GZ-ADMIN-103 admin 订单用户关键词搜）
+        LambdaQueryWrapper<GzUser> lqw = new LambdaQueryWrapper<GzUser>()
+            .select(GzUser::getId)
+            .and(w -> w.like(GzUser::getNickname, keyword).or().like(GzUser::getOpenid, keyword));
+        return baseMapper.selectList(lqw).stream()
+            .map(GzUser::getId)
+            .toList();
+    }
+
+    @Override
     public java.util.Map<Long, GzUserVO> selectVoMapByIds(java.util.Collection<Long> ids) {
         if (ids == null || ids.isEmpty()) {
             return java.util.Collections.emptyMap();

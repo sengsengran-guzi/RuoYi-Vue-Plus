@@ -108,8 +108,13 @@ class PreorderFullChainMockTest {
         dispatcher.validate();
 
         PayOrderNoGenerator generator = new PayOrderNoGenerator(payTxMapper, refundMapper);
+        // 回调分发器以 ObjectProvider 延迟注入（打断构造期循环依赖）；测试 stub getObject() 返回真实 dispatcher
+        @SuppressWarnings("unchecked")
+        org.springframework.beans.factory.ObjectProvider<PayCallbackDispatcher> dispatcherProvider =
+            org.mockito.Mockito.mock(org.springframework.beans.factory.ObjectProvider.class);
+        lenient().when(dispatcherProvider.getObject()).thenReturn(dispatcher);
         payService = new GzPayTransactionServiceImpl(
-            payTxMapper, callbackLogMapper, generator, mockClient, props, dispatcher);
+            payTxMapper, callbackLogMapper, generator, mockClient, props, dispatcherProvider);
 
         wirePayMappers();
         wireOrderMappers();

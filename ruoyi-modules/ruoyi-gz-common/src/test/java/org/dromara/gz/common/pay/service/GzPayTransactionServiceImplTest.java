@@ -27,6 +27,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.MockedStatic;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.beans.factory.ObjectProvider;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -81,8 +82,11 @@ class GzPayTransactionServiceImplTest {
         payProperties = new WechatPayProperties();
         payProperties.setClientMode("mock");
         payProperties.getTest().setAmountCent(1L);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<PayCallbackDispatcher> callbackDispatcherProvider = mock(ObjectProvider.class);
+        lenient().when(callbackDispatcherProvider.getObject()).thenReturn(callbackDispatcher);
         service = new GzPayTransactionServiceImpl(
-            transactionMapper, callbackLogMapper, orderNoGenerator, wechatPayClient, payProperties, callbackDispatcher);
+            transactionMapper, callbackLogMapper, orderNoGenerator, wechatPayClient, payProperties, callbackDispatcherProvider);
     }
 
     // ============================================================

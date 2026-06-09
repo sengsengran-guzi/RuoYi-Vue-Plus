@@ -61,6 +61,40 @@ public interface IGzOrdProductService {
     boolean deleteByIds(List<Long> ids);
 
     /**
+     * 批量上下架（GZ-ADMIN-101 AC 7）。一次 {@code UPDATE ... WHERE id IN(...)}；不满足条件的项
+     * 不报错整体失败，过滤进 skipped：
+     * <ul>
+     *   <li>商品不存在 → 跳过</li>
+     *   <li>当前 auto_off 不可被批量上架覆盖（决策 D5）→ 跳过</li>
+     *   <li>批量上架时无 enabled SKU / 截止日已过 → 跳过（R5）</li>
+     * </ul>
+     * targetStatus 仅 on_shelf / off_shelf；auto_off 拒绝（抛 INVALID_STATUS）。
+     *
+     * @param ids          商品 id 列表
+     * @param targetStatus 目标态（on_shelf / off_shelf）
+     * @return success（已流转）+ skipped（被跳过 + 原因）
+     */
+    org.dromara.gz.ord.domain.vo.GzOrdBatchStatusVO batchUpdateStatus(List<Long> ids, String targetStatus);
+
+    /**
+     * 导出当前筛选结果（GZ-ADMIN-101 AC 8）。product × SKU 平铺；金额分 → 元；status 中文文案。
+     *
+     * @param query 与列表同筛选条件（name / status / ipTag）
+     * @return 平铺导出行
+     */
+    List<org.dromara.gz.ord.domain.excel.GzOrdProductExportVo> exportList(GzOrdProductQueryBo query);
+
+    /**
+     * Excel 批量导入商品 + SKU（GZ-ADMIN-101 AC 8）。同名商品多行合并为一个商品 + 多 SKU；行级校验
+     * 全失败回滚（决策 D5，不部分提交）；新建固定 off_shelf；product_no / sku_no 系统生成。
+     *
+     * @param rows 导入行（已由 EasyExcel 解析）
+     * @return 导入结果（成功计数 或 行级错误列表）
+     */
+    org.dromara.gz.ord.domain.vo.GzOrdProductImportResultVO importData(
+        List<org.dromara.gz.ord.domain.excel.GzOrdProductImportVo> rows);
+
+    /**
      * 截止下架（AC 5，截止 SnailJob 委托的可单测 service 方法）。
      * {@code on_shelf AND deadline_time < now()} → {@code auto_off}（决策 D5 唯一写 auto_off 路径）。
      *

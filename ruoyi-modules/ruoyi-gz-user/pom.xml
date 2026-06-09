@@ -23,6 +23,12 @@
             <version>${revision}</version>
         </dependency>
 
+        <!-- GZ-USER-104 SnailJob 客户端（自动签收 cron @JobExecutor）；同 ruoyi-gz-ord/news/bean -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-job</artifactId>
+        </dependency>
+
         <!-- GZ-USER-002/003 单元测试（Mockito + JUnit 5）-->
         <dependency>
             <groupId>org.springframework.boot</groupId>

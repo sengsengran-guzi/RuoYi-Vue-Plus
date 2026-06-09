@@ -94,4 +94,15 @@ public interface IGzUserService {
      * @return id → GzUserVO 映射（含 mobile / nickname；缺失 id 不在 map 内）
      */
     Map<Long, GzUserVO> selectVoMapByIds(Collection<Long> ids);
+
+    /**
+     * 按关键词模糊解析用户 id 集合（GZ-ADMIN-103 三类聚合订单 admin 用户关键词搜）。
+     *
+     * <p>admin 订单列表 userKeyword 筛选：在 gz_user 用 {@code nickname LIKE %?% OR openid LIKE %?%}
+     * 解析命中 user_id，再用结果集过滤支付流水 / 业务订单的 user_id（解耦订单模块与用户表，不写跨表 JOIN）。</p>
+     *
+     * @param keyword 昵称 / openid 模糊串（空 / null → 返回空列表，调用方据此判定「无匹配」）
+     * @return 命中 user_id 列表（无匹配 → 空列表）
+     */
+    List<Long> selectIdsByKeyword(String keyword);
 }

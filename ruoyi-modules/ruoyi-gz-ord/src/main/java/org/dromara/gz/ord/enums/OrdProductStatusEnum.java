@@ -48,4 +48,15 @@ public enum OrdProductStatusEnum {
     public static boolean isValid(String code) {
         return Arrays.stream(values()).anyMatch(e -> e.code.equals(code));
     }
+
+    /**
+     * code → 中文显示名（导出用；未知 code 原样返回，AC 8）。
+     */
+    public static String labelOf(String code) {
+        return Arrays.stream(values())
+            .filter(e -> e.code.equals(code))
+            .map(OrdProductStatusEnum::getLabel)
+            .findFirst()
+            .orElse(code);
+    }
 }

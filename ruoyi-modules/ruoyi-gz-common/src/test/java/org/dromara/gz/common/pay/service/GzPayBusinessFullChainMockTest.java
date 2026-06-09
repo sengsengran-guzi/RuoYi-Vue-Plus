@@ -23,6 +23,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.beans.factory.ObjectProvider;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -101,10 +102,13 @@ class GzPayBusinessFullChainMockTest {
         };
         dispatcher = new PayCallbackDispatcher(List.of(preorderHandler));
         dispatcher.validate();
+        @SuppressWarnings("unchecked")
+        ObjectProvider<PayCallbackDispatcher> dispatcherProvider = mock(ObjectProvider.class);
+        lenient().when(dispatcherProvider.getObject()).thenReturn(dispatcher);
 
         PayOrderNoGenerator generator = new PayOrderNoGenerator(transactionMapper, refundMapper);
         service = new GzPayTransactionServiceImpl(
-            transactionMapper, callbackLogMapper, generator, mockClient, props, dispatcher);
+            transactionMapper, callbackLogMapper, generator, mockClient, props, dispatcherProvider);
 
         wireInMemoryMappers();
     }

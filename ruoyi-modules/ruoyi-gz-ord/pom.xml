@@ -31,6 +31,14 @@
             <version>${revision}</version>
         </dependency>
 
+        <!-- GZ-ADMIN-103 三类聚合订单：回查 gz_gacha_order（扭蛋衍生订单）取奖品 / 机器 snapshot。
+             gz-gacha → gz-common 单向，gz-ord 依赖 gz-gacha 不构成循环（gz-gacha 不依赖 gz-ord）。 -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-gz-gacha</artifactId>
+            <version>${revision}</version>
+        </dependency>
+
         <!-- GZ-ORD-101 商品富文本 description_html 写入白名单清洗：jsoup（复用 gz-news 同款，不引新依赖） -->
         <dependency>
             <groupId>org.jsoup</groupId>

@@ -27,4 +27,10 @@ public class GzOrdProductQueryBo implements Serializable {
 
     /** IP 标签精确筛选 */
     private String ipTag;
+
+    /** 截止日范围起（含；yyyy-MM-dd，GZ-ADMIN-101 AC 2 按 deadline_time 过滤） */
+    private String deadlineStart;
+
+    /** 截止日范围止（含当日 23:59:59；yyyy-MM-dd） */
+    private String deadlineEnd;
 }

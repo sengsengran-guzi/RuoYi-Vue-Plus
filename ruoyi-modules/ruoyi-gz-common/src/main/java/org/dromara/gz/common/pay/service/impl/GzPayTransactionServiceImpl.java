@@ -32,6 +32,7 @@ import org.dromara.gz.common.pay.service.internal.IWechatPayClient.UnifiedOrderR
 import org.dromara.gz.common.pay.service.internal.PayOrderNoGenerator;
 import org.dromara.gz.common.pay.service.internal.WechatPayVerifyException;
 import org.dromara.gz.common.pay.service.spi.PayCallbackDispatcher;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -76,7 +77,17 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
     private final PayOrderNoGenerator orderNoGenerator;
     private final IWechatPayClient wechatPayClient;
     private final WechatPayProperties payProperties;
-    private final PayCallbackDispatcher callbackDispatcher;
+    /**
+     * 支付回调 SPI 分发器 —— 用 {@link ObjectProvider} 延迟解析以打断构造期循环依赖。
+     *
+     * <p>分发器构造注入 {@code List<PayCallbackHandler>}，而各业务 handler（如 gz-ord
+     * {@code PreorderPayCallbackHandler} / gz-gacha {@code GachaPayCallbackHandler}）又依赖回到
+     * 对应业务 service，业务 service 建单时依赖 {@code IGzPayTransactionService}（即本类）→
+     * 形成 本类 → Dispatcher → Handler → 业务 service → 本类 的构造期环。分发器仅在回调成功
+     * （{@code dispatch}）时才用到，构造期无需就绪，故注入 Provider 在调用点 {@code getObject()}
+     * 惰性取实例，打断这一条环边（其余注入保持构造期 final）。</p>
+     */
+    private final ObjectProvider<PayCallbackDispatcher> callbackDispatcherProvider;
 
     // ============================================================
     //  AC 4（PAY-001 test 单）/ AC 1（PAY-101 业务建单）统一下单
@@ -270,7 +281,7 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
         tx.setTransactionId(transactionId);
         tx.setFeeCent(feeCent);
         tx.setPaidTime(paidTime);
-        callbackDispatcher.dispatch(tx);
+        callbackDispatcherProvider.getObject().dispatch(tx);
 
         // ⑥ callback_log processed
         writeCallbackLog(transactionId, outTradeNo, rawBody, signature, CB_PROCESSED, null);

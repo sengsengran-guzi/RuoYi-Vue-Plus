@@ -39,6 +39,9 @@ public class GzOrdProductAdminVO implements Serializable {
     @JsonSerialize(using = ToStringSerializer.class)
     private Long mainImageId;
 
+    /** 主图签名 URL（列表缩略图直用；后端解析 file_id → 1h 签名 URL，空 / 解析失败回退占位图，AC 3） */
+    private String mainImageUrl;
+
     /** 图集 逗号分隔 file_id */
     private String galleryImageIds;
 
@@ -62,6 +65,9 @@ public class GzOrdProductAdminVO implements Serializable {
 
     /** 销量 */
     private Long salesCount;
+
+    /** SKU 数（列表展示用；详情不必填，前端取 skuList.length） */
+    private Integer skuCount;
 
     /** 同 IP 内排序 */
     private Integer sortNo;
