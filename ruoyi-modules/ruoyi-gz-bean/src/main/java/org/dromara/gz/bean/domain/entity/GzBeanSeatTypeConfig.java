@@ -69,7 +69,7 @@ public class GzBeanSeatTypeConfig extends TenantEntity {
     /** 备注 */
     private String remark;
 
-    /** 软删标志（0=正常 / 2=删除，对齐 ruoyi 全局 logicDeleteValue） */
+    /** 软删标志（0=正常 / 1=删除，对齐本项目 logicDeleteValue=1） */
     @TableLogic
     private String delFlag;
 }

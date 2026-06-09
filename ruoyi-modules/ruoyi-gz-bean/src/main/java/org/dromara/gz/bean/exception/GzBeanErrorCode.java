@@ -58,6 +58,30 @@ public final class GzBeanErrorCode {
     /** 扫码命中的状态分支文案（admin 端按 code 映射，doc/10 §3 E6/E7）：
      *  已核销 / 已取消 / 已过期 共用 INVALID_STATUS（4008），由 service 拼当前状态中文返回。*/
 
+    // ============================================================
+    //  GZ-BEAN-014 V1.2 付费模型错误码
+    // ============================================================
+
+    /** 该 (座位类型,日期,时段) 配额已满（活跃 booking 数 ≥ quantity，doc/10 §11.E1） */
+    public static final int QUOTA_FULL = 4011;
+    public static final String QUOTA_FULL_MSG = "该时段座位已约满，请重选类型或时段";
+
+    /** 座位类型配置不存在 / 未配置（该门店未配此 seat_type） */
+    public static final int SEAT_TYPE_NOT_CONFIGURED = 4012;
+    public static final String SEAT_TYPE_NOT_CONFIGURED_MSG = "该座位类型暂未开放，请重选";
+
+    /** 座位类型被后台停用（doc/10 §11.E3） */
+    public static final int SEAT_TYPE_DISABLED = 4013;
+    public static final String SEAT_TYPE_DISABLED_MSG = "该座位类型已停用，请重选";
+
+    /** 付款前未采集微信号（doc/10 §11.N6 / §11.E2） */
+    public static final int WECHAT_ID_REQUIRED = 4014;
+    public static final String WECHAT_ID_REQUIRED_MSG = "拼豆预约需填写微信号，便于门店联系";
+
+    /** 核销前置未满足：仅 pay_status='paid' 的 pending 单可核销（ADR-0007 §1.2） */
+    public static final int NOT_PAID = 4015;
+    public static final String NOT_PAID_MSG = "该预约尚未完成支付，不可核销";
+
     private GzBeanErrorCode() {
     }
 }

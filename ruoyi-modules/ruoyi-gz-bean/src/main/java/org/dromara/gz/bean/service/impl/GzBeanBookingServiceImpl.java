@@ -11,24 +11,37 @@ import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.redis.utils.RedisUtils;
 import org.dromara.common.tenant.helper.TenantHelper;
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingSubmitBo;
+import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
 import org.dromara.gz.bean.domain.entity.GzBeanBooking;
 import org.dromara.gz.bean.domain.entity.GzBeanBookingLog;
 import org.dromara.gz.bean.domain.entity.GzBeanSeat;
+import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
 import org.dromara.gz.bean.domain.entity.GzBeanStore;
+import org.dromara.gz.bean.domain.entity.GzBeanTimeSlotTemplate;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingMpSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
+import org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanStaffOverviewVO;
+import org.dromara.gz.bean.domain.vo.GzBeanTypeSlotAvailabilityVO;
 import org.dromara.gz.bean.exception.GzBeanErrorCode;
 import org.dromara.gz.bean.mapper.GzBeanBookingLogMapper;
 import org.dromara.gz.bean.mapper.GzBeanBookingMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatMapper;
+import org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper;
 import org.dromara.gz.bean.mapper.GzBeanStoreMapper;
+import org.dromara.gz.bean.mapper.GzBeanTimeSlotTemplateMapper;
 import org.dromara.gz.bean.service.IGzBeanBookingService;
 import org.dromara.gz.bean.service.internal.QrCodeSigner;
 import org.dromara.gz.common.domain.entity.GzUser;
 import org.dromara.gz.common.mapper.GzUserMapper;
+import org.dromara.gz.common.pay.domain.bo.CreateOrderBo;
+import org.dromara.gz.common.pay.domain.vo.MpPayParamsVO;
+import org.dromara.gz.common.pay.enums.PayBusinessType;
+import org.dromara.gz.common.pay.service.IGzPayTransactionService;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -38,6 +51,8 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -68,6 +83,21 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     private static final String STATUS_CANCELLED = "cancelled";
     private static final String STATUS_NO_SHOW = "no_show";
 
+    /** 付费状态机（V1.2，doc/11 §3.8 / 附录 A.15） */
+    private static final String PAY_STATUS_UNPAID = "unpaid";
+    private static final String PAY_STATUS_PAYING = "paying";
+    private static final String PAY_STATUS_PAID = "paid";
+    private static final String PAY_STATUS_PAY_CLOSED = "pay_closed";
+
+    /** 座位类型 value → 中文名（= 字典 gz_bean_seat_type，附录 A.14）。
+     *  硬编码映射原因同 GzBeanSeatTypeConfigServiceImpl.VALID_SEAT_TYPES：业务租户上下文查不到系统级字典
+     *  （seed tenant_id='000000'，memory ruoyi-menu-dict-gotchas）。扩展类型时同步加此 Map + 字典项。 */
+    private static final Map<String, String> SEAT_TYPE_NAME = Map.of(
+        "single", "单人", "double", "双人", "quad", "四人桌");
+
+    /** unpaid 超时回收默认时长（分钟，doc/10 §11 Q11.2，与微信 JSAPI 订单超时对齐） */
+    private static final int DEFAULT_UNPAID_TIMEOUT_MINUTES = 15;
+
     private static final String OPERATOR_USER = "user";
     private static final String OPERATOR_ADMIN = "admin";
     /** cron 系统操作者（doc/11 §3.5 operator_type 口径 system；operator_id 为 null） */
@@ -91,6 +121,17 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     private final GzBeanStoreMapper storeMapper;
     private final GzUserMapper gzUserMapper;
     private final QrCodeSigner qrCodeSigner;
+    /** V1.2 座位类型配额配置（GZ-BEAN-013）— 下单取单价 + quantity */
+    private final GzBeanSeatTypeConfigMapper seatTypeConfigMapper;
+    /** V1.2 时段模板（GZ-BEAN-002）— 余量查询枚举启用时段 */
+    private final GzBeanTimeSlotTemplateMapper timeSlotTemplateMapper;
+    /**
+     * V1.2 支付建单服务（gz-common PAY-101）— 用 {@link ObjectProvider} 延迟解析打断构造期循环依赖：
+     * 本类 → PindouPayCallbackHandler → 本类（handler 依赖本 service 回调）+
+     * 本类 → IGzPayTransactionService → PayCallbackDispatcher → PindouPayCallbackHandler → 本类。
+     * 建单（submitPaid）才用到，构造期无需就绪，调用点 getObject() 惰性取实例。
+     */
+    private final ObjectProvider<IGzPayTransactionService> payServiceProvider;
 
     // ============================================================
     //  mp 提交预约
@@ -297,9 +338,17 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             throw new ServiceException(GzBeanErrorCode.BOOKING_NOT_FOUND_MSG, GzBeanErrorCode.BOOKING_NOT_FOUND);
         }
 
-        // ③ HMAC 校签（口径与 BEAN-004 submit / BEAN-005 详情即时重算一致）
-        boolean signOk = qrCodeSigner.verify(
-            booking.getBookingNo(), booking.getSessDate(), booking.getSeatId(), verifyCode);
+        // ③ HMAC 校签：核销码持久化时用什么因子签的就用什么校。判别真源 = seat_id 是否非空：
+        //    - 旧 booking（seat_id 非空，含迁移后补了 seat_type 的旧免费单）：verify_code 当年用 seat_id 签 → verify(seat_id)
+        //    - V1.2 新付费单（seat_id NULL，seat_type 非空）：onPaid 时用 seat_type 签（doc/11 §3.8）→ verifyByType
+        boolean signOk;
+        if (booking.getSeatId() != null) {
+            signOk = qrCodeSigner.verify(
+                booking.getBookingNo(), booking.getSessDate(), booking.getSeatId(), verifyCode);
+        } else {
+            signOk = qrCodeSigner.verifyByType(
+                booking.getBookingNo(), booking.getSessDate(), booking.getSeatType(), verifyCode);
+        }
         if (!signOk) {
             log.warn("[bean-verify-scan] signature mismatch bookingNo={} (篡改 / 非本店码)", bookingNo);
             throw new ServiceException(GzBeanErrorCode.QR_SIGNATURE_INVALID_MSG, GzBeanErrorCode.QR_SIGNATURE_INVALID);
@@ -327,6 +376,12 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             // doc/10 §3 E6/E7：已核销 / 已取消 / 已过期 → 拼当前状态中文，admin 端按 INVALID_STATUS code 映射文案
             throw new ServiceException(GzBeanErrorCode.INVALID_STATUS_MSG + "（当前状态：" + booking.getStatus() + "）",
                 GzBeanErrorCode.INVALID_STATUS);
+        }
+        // V1.2 付费前置（ADR-0007 §1.2）：仅 pay_status='paid' 的 pending 单可核销。
+        // pay_status 为 null（理论上不存在 — 迁移已回填）容错按 paid 放行；旧免费单迁移后 pay_status=paid。
+        if (booking.getPayStatus() != null && !PAY_STATUS_PAID.equals(booking.getPayStatus())) {
+            throw new ServiceException(GzBeanErrorCode.NOT_PAID_MSG + "（当前支付状态：" + booking.getPayStatus() + "）",
+                GzBeanErrorCode.NOT_PAID);
         }
 
         // 核销 → status=used + verifyTime + verifiedBy；dedupToken 切到 booking_no 让座位可被释放给同时段下次抢
@@ -590,10 +645,19 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
      * doc/10 §3 R4 兜底）。verifyCode 走 {@link QrCodeSigner#sign} 重算，不读 DB 持久列。</p>
      */
     private String buildQrPayload(GzBeanBookingVO vo) {
-        if (StrUtil.isBlank(vo.getBookingNo()) || vo.getSessDate() == null || vo.getSeatId() == null) {
+        if (StrUtil.isBlank(vo.getBookingNo()) || vo.getSessDate() == null) {
             return null;
         }
-        String verifyCode = qrCodeSigner.sign(vo.getBookingNo(), vo.getSessDate(), vo.getSeatId());
+        // 判别真源同 doVerify：seat_id 非空 = 旧 booking（verify_code 用 seat_id 签）；
+        // seat_id NULL + seat_type 非空 = V1.2 新付费单（verify_code 用 seat_type 签，doc/11 §3.8）。
+        String verifyCode;
+        if (vo.getSeatId() != null) {
+            verifyCode = qrCodeSigner.sign(vo.getBookingNo(), vo.getSessDate(), vo.getSeatId());
+        } else if (StrUtil.isNotBlank(vo.getSeatType())) {
+            verifyCode = qrCodeSigner.signByType(vo.getBookingNo(), vo.getSessDate(), vo.getSeatType());
+        } else {
+            return null;
+        }
         return qrCodeSigner.buildQrPayload(vo.getBookingNo(), verifyCode);
     }
 
@@ -624,6 +688,376 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         // 列表展示门店名 → 批量 enrich（复用 BEAN-005 私有方法，避免 N+1）
         enrichStoreInfoBatch(page.getRecords());
         return TableDataInfo.build(page);
+    }
+
+    // ============================================================
+    //  GZ-BEAN-014 V1.2 付费下单事务（ADR-0007 / ADR-0008）
+    // ============================================================
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public GzBeanPaidSubmitVO submitPaid(GzBeanPaidBookingSubmitBo bo, Long userId) {
+        if (userId == null) {
+            throw new ServiceException("未登录");
+        }
+
+        // ① 用户存在 + 手机号 + 微信号已采集（doc/10 §11.N6）
+        GzUser user = gzUserMapper.selectById(userId);
+        if (user == null) {
+            throw new ServiceException("user.notFound");
+        }
+        if (StrUtil.isBlank(user.getMobile())) {
+            throw new ServiceException(GzBeanErrorCode.PHONE_REQUIRED_MSG, GzBeanErrorCode.PHONE_REQUIRED);
+        }
+        if (StrUtil.isBlank(user.getWechatId())) {
+            throw new ServiceException(GzBeanErrorCode.WECHAT_ID_REQUIRED_MSG, GzBeanErrorCode.WECHAT_ID_REQUIRED);
+        }
+        String tenantId = user.getTenantId();
+
+        // ② Redis 锁：用户提交锁（防连点，5s）。含 dedupClientToken 合并 key（同 UUID 5s 内幂等）。
+        String userLockKey = LOCK_USER_SUBMIT_PREFIX + userId
+            + (StrUtil.isNotBlank(bo.getDedupClientToken()) ? ":" + bo.getDedupClientToken() : "");
+        if (!tryAcquireRedisLock(userLockKey)) {
+            log.info("[bean-paid-submit] user_submit lock taken userId={} dedupClientToken={}",
+                userId, bo.getDedupClientToken());
+            throw new ServiceException(GzBeanErrorCode.SUBMIT_TOO_FAST_MSG, GzBeanErrorCode.SUBMIT_TOO_FAST);
+        }
+
+        // ③ 校验门店
+        GzBeanStore store = storeMapper.selectById(bo.getStoreId());
+        if (store == null) {
+            throw new ServiceException("门店不存在");
+        }
+
+        // ④ 校验座位类型配置存在 + 启用（拿单价 + quantity）
+        GzBeanSeatTypeConfig config = seatTypeConfigMapper.selectOne(
+            Wrappers.<GzBeanSeatTypeConfig>lambdaQuery()
+                .eq(GzBeanSeatTypeConfig::getStoreId, bo.getStoreId())
+                .eq(GzBeanSeatTypeConfig::getSeatType, bo.getSeatType())
+                .last("LIMIT 1"));
+        if (config == null) {
+            throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_NOT_CONFIGURED_MSG, GzBeanErrorCode.SEAT_TYPE_NOT_CONFIGURED);
+        }
+        if (config.getEnabled() == null || config.getEnabled() != 1) {
+            throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_DISABLED_MSG, GzBeanErrorCode.SEAT_TYPE_DISABLED);
+        }
+        long quantity = config.getQuantity() == null ? 0L : config.getQuantity();
+
+        // ⑤ 幂等：同用户同 (类型,日期,时段) 已有活跃 booking → 返回原单（doc/10 §11 Q11.3）
+        long userActive = bookingMapper.countActiveUserTypeSlot(
+            tenantId, userId, bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), bo.getSlotStart());
+        if (userActive > 0) {
+            throw new ServiceException(GzBeanErrorCode.DUPLICATE_USER_BOOKING_MSG, GzBeanErrorCode.DUPLICATE_USER_BOOKING);
+        }
+
+        // ⑥ 防超卖：COUNT(活跃) FOR UPDATE 比对 quantity，满则拒单回滚（AC 3，doc/11 §3.6）
+        long active = bookingMapper.countActiveByTypeSlotForUpdate(
+            tenantId, bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), bo.getSlotStart());
+        if (active >= quantity) {
+            log.info("[bean-paid-submit] quota full storeId={} seatType={} date={} slot={} active={} quantity={}",
+                bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), bo.getSlotStart(), active, quantity);
+            throw new ServiceException(GzBeanErrorCode.QUOTA_FULL_MSG, GzBeanErrorCode.QUOTA_FULL);
+        }
+
+        // ⑦ 计费：单笔金额 = 该类型单价 snapshot（单笔单时段无累加）
+        long amountCent = config.getPriceCent() == null ? 0L : config.getPriceCent();
+        // 券抵扣 = D13 COUPON-002 实现，本卡恒 0（仅记 couponId 占位）
+        long discountAmountCent = 0L;
+        long payAmountCent = Math.max(0L, amountCent - discountAmountCent);
+
+        // ⑧ 生成 booking_no
+        LocalDateTime now = LocalDateTime.now();
+        String bookingNo = generateBookingNo(now.toLocalDate());
+        String seatTypeName = SEAT_TYPE_NAME.getOrDefault(bo.getSeatType(), bo.getSeatType());
+
+        boolean free = payAmountCent <= 0L;
+
+        // ⑨ INSERT 一行 booking。免费单（实付=0）直接 paid + 生成 verify_code（ADR-0007 §1.4）；
+        //    付费单 pay_status=paying（建支付单后），verify_code 留 NULL（onPaid 才生成）。
+        GzBeanBooking entity = GzBeanBooking.builder()
+            .bookingNo(bookingNo)
+            .userId(userId)
+            .storeId(bo.getStoreId())
+            // seatId / seatNoSnapshot / dedupToken：V1.2 不写（NULL）
+            .seatType(bo.getSeatType())
+            .seatTypeSnapshot(seatTypeName)
+            .sessDate(bo.getSessDate())
+            .slotStart(bo.getSlotStart())
+            .slotEnd(bo.getSlotEnd())
+            .mobileSnapshot(user.getMobile())
+            .wechatIdSnapshot(user.getWechatId())
+            .amountCent(amountCent)
+            .discountAmountCent(discountAmountCent)
+            .couponId(bo.getCouponId())
+            .status(STATUS_PENDING)
+            .payStatus(free ? PAY_STATUS_PAID : PAY_STATUS_PAYING)
+            .verifyCode(free ? qrCodeSigner.signByType(bookingNo, bo.getSessDate(), bo.getSeatType()) : null)
+            .delFlag("0")
+            .build();
+        bookingMapper.insert(entity);
+
+        // TODO(D13-COUPON-002): 选券时此处锁券（gz_user_coupon unused → locked），下单事务回滚自动解锁；
+        //   实付重算 payAmountCent = amountCent − 券面额（下限 0）。本卡仅透传 couponId 占位，不锁不抵扣。
+
+        // ⑩ 首条 booking_log
+        bookingLogMapper.insert(GzBeanBookingLog.builder()
+            .bookingId(entity.getId())
+            .fromStatus(null)
+            .toStatus(STATUS_PENDING)
+            .operatorType(OPERATOR_USER)
+            .operatorId(String.valueOf(userId))
+            .note(free ? "用户提交付费预约（免费单，直接 paid）" : "用户提交付费预约（待支付）")
+            .delFlag("0")
+            .build());
+
+        // ⑪ 免费单兜底：不建支付单，已 paid，直接返回（ADR-0007 §1.4）
+        if (free) {
+            log.info("[bean-paid-submit] FREE booking paid bookingNo={} userId={} seatType={} amount=0",
+                bookingNo, userId, bo.getSeatType());
+            return buildPaidSubmitVO(entity, payAmountCent, true, null);
+        }
+
+        // ⑫ 付费单：建 pindou 支付单（business_order_no = booking_no），拿 mp 五参 + out_trade_no
+        CreateOrderBo orderBo = CreateOrderBo.builder()
+            .businessType(PayBusinessType.PINDOU)
+            .businessOrderNo(bookingNo)
+            .amountCent(payAmountCent)
+            .openid(user.getOpenid())
+            .userId(userId)
+            .description("谷子宇宙拼豆预约 · " + seatTypeName)
+            .build();
+        MpPayParamsVO payParams = payServiceProvider.getObject().createBusinessOrder(orderBo);
+
+        // 回写 out_trade_no 到 booking（支付回调 onPaid 用 booking_no 定位，out_trade_no 做对账校验）
+        GzBeanBooking patch = new GzBeanBooking();
+        patch.setId(entity.getId());
+        patch.setOutTradeNo(payParams.getOutTradeNo());
+        bookingMapper.updateById(patch);
+        entity.setOutTradeNo(payParams.getOutTradeNo());
+
+        log.info("[bean-paid-submit] PAID booking created bookingNo={} userId={} seatType={} amount={} outTradeNo={}",
+            bookingNo, userId, bo.getSeatType(), payAmountCent, payParams.getOutTradeNo());
+        return buildPaidSubmitVO(entity, payAmountCent, false, payParams);
+    }
+
+    private GzBeanPaidSubmitVO buildPaidSubmitVO(GzBeanBooking e, long payAmountCent, boolean free, MpPayParamsVO payParams) {
+        return GzBeanPaidSubmitVO.builder()
+            .id(e.getId())
+            .bookingNo(e.getBookingNo())
+            .seatType(e.getSeatType())
+            .seatTypeSnapshot(e.getSeatTypeSnapshot())
+            .sessDate(e.getSessDate())
+            .slotStart(e.getSlotStart())
+            .slotEnd(e.getSlotEnd())
+            .amountCent(e.getAmountCent())
+            .discountAmountCent(e.getDiscountAmountCent())
+            .payAmountCent(payAmountCent)
+            .payStatus(e.getPayStatus())
+            .free(free)
+            .outTradeNo(e.getOutTradeNo())
+            .payParams(payParams)
+            .build();
+    }
+
+    // ============================================================
+    //  GZ-BEAN-014 余量查询（AC 4）
+    // ============================================================
+
+    @Override
+    public List<GzBeanTypeSlotAvailabilityVO> selectTypeSlotAvailability(Long storeId, LocalDate sessDate) {
+        if (storeId == null || sessDate == null) {
+            return List.of();
+        }
+        GzBeanStore store = storeMapper.selectById(storeId);
+        if (store == null) {
+            return List.of();
+        }
+        String tenantId = store.getTenantId();
+
+        // 关多租户拦截器按 store 的租户显式 scope（mp 用户态 JWT tenant 不可靠，同 submit 注释）
+        return TenantHelper.ignore(() -> {
+            // 启用的座位类型配置（按 sortNo / seatType 升序）
+            List<GzBeanSeatTypeConfig> configs = seatTypeConfigMapper.selectList(
+                Wrappers.<GzBeanSeatTypeConfig>lambdaQuery()
+                    .eq(GzBeanSeatTypeConfig::getTenantId, tenantId)
+                    .eq(GzBeanSeatTypeConfig::getStoreId, storeId)
+                    .eq(GzBeanSeatTypeConfig::getEnabled, 1)
+                    .orderByAsc(GzBeanSeatTypeConfig::getSortNo)
+                    .orderByAsc(GzBeanSeatTypeConfig::getSeatType));
+            if (configs.isEmpty()) {
+                return List.of();
+            }
+            // 该日启用的时段模板（weekday / 生效区间过滤）
+            List<GzBeanTimeSlotTemplate> slots = selectEnabledSlotsForDate(tenantId, storeId, sessDate);
+            if (slots.isEmpty()) {
+                return List.of();
+            }
+
+            List<GzBeanTypeSlotAvailabilityVO> result = new ArrayList<>(configs.size() * slots.size());
+            for (GzBeanSeatTypeConfig cfg : configs) {
+                int quantity = cfg.getQuantity() == null ? 0 : cfg.getQuantity();
+                String typeName = SEAT_TYPE_NAME.getOrDefault(cfg.getSeatType(), cfg.getSeatType());
+                for (GzBeanTimeSlotTemplate slot : slots) {
+                    long activeCount = bookingMapper.countActiveByTypeSlot(
+                        tenantId, storeId, cfg.getSeatType(), sessDate, slot.getStartTime());
+                    int remaining = (int) Math.max(0L, quantity - activeCount);
+                    result.add(GzBeanTypeSlotAvailabilityVO.builder()
+                        .seatType(cfg.getSeatType())
+                        .seatTypeName(typeName)
+                        .priceCent(cfg.getPriceCent())
+                        .slotStart(slot.getStartTime())
+                        .slotEnd(slot.getEndTime())
+                        .quantity(quantity)
+                        .activeCount(activeCount)
+                        .remaining(remaining)
+                        .full(remaining <= 0)
+                        .build());
+                }
+            }
+            return result;
+        });
+    }
+
+    /**
+     * 该日启用时段模板过滤（doc/11 §3.2 重要语义：enabled=1 + weekdays 含该 ISO 星期 + 生效区间）。
+     * 复用 BEAN-002/003 口径，应用层 contains 判 weekdays（逗号分隔）。
+     */
+    private List<GzBeanTimeSlotTemplate> selectEnabledSlotsForDate(String tenantId, Long storeId, LocalDate date) {
+        List<GzBeanTimeSlotTemplate> all = timeSlotTemplateMapper.selectList(
+            Wrappers.<GzBeanTimeSlotTemplate>lambdaQuery()
+                .eq(GzBeanTimeSlotTemplate::getTenantId, tenantId)
+                .eq(GzBeanTimeSlotTemplate::getStoreId, storeId)
+                .eq(GzBeanTimeSlotTemplate::getEnabled, 1)
+                .orderByAsc(GzBeanTimeSlotTemplate::getSortNo)
+                .orderByAsc(GzBeanTimeSlotTemplate::getStartTime));
+        int isoWeekday = date.getDayOfWeek().getValue(); // 1=Mon ... 7=Sun
+        String weekdayStr = String.valueOf(isoWeekday);
+        // LinkedHashMap 按 startTime 去重（同 startTime 多模板只取一个，余量按 slot_start 计数）
+        Map<LocalTime, GzBeanTimeSlotTemplate> dedup = new LinkedHashMap<>();
+        for (GzBeanTimeSlotTemplate t : all) {
+            if (!containsWeekday(t.getWeekdays(), weekdayStr)) {
+                continue;
+            }
+            if (t.getEffectiveDate() != null && date.isBefore(t.getEffectiveDate())) {
+                continue;
+            }
+            if (t.getExpireDate() != null && date.isAfter(t.getExpireDate())) {
+                continue;
+            }
+            dedup.putIfAbsent(t.getStartTime(), t);
+        }
+        return new ArrayList<>(dedup.values());
+    }
+
+    /** weekdays 逗号分隔 contains 判定（按 token 精确匹配，防 "1" 命中 "11"）。 */
+    private boolean containsWeekday(String weekdays, String isoWeekday) {
+        if (StrUtil.isBlank(weekdays)) {
+            return true; // 空 weekdays 视为全周（与 BEAN-002 默认 "1,2,3,4,5,6,7" 兼容）
+        }
+        for (String token : weekdays.split(",")) {
+            if (token.trim().equals(isoWeekday)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ============================================================
+    //  GZ-BEAN-014 付费双状态机推进（onPaid / pay_closed）
+    // ============================================================
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void onPindouPaid(String bookingNo, String outTradeNo) {
+        GzBeanBooking booking = bookingMapper.selectByBookingNo(bookingNo);
+        if (booking == null) {
+            // 回调事务内 → 抛异常让整笔回调回滚（微信重试 + PAY-102 补单兜底，doc/10 §6.E2）
+            throw new ServiceException("拼豆预约不存在: bookingNo=" + bookingNo);
+        }
+        // 幂等：已 paid（含核销后 used）→ 跳过（PAY-101 SPI 已保证至多调一次，此处守卫双保险）
+        if (!PAY_STATUS_PAYING.equals(booking.getPayStatus())) {
+            log.info("[bean-onpaid] booking pay_status={} ≠ paying, idempotent skip bookingNo={}",
+                booking.getPayStatus(), bookingNo);
+            return;
+        }
+        // 生成核销码（签名因子 booking_no + sess_date + seat_type，doc/11 §3.8）
+        String verifyCode = qrCodeSigner.signByType(booking.getBookingNo(), booking.getSessDate(), booking.getSeatType());
+        int affected = bookingMapper.markPaid(booking.getId(), verifyCode);
+        if (affected == 0) {
+            // 并发已被推进 → 幂等跳过（条件 UPDATE 守卫）
+            log.info("[bean-onpaid] markPaid affected=0 (concurrent), idempotent skip bookingNo={}", bookingNo);
+            return;
+        }
+        bookingLogMapper.insert(GzBeanBookingLog.builder()
+            .bookingId(booking.getId())
+            .fromStatus(booking.getStatus())   // status 不变（仍 pending）
+            .toStatus(booking.getStatus())
+            .operatorType(OPERATOR_SYSTEM)
+            .operatorId(null)
+            .note("支付成功（pay_status paying → paid），核销码已生成 outTradeNo=" + outTradeNo)
+            .delFlag("0")
+            .build());
+        log.info("[bean-onpaid] booking paid bookingNo={} outTradeNo={} verifyCode generated", bookingNo, outTradeNo);
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public boolean closePindou(Long bookingId) {
+        GzBeanBooking booking = bookingMapper.selectById(bookingId);
+        if (booking == null) {
+            return false;
+        }
+        int affected = bookingMapper.markPayClosed(bookingId, LocalDateTime.now());
+        if (affected == 0) {
+            // 已非 unpaid/paying（已 paid / 已关闭）→ 幂等跳过
+            return false;
+        }
+        // TODO(D13-COUPON-002): 此处回滚锁定的券（gz_user_coupon locked → unused），ADR-0007 §1.5。
+        bookingLogMapper.insert(GzBeanBookingLog.builder()
+            .bookingId(bookingId)
+            .fromStatus(STATUS_PENDING)
+            .toStatus(STATUS_CANCELLED)
+            .operatorType(OPERATOR_SYSTEM)
+            .operatorId(null)
+            .note("支付关闭（pay_status → pay_closed，status → cancelled），释放配额")
+            .delFlag("0")
+            .build());
+        log.info("[bean-payclosed] booking closed bookingId={} (quota released)", bookingId);
+        return true;
+    }
+
+    @Override
+    public ExpiredUnpaidResult markExpiredUnpaidBatch(int timeoutMinutes) {
+        int timeout = timeoutMinutes > 0 ? timeoutMinutes : DEFAULT_UNPAID_TIMEOUT_MINUTES;
+        // cron 无登录态 → 关多租户拦截器全租户扫（V1.0 仅 '1001'）
+        return TenantHelper.ignore(() -> {
+            LocalDateTime deadline = LocalDateTime.now().minusMinutes(timeout);
+            List<Long> ids = bookingMapper.selectExpiredUnpaidIds(deadline);
+            int scanned = ids.size();
+            if (scanned == 0) {
+                log.info("[bean-unpaid-expire] no expired unpaid bookings, skip");
+                return new ExpiredUnpaidResult(0, 0, 0, 0);
+            }
+            log.info("[bean-unpaid-expire] scan {} expired unpaid bookings (timeout={}min), start", scanned, timeout);
+            int closed = 0;
+            int skipped = 0;
+            int failed = 0;
+            for (Long id : ids) {
+                try {
+                    if (closePindou(id)) {
+                        closed++;
+                    } else {
+                        skipped++;
+                    }
+                } catch (Exception ex) {
+                    failed++;
+                    log.error("[bean-unpaid-expire] close FAILED bookingId={}, continue next", id, ex);
+                }
+            }
+            log.info("[bean-unpaid-expire] done. scanned={} closed={} skipped={} failed={}",
+                scanned, closed, skipped, failed);
+            return new ExpiredUnpaidResult(scanned, closed, skipped, failed);
+        });
     }
 
     // ============================================================

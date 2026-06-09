@@ -48,6 +48,12 @@ public class GzBeanBookingVO implements Serializable {
 
     private String seatNoSnapshot;
 
+    /** V1.2 座位类型（single/double/quad；前端 dict-tag gz_bean_seat_type 翻译） */
+    private String seatType;
+
+    /** V1.2 座位类型中文名快照 */
+    private String seatTypeSnapshot;
+
     @JsonFormat(pattern = "yyyy-MM-dd")
     private LocalDate sessDate;
 
@@ -60,7 +66,26 @@ public class GzBeanBookingVO implements Serializable {
     /** 手机号（admin 看全 / mp 详情脱敏由前端处理） */
     private String mobileSnapshot;
 
+    /** V1.2 付款前采集微信号快照（admin 看全） */
+    private String wechatIdSnapshot;
+
+    /** V1.2 本笔金额（分）= 座位类型单价 */
+    private Long amountCent;
+
+    /** V1.2 优惠券抵扣额（分） */
+    private Long discountAmountCent;
+
+    /** V1.2 FK → gz_user_coupon.id（未用券为 null） */
+    @JsonSerialize(using = ToStringSerializer.class)
+    private Long couponId;
+
+    /** V1.2 支付单业务码（免费单为 null） */
+    private String outTradeNo;
+
     private String status;
+
+    /** V1.2 付费状态机 unpaid/paying/paid/pay_closed/refunded（前端 dict-tag gz_bean_pay_status 翻译） */
+    private String payStatus;
 
     @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
     private LocalDateTime verifyTime;

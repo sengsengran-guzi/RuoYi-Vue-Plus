@@ -66,6 +66,34 @@ public class QrCodeSigner {
     }
 
     /**
+     * 生成 verify_code（V1.2 付费模型 — 签名因子改 booking_no + sess_date + seat_type，doc/11 §3.8）。
+     *
+     * <p>V1.2 单笔单时段不再用废弃的 seat_id，改用本笔预约的座位类型作签名因子。</p>
+     *
+     * @param bookingNo 业务码
+     * @param sessDate  预约日期
+     * @param seatType  座位类型（single/double/quad）
+     * @return HMAC-SHA256 截 32 位 hex 字符串
+     */
+    public String signByType(String bookingNo, LocalDate sessDate, String seatType) {
+        if (bookingNo == null || sessDate == null || seatType == null) {
+            throw new ServiceException("QrCodeSigner: bookingNo/sessDate/seatType 不能为空");
+        }
+        String payload = bookingNo + "|" + sessDate + "|" + seatType;
+        return hmacSha256Hex(payload, properties.getSigningSecret()).substring(0, VERIFY_CODE_LENGTH);
+    }
+
+    /**
+     * 校验 verify_code 是否与 (bookingNo + sessDate + seatType) 匹配（V1.2 付费单核销时调）。
+     */
+    public boolean verifyByType(String bookingNo, LocalDate sessDate, String seatType, String verifyCode) {
+        if (verifyCode == null) {
+            return false;
+        }
+        return verifyCode.equals(signByType(bookingNo, sessDate, seatType));
+    }
+
+    /**
      * 生成 QR payload 字符串（mp 端用此渲染二维码）。
      *
      * <p>格式：{@code "BK|{bookingNo}|{verifyCode}"} — 短码长度 ~50 字符。</p>

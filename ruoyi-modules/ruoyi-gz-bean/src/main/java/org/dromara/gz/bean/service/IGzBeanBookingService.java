@@ -4,9 +4,12 @@ import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingSubmitBo;
+import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingMpSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
+import org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanStaffOverviewVO;
+import org.dromara.gz.bean.domain.vo.GzBeanTypeSlotAvailabilityVO;
 
 import java.time.LocalDate;
 import java.time.LocalTime;
@@ -176,4 +179,89 @@ public interface IGzBeanBookingService {
      * admin 分页列表。
      */
     TableDataInfo<GzBeanBookingVO> selectPageList(GzBeanBookingQueryBo query, PageQuery pageQuery);
+
+    // ============================================================
+    //  GZ-BEAN-014 V1.2 付费模型（ADR-0007 / ADR-0008 / doc/10 §11 / doc/11 §3.5-3.8）
+    // ============================================================
+
+    /**
+     * mp 端付费预约下单事务（GZ-BEAN-014 AC 2/3/5，doc/10 §11.N7）。
+     *
+     * <p><b>单笔单时段</b>：建<b>一行</b> booking = 1 用户 × 1 门店 × 1 座位类型 × 1 时段。
+     * {@code amount_cent} = 该座位类型单价 snapshot（无累加无子表）。</p>
+     *
+     * <p><b>下单事务（防超卖 + 付费前置）</b>：</p>
+     * <ol>
+     *   <li>校验手机号 + 微信号已采集（doc/10 §11.N6）</li>
+     *   <li>校验座位类型配置存在 + 启用（拿单价 + quantity）</li>
+     *   <li>幂等：同用户同 (类型,日期,时段) 已有活跃 booking → 返回原单（doc/10 §11 Q11.3）</li>
+     *   <li><b>配额 COUNT(活跃) FOR UPDATE</b> 比对 quantity，满则拒单回滚（AC 3）</li>
+     *   <li>INSERT 一行 booking（status=pending）：实付&gt;0 → pay_status=paying + 建 pindou 支付单；
+     *       免费单（单价=0 无券）→ pay_status=paid + 生成 verify_code（兜底，ADR-0007 §1.4）</li>
+     * </ol>
+     *
+     * @param bo     付费下单参数（storeId / seatType / sessDate / slot / couponId?）
+     * @param userId 当前登录 user_id（sa-token 拿）
+     * @return 提交结果（含实付 + 支付五参 / 免费单标记）
+     */
+    GzBeanPaidSubmitVO submitPaid(GzBeanPaidBookingSubmitBo bo, Long userId);
+
+    /**
+     * mp 选座余量查询（GZ-BEAN-014 AC 4，doc/10 §11.N3/N4 + doc/11 §3.6）。
+     *
+     * <p>对某门店某日各 {@code (启用座位类型 × 启用时段)} 组合返回余量 =
+     * {@code quantity − 活跃 booking 计数}（N&gt;0 还剩 N / N≤0 已满）。供 mp 选座实时显余量。</p>
+     *
+     * @param storeId  门店 ID
+     * @param sessDate 预约日期
+     * @return 各 (类型,时段) 余量列表（按 sortNo / slot 升序）
+     */
+    List<GzBeanTypeSlotAvailabilityVO> selectTypeSlotAvailability(Long storeId, LocalDate sessDate);
+
+    /**
+     * 支付成功业务回调（GZ-BEAN-014 AC 5，doc/10 §11.N9）。由 {@code PindouPayCallbackHandler.onPaid}
+     * 在 PAY-101 回调事务内调用（business_order_no = booking_no 定位）。
+     *
+     * <p>条件 UPDATE {@code pay_status: paying → paid} + 生成 verify_code
+     * （{@code HmacSHA256(booking_no+sess_date+seat_type)}，doc/11 §3.8）+ 写 booking_log。
+     * {@code status} 不动（仍 pending，等到店核销 — ADR-0007 §1.4）。幂等：已 paid 的单跳过。</p>
+     *
+     * @param bookingNo 业务码（= 支付交易 business_order_no）
+     * @param outTradeNo 支付单业务码（校验对账用）
+     */
+    void onPindouPaid(String bookingNo, String outTradeNo);
+
+    /**
+     * 支付关闭（超时未付 / 用户放弃，GZ-BEAN-014 AC 5，doc/10 §11.N13a / ADR-0007 §1.5）。
+     *
+     * <p>条件 UPDATE {@code pay_status: unpaid/paying → pay_closed} + {@code status: pending → cancelled}
+     * （同步释放该 (类型,时段) 配额名额）+ 写 booking_log。券回滚 hook 位（D13 COUPON-002 接）。
+     * 幂等：已终态的单跳过。</p>
+     *
+     * @param bookingId 预约 id
+     * @return true = 关闭成功 / false = 已非 unpaid/paying（幂等跳过）
+     */
+    boolean closePindou(Long bookingId);
+
+    /**
+     * 批量回收超时未付的占位单（GZ-BEAN-014 AC 8，doc/10 §11.N13a）。
+     *
+     * <p>扫 {@code pay_status IN (unpaid,paying) AND status=pending AND create_time < now−timeout} →
+     * 逐条 {@link #closePindou} 释放配额。单条失败隔离不中断整批（同 no_show 模式）。</p>
+     *
+     * @param timeoutMinutes 超时分钟数（默认 15，doc/10 §11 Q11.2）
+     * @return 批处理结果（扫描 / 关闭 / 跳过 / 失败）
+     */
+    ExpiredUnpaidResult markExpiredUnpaidBatch(int timeoutMinutes);
+
+    /**
+     * 超时未付回收批结果（GZ-BEAN-014 AC 8）。
+     *
+     * @param scanned 扫描数
+     * @param closed  实际关闭数（释放配额）
+     * @param skipped 幂等跳过数（已终态）
+     * @param failed  处理失败数（单条异常）
+     */
+    record ExpiredUnpaidResult(int scanned, int closed, int skipped, int failed) {
+    }
 }

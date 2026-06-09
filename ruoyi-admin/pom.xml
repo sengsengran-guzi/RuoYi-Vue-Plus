@@ -135,6 +135,11 @@
             <artifactId>ruoyi-gz-gacha</artifactId>
             <version>${revision}</version>
         </dependency>
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-gz-coupon</artifactId>
+            <version>${revision}</version>
+        </dependency>
 
         <dependency>
             <groupId>de.codecentric</groupId>

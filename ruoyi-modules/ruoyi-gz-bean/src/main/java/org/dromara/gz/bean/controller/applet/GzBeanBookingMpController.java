@@ -10,10 +10,14 @@ import org.dromara.common.log.enums.BusinessType;
 import org.dromara.common.satoken.utils.LoginHelper;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingSubmitBo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingVerifyScanBo;
+import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingMpSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
+import org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanStaffOverviewVO;
+import org.dromara.gz.bean.domain.vo.GzBeanTypeSlotAvailabilityVO;
 import org.dromara.gz.bean.service.IGzBeanBookingService;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -23,6 +27,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.time.LocalDate;
 import java.util.List;
 
 /**
@@ -93,6 +98,64 @@ public class GzBeanBookingMpController {
             userId, bo.getStoreId(), bo.getSeatId(), bo.getSessDate(), bo.getSlotStart(), bo.getDedupClientToken());
         GzBeanBookingMpSubmitVO vo = bookingService.submit(bo, userId);
         return R.ok(vo);
+    }
+
+    /**
+     * V1.2 付费预约下单（GZ-BEAN-014，单笔单时段，doc/10 §11.N7）。
+     *
+     * <pre>
+     * POST /app/gz/bean/booking/paid-submit
+     * Body:    { storeId, seatType, sessDate, slotStart, slotEnd, couponId?, dedupClientToken? }
+     *
+     * 200 OK（付费单，实付>0）
+     * { "code":200, "data": {
+     *     "id":"...", "bookingNo":"BK...", "seatType":"single", "seatTypeSnapshot":"单人",
+     *     "amountCent":1500, "discountAmountCent":0, "payAmountCent":1500,
+     *     "payStatus":"paying", "free":false, "outTradeNo":"PINDOU-...",
+     *     "payParams": { timeStamp, nonceStr, packageVal, signType, paySign, outTradeNo }
+     * } }
+     * 200 OK（免费单，实付=0 兜底）：free=true, payStatus="paid", payParams=null（mp 直接跳详情）
+     *
+     * 业务错误（R.code）：
+     *   4001 PHONE_REQUIRED          → 弹手机号授权
+     *   4011 QUOTA_FULL              → 「该时段座位已约满」
+     *   4012 SEAT_TYPE_NOT_CONFIGURED→ 「该座位类型暂未开放」
+     *   4013 SEAT_TYPE_DISABLED      → 「该座位类型已停用」
+     *   4014 WECHAT_ID_REQUIRED      → 弹填微信号
+     *   4003 DUPLICATE_USER_BOOKING  → 「您该时段已有预约」
+     *   4004 SUBMIT_TOO_FAST         → 「操作过快」
+     * </pre>
+     */
+    @PostMapping("/paid-submit")
+    @Log(title = "拼豆付费预约下单(mp)", businessType = BusinessType.INSERT)
+    public R<GzBeanPaidSubmitVO> paidSubmit(@Valid @RequestBody GzBeanPaidBookingSubmitBo bo) {
+        Long userId = LoginHelper.getUserId();
+        if (userId == null) {
+            return R.fail(401, "未登录");
+        }
+        log.info("[bean-booking-mp] paid-submit userId={} storeId={} seatType={} sessDate={} slotStart={} couponId={}",
+            userId, bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), bo.getSlotStart(), bo.getCouponId());
+        return R.ok(bookingService.submitPaid(bo, userId));
+    }
+
+    /**
+     * V1.2 选座余量查询（GZ-BEAN-014，doc/10 §11.N3/N4）。
+     *
+     * <pre>
+     * GET /app/gz/bean/booking/type-slots?storeId=1&sessDate=2026-06-20
+     * 200 OK { "code":200, "data": [
+     *   { "seatType":"single","seatTypeName":"单人","priceCent":1500,
+     *     "slotStart":"10:00:00","slotEnd":"12:00:00","quantity":8,"activeCount":3,"remaining":5,"full":false },
+     *   ...
+     * ] }
+     * 每档：remaining>0 → 「还剩 N 个单人座」；remaining≤0（full=true）→ 「已满」灰显。
+     * </pre>
+     */
+    @GetMapping("/type-slots")
+    public R<List<GzBeanTypeSlotAvailabilityVO>> typeSlots(
+        @RequestParam Long storeId,
+        @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate sessDate) {
+        return R.ok(bookingService.selectTypeSlotAvailability(storeId, sessDate));
     }
 
     /**

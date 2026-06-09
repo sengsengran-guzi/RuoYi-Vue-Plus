@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <parent>
+        <groupId>org.dromara</groupId>
+        <artifactId>ruoyi-modules</artifactId>
+        <version>${revision}</version>
+    </parent>
+    <modelVersion>4.0.0</modelVersion>
+
+    <artifactId>ruoyi-gz-coupon</artifactId>
+
+    <description>
+        谷子宇宙优惠券域（GZ-COUPON，V1.2 代金券）：券模板 + 用户券 + 发放策略 SPI（manual 实现，预留 register_window/event）+ admin 模板 CRUD + 批量发放。
+        字段权威 doc/11 §11；业务流 doc/10 §12。本模块只建表 + 发放，券抵扣/锁定/核销 = GZ-COUPON-002（D13）。
+    </description>
+
+    <dependencies>
+        <!-- 谷子业务通用层（传递引入 mybatis / web / tenant / security / log / json 等）+ 复用 gz_user / IGzUserService 发券名单解析 -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-gz-common</artifactId>
+            <version>${revision}</version>
+        </dependency>
+
+        <!-- 单元测试（AC 8：发放乐观锁并发 + manual 策略 happy path，与 gz-news / gz-ord 同款） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+</project>

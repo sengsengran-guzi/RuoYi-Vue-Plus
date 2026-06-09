@@ -62,11 +62,17 @@ public class GzBeanBooking extends TenantEntity {
     /** FK → gz_bean_store.id */
     private Long storeId;
 
-    /** FK → gz_bean_seat.id */
+    /** FK → gz_bean_seat.id（V1.2 起不再写，NULL；旧数据保留原值） */
     private Long seatId;
 
-    /** 提交时座位号 snapshot */
+    /** 提交时座位号 snapshot（V1.2 起不再写；旧数据保留） */
     private String seatNoSnapshot;
+
+    /** V1.2 座位类型 single/double/quad（字典 gz_bean_seat_type；取代旧 seat_id，配额计数维度） */
+    private String seatType;
+
+    /** V1.2 座位类型中文名快照（防字典改名后历史单丢信息） */
+    private String seatTypeSnapshot;
 
     /** 预约日期 */
     private LocalDate sessDate;
@@ -80,10 +86,28 @@ public class GzBeanBooking extends TenantEntity {
     /** 提交时手机号 snapshot（11 位） */
     private String mobileSnapshot;
 
-    /** 状态 pending / used / cancelled / no_show */
+    /** V1.2 付款前采集微信号快照（gz_user.wechat_id snapshot） */
+    private String wechatIdSnapshot;
+
+    /** V1.2 本笔金额（分）= 该座位类型单价 snapshot；单笔单时段无累加 */
+    private Long amountCent;
+
+    /** V1.2 优惠券抵扣额（分）；未用券为 0（券逻辑 D13 COUPON-002） */
+    private Long discountAmountCent;
+
+    /** V1.2 FK → gz_user_coupon.id；未用券为 NULL（券逻辑 D13） */
+    private Long couponId;
+
+    /** V1.2 支付单业务码 PINDOU-yyyyMMdd-6位；免费单为 NULL — UNIQUE(tenant_id, out_trade_no) WHERE NOT NULL */
+    private String outTradeNo;
+
+    /** 业务状态机 pending / used / cancelled / no_show（与 payStatus 正交，ADR-0007） */
     private String status;
 
-    /** 核销码（HMAC-SHA256 截 32 位） — UNIQUE(tenant_id, verify_code) */
+    /** V1.2 付费状态机 unpaid / paying / paid / pay_closed / refunded（与 status 正交，ADR-0007 / 附录 A.15） */
+    private String payStatus;
+
+    /** 核销码（HMAC-SHA256 截 32 位） — UNIQUE(tenant_id, verify_code)；V1.2 onPaid 后生成，unpaid 单为 NULL */
     private String verifyCode;
 
     /** 核销时间（仅 used 状态写） */

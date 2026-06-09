@@ -22,6 +22,7 @@
         <module>ruoyi-gz-news</module>
         <module>ruoyi-gz-ord</module>
         <module>ruoyi-gz-gacha</module>
+        <module>ruoyi-gz-coupon</module>
     </modules>
 
     <artifactId>ruoyi-modules</artifactId>
