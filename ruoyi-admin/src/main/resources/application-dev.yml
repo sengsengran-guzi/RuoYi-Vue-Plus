@@ -279,10 +279,10 @@ wx:
     # 真实 AppID 接入后改为 wx.xxxxxx，自动切换 WxRealLoginAdapter
     appid: ${WX_MA_APPID:wxMOCK}
     secret: ${WX_MA_SECRET:}
-    # session_key Redis TTL（秒），默认 24h（doc/10 §1.N6）
+    # session_key Redis TTL（秒），默认 24h（doc/10 §1.N6；仅解密手机号用，与登录态解耦）
     session-key-ttl-seconds: 86400
-    # 业务 token TTL（秒），默认 7 天（doc/10 §1 状态机注释）
-    token-ttl-seconds: 604800
+    # 业务 token TTL（秒），30 天（ADR-0009 登录态长效；失效由 mp 静默 wx.login 续期，用户无感）
+    token-ttl-seconds: 2592000
 
 --- # 关闭 dev 验证码（kevin-qa Tier 1B Playwright admin E2E 自动化 — Redisson Fury 序列化与 redis-cli SET 不兼容，无法注入绕过；上线前 prod profile 不受影响）
 captcha:

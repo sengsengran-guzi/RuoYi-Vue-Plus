@@ -137,7 +137,9 @@ public class WxLoginServiceImpl implements IWxLoginService {
         SaLoginParameter model = new SaLoginParameter();
         model.setDeviceType("mp");
         model.setTimeout(properties.getTokenTtlSeconds());
-        model.setActiveTimeout(30 * 60L);
+        // ADR-0009 登录态长效：activeTimeout 对齐绝对 TTL（不设 30min 空闲超时），
+        // 让 token 仅按绝对有效期过期，配合 mp 静默 wx.login 续期，C 端「进店即用」不被频繁踢。
+        model.setActiveTimeout(properties.getTokenTtlSeconds());
         model.setExtra(LoginHelper.CLIENT_KEY, clientId);
         LoginHelper.login(loginUser, model);
 

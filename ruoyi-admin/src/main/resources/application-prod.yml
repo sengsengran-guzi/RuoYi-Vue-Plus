@@ -276,7 +276,8 @@ wx:
     appid: ${WX_MA_APPID:wxMOCK}          # prod 部署前由甲方提供，CI/CD env var 注入；缺省 wxMOCK 不报错
     secret: ${WX_MA_SECRET:}
     session-key-ttl-seconds: ${WX_MA_SESSION_KEY_TTL:86400}
-    token-ttl-seconds: ${WX_MA_TOKEN_TTL:604800}
+    # 业务 token TTL（秒），30 天（ADR-0009 登录态长效；失效由 mp 静默 wx.login 续期）
+    token-ttl-seconds: ${WX_MA_TOKEN_TTL:2592000}
 
 --- # 拼豆核销码签名密钥（GZ-BEAN-004）— prod 必须走 env var GZ_BEAN_QR_SECRET（生产前生成 ≥ 32 字符随机串）
 gz:

@@ -57,14 +57,37 @@ public class GzUser extends TenantEntity {
     /** 微信 unionid（甲方未绑公众号/开放平台时为 null） */
     private String unionid;
 
-    /** 昵称（微信授权拉取后用户可编辑覆盖） */
+    /** 昵称（chooseAvatar 时代用 &lt;input type="nickname"&gt; 一次性采集，用户可编辑覆盖；ADR-0009） */
     private String nickname;
 
-    /** 头像 URL（微信侧 CDN URL，不下载到 OSS） */
+    /**
+     * 头像可渲染 URL 缓存（doc/11 §2.1 / ADR-0009）。
+     *
+     * <p><b>V1.2 改语义</b>：头像真源 = {@link #avatarImageId}（COS 对象）；本字段只是按 image_id
+     * 对应 COS 对象拼出的可渲染 URL 缓存（读取时后端按 avatar_image_id 重生成 1h 签名 URL 回填）。
+     * 不再存微信 CDN 临时 URL（临时 URL 会失效）。avatarImageId 为 null（未采集）时可空。</p>
+     */
     private String avatarUrl;
+
+    /**
+     * 头像文件 id（FK gz_file_object.id；GZ-USER-006 / ADR-0009 / doc/11 §2.1 F2.6）。
+     *
+     * <p>chooseAvatar 拿到的临时头像路径上传腾讯云 COS（usage_type='user_avatar'）后落库的 file_object id。
+     * <b>头像落 COS 不存裸 url</b>（跨层契约 #5 + 强约束 #12）；渲染时按本 id 调
+     * {@code IGzFileService#getPresignedUrl} 生成 1h 签名 URL。</p>
+     */
+    private Long avatarImageId;
 
     /** 手机号（拼豆预约时 getPhoneNumber 强收集） */
     private String mobile;
+
+    /**
+     * 微信号（GZ-USER-005 / ADR-0009 / doc/11 §2.1）。
+     *
+     * <p><b>用户手动填</b>：微信不开放任何 API 查微信号（区别于手机号有 getPhoneNumber 一键授权）。
+     * 无 UNIQUE（一个微信号可被多人填）；拼豆付款前采集便于门店联系，资料页可编辑。</p>
+     */
+    private String wechatId;
 
     /** 性别 0=未知 / 1=男 / 2=女（对齐 sys_dict sys_user_sex） */
     private Integer gender;

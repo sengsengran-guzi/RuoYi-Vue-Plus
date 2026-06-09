@@ -7,8 +7,10 @@ import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.common.domain.bo.GzUserQueryBo;
 import org.dromara.gz.common.domain.entity.GzUser;
+import org.dromara.gz.common.domain.vo.GzFileObjectVO;
 import org.dromara.gz.common.domain.vo.GzUserVO;
 import org.dromara.gz.common.mapper.GzUserMapper;
+import org.dromara.gz.common.service.IGzFileService;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -46,11 +48,14 @@ class GzUserServiceImplTest {
     @Mock
     private GzUserMapper baseMapper;
 
+    @Mock
+    private IGzFileService gzFileService;
+
     private GzUserServiceImpl gzUserService;
 
     @BeforeEach
     void setUp() {
-        gzUserService = new GzUserServiceImpl(baseMapper);
+        gzUserService = new GzUserServiceImpl(baseMapper, gzFileService);
     }
 
     @Test
@@ -221,15 +226,54 @@ class GzUserServiceImplTest {
     }
 
     @Test
-    @DisplayName("selectVoById 正常 → 透传 mapper 结果")
+    @DisplayName("selectVoById 正常（无头像 image_id）→ 透传 mapper 结果，不调文件服务")
     void selectVoById_validId_returnsMapperResult() {
         GzUserVO vo = new GzUserVO();
         vo.setId(501L);
+        // avatarImageId == null → 不触发签名 URL 重生成
         when(baseMapper.selectVoById(501L)).thenReturn(vo);
 
         GzUserVO result = gzUserService.selectVoById(501L);
 
         assertNotNull(result);
         assertEquals(501L, result.getId());
+        verify(gzFileService, never()).getPresignedUrl(any());
+    }
+
+    @Test
+    @DisplayName("GZ-USER-006：selectVoById 有 avatar_image_id → 按 image_id 重生成签名 URL 回填 avatarUrl")
+    void selectVoById_withAvatarImageId_resolvesPresignedUrl() {
+        GzUserVO vo = new GzUserVO();
+        vo.setId(502L);
+        vo.setAvatarImageId(99L);
+        vo.setAvatarUrl("https://stale-cache/old.png"); // 旧缓存，应被重生成的签名 URL 覆盖
+        when(baseMapper.selectVoById(502L)).thenReturn(vo);
+
+        GzFileObjectVO file = new GzFileObjectVO();
+        file.setFileId(99L);
+        file.setUrl("https://cos-signed/avatar.png?sign=fresh");
+        when(gzFileService.getPresignedUrl(99L)).thenReturn(file);
+
+        GzUserVO result = gzUserService.selectVoById(502L);
+
+        assertNotNull(result);
+        assertEquals("https://cos-signed/avatar.png?sign=fresh", result.getAvatarUrl());
+        verify(gzFileService, times(1)).getPresignedUrl(99L);
+    }
+
+    @Test
+    @DisplayName("GZ-USER-006：头像签名失败（文件被删 / COS 异常）→ 不抛错，保留旧缓存 URL")
+    void selectVoById_avatarResolveFails_doesNotThrow() {
+        GzUserVO vo = new GzUserVO();
+        vo.setId(503L);
+        vo.setAvatarImageId(88L);
+        vo.setAvatarUrl("https://fallback/cache.png");
+        when(baseMapper.selectVoById(503L)).thenReturn(vo);
+        when(gzFileService.getPresignedUrl(88L)).thenThrow(new RuntimeException("file deleted"));
+
+        GzUserVO result = assertDoesNotThrow(() -> gzUserService.selectVoById(503L));
+
+        // 资料读取不因头像失败而 500：保留库里旧 avatar_url 缓存
+        assertEquals("https://fallback/cache.png", result.getAvatarUrl());
     }
 }

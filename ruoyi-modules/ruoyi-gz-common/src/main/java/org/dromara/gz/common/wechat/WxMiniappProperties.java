@@ -41,11 +41,16 @@ public class WxMiniappProperties {
     /** 小程序 AppSecret，默认空（mock 通道不需要）。 */
     private String secret = "";
 
-    /** session_key 在 Redis 中的 TTL（秒），默认 24h。 */
+    /** session_key 在 Redis 中的 TTL（秒），默认 24h（仅解密手机号等微信能力用，与登录态解耦）。 */
     private long sessionKeyTtlSeconds = 86400L;
 
-    /** 业务 token TTL（秒），默认 7 天。 */
-    private long tokenTtlSeconds = 604800L;
+    /**
+     * 业务 token TTL（秒），默认 <b>30 天</b>（ADR-0009 登录态长效）。
+     *
+     * <p>登录态真源 = sa-token 长效 token（独立于 session_key 的 24h）；过期由 mp 启动 / 401 时
+     * 静默 wx.login → code2session 续期，用户无感（openid 静默可得）。</p>
+     */
+    private long tokenTtlSeconds = 2592000L;
 
     /**
      * 判断是否走 mock 通道。

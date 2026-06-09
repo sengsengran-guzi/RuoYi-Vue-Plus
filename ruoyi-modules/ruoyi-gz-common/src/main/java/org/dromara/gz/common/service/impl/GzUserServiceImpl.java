@@ -10,8 +10,10 @@ import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.common.domain.bo.GzUserQueryBo;
 import org.dromara.gz.common.domain.entity.GzUser;
+import org.dromara.gz.common.domain.vo.GzFileObjectVO;
 import org.dromara.gz.common.domain.vo.GzUserVO;
 import org.dromara.gz.common.mapper.GzUserMapper;
+import org.dromara.gz.common.service.IGzFileService;
 import org.dromara.gz.common.service.IGzUserService;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
 import org.springframework.stereotype.Service;
@@ -48,6 +50,8 @@ public class GzUserServiceImpl implements IGzUserService {
     private static final DateTimeFormatter USER_NO_DATE_FMT = DateTimeFormatter.ofPattern("yyyyMMdd");
 
     private final GzUserMapper baseMapper;
+    /** 头像渲染：按 avatar_image_id 重生成 1h 签名 URL（ADR-0009 头像真源 = COS 对象）。 */
+    private final IGzFileService gzFileService;
 
     @Override
     public GzUser upsertByOpenid(WxJscode2SessionResult session, String nickname, String avatarUrl) {
@@ -112,7 +116,31 @@ public class GzUserServiceImpl implements IGzUserService {
         if (ObjectUtil.isNull(id)) {
             return null;
         }
-        return baseMapper.selectVoById(id);
+        GzUserVO vo = baseMapper.selectVoById(id);
+        resolveAvatarUrl(vo);
+        return vo;
+    }
+
+    /**
+     * 按 {@code avatar_image_id} 重生成 1h 签名 URL 回填 {@code avatarUrl}（ADR-0009 头像真源 = COS 对象）。
+     *
+     * <p>单用户读路径（mp /me + profile 更新返回）调用。avatarImageId 为 null（未采集 / 历史用户）时
+     * 保留库里 avatar_url 缓存（可能是旧微信 CDN URL 或空），不覆盖。签名失败（文件被删 / COS 异常）
+     * 不抛错，仅 warn —— 资料读取不因头像失败而 500（doc/10 §1.E3 风格：外部资源异常兜底）。</p>
+     */
+    private void resolveAvatarUrl(GzUserVO vo) {
+        if (vo == null || vo.getAvatarImageId() == null) {
+            return;
+        }
+        try {
+            GzFileObjectVO file = gzFileService.getPresignedUrl(vo.getAvatarImageId());
+            if (file != null && StrUtil.isNotBlank(file.getUrl())) {
+                vo.setAvatarUrl(file.getUrl());
+            }
+        } catch (Exception e) {
+            log.warn("[gz-user] resolve avatar presigned url failed userId={} avatarImageId={}: {}",
+                vo.getId(), vo.getAvatarImageId(), e.getMessage());
+        }
     }
 
     @Override
