@@ -8,11 +8,15 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.exception.ServiceException;
+import org.dromara.common.core.service.DictService;
+import org.dromara.common.core.utils.SpringUtils;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
+import org.dromara.common.tenant.helper.TenantHelper;
 import org.dromara.gz.recycle.domain.bo.GzRecyclePriceRuleBo;
 import org.dromara.gz.recycle.domain.bo.GzRecyclePriceRuleQueryBo;
 import org.dromara.gz.recycle.domain.entity.GzRecyclePriceRule;
+import org.dromara.gz.recycle.domain.vo.GzRecycleCategoryVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleEstimateVO;
 import org.dromara.gz.recycle.domain.vo.GzRecyclePriceRuleVO;
 import org.dromara.gz.recycle.mapper.GzRecyclePriceRuleMapper;
@@ -20,7 +24,11 @@ import org.dromara.gz.recycle.service.IGzRecyclePriceRuleService;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * 回收价目表服务实现（GZ-RECYCLE-001 AC 1/2/3/5）。
@@ -181,6 +189,36 @@ public class GzRecyclePriceRuleServiceImpl implements IGzRecyclePriceRuleService
         vo.setEstimatedAmountCent(rule.getUnitPriceCent() * qty);
         vo.setMatchedDurationMinutes(rule.getDurationMinutes());
         return vo;
+    }
+
+    @Override
+    public List<GzRecycleCategoryVO> listCategories() {
+        // 有 enabled 规则的 distinct category（按 sort_no / qty_min 升序保留首现顺序）
+        LambdaQueryWrapper<GzRecyclePriceRule> lqw = Wrappers.<GzRecyclePriceRule>lambdaQuery()
+            .eq(GzRecyclePriceRule::getEnabled, ENABLED_ON)
+            .orderByAsc(GzRecyclePriceRule::getSortNo)
+            .orderByAsc(GzRecyclePriceRule::getQtyMin);
+        Set<String> categories = new LinkedHashSet<>();
+        for (GzRecyclePriceRule r : baseMapper.selectList(lqw)) {
+            if (StrUtil.isNotBlank(r.getCategory())) {
+                categories.add(r.getCategory());
+            }
+        }
+        if (categories.isEmpty()) {
+            return List.of();
+        }
+        // 字典 gz_recycle_category 在系统租户 000000（共享）→ TenantHelper.ignore 跨租户读 value→label
+        // （memory ruoyi-menu-dict-gotchas：业务租户上下文查不到系统级字典，用 ignore 兜底）
+        Map<String, String> labelMap = TenantHelper.ignore(() -> {
+            DictService dictService = SpringUtils.getBean(DictService.class);
+            return dictService.getAllDictByDictType("gz_recycle_category");
+        });
+        List<GzRecycleCategoryVO> result = new ArrayList<>(categories.size());
+        for (String value : categories) {
+            String label = labelMap != null ? labelMap.get(value) : null;
+            result.add(new GzRecycleCategoryVO(value, StrUtil.isNotBlank(label) ? label : value));
+        }
+        return result;
     }
 
     /* ---------------- 内部辅助 ---------------- */

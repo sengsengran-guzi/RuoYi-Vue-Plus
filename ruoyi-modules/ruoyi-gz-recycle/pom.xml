@@ -18,11 +18,17 @@
     </description>
 
     <dependencies>
-        <!-- 谷子业务通用层（传递引入 mybatis / web / tenant / security / log / json 等） -->
+        <!-- 谷子业务通用层（传递引入 mybatis / web / tenant / security / log / json 等；反向打款 IGzPayPayoutService） -->
         <dependency>
             <groupId>org.dromara</groupId>
             <artifactId>ruoyi-gz-common</artifactId>
             <version>${revision}</version>
+        </dependency>
+
+        <!-- SnailJob 任务调度（GZ-RECYCLE-003 no_show 凌晨兜底扫，@Component + @JobExecutor 薄壳；memory scheduler-is-snailjob） -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-job</artifactId>
         </dependency>
 
         <!-- 单元测试（AC 6：区间不重叠校验 + 估价命中，与 gz-coupon / gz-news 同款） -->

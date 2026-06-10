@@ -3,6 +3,8 @@ package org.dromara.gz.common.pay.controller;
 import cn.dev33.satoken.annotation.SaCheckPermission;
 import lombok.RequiredArgsConstructor;
 import org.dromara.common.core.domain.R;
+import org.dromara.common.log.annotation.Log;
+import org.dromara.common.log.enums.BusinessType;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.web.core.BaseController;
@@ -12,6 +14,7 @@ import org.dromara.gz.common.pay.service.IGzPayPayoutService;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -46,6 +49,37 @@ public class GzPayPayoutController extends BaseController {
         GzPayPayoutTransactionVO vo = payoutService.getById(id);
         if (vo == null) {
             return R.fail("反向打款单不存在");
+        }
+        return R.ok(vo);
+    }
+
+    /**
+     * 失败重试（ADR-0006 旁路 failed 可重试，doc/10 §14.N6）：owner 对 payout_failed 单触发重试。
+     *
+     * <p>{@code failed → created} 重置后重新受理（新 batch_id）。<b>仅 owner 手动</b>（敏感资金操作，
+     * 权限 {@code gz:pay:payout:retry}，menu 5113）。回收单 paying→paid 的回写由 RECYCLE-003 钩子收敛。</p>
+     *
+     * <pre>POST /system/gz/pay/payout/{businessOrderNo}/retry</pre>
+     */
+    @SaCheckPermission("gz:pay:payout:retry")
+    @Log(title = "反向打款失败重试", businessType = BusinessType.UPDATE)
+    @PostMapping("/{businessOrderNo}/retry")
+    public R<GzPayPayoutTransactionVO> retry(@PathVariable String businessOrderNo) {
+        return R.ok(payoutService.retryPayout(businessOrderNo, "谷子回收返现"));
+    }
+
+    /**
+     * 主动查单一次（ADR-0006 §3 主动查单优先）：owner 对 processing 单手动触发查单推进。
+     *
+     * <pre>POST /system/gz/pay/payout/{businessOrderNo}/query</pre>
+     */
+    @SaCheckPermission("gz:pay:payout:retry")
+    @Log(title = "反向打款主动查单", businessType = BusinessType.UPDATE)
+    @PostMapping("/{businessOrderNo}/query")
+    public R<GzPayPayoutTransactionVO> queryOnce(@PathVariable String businessOrderNo) {
+        GzPayPayoutTransactionVO vo = payoutService.queryAndAdvanceByBusinessOrderNo(businessOrderNo);
+        if (vo == null) {
+            return R.fail("该业务单无在途打款单");
         }
         return R.ok(vo);
     }

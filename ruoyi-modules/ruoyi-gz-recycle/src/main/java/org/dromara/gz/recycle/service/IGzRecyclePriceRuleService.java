@@ -4,6 +4,7 @@ import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.recycle.domain.bo.GzRecyclePriceRuleBo;
 import org.dromara.gz.recycle.domain.bo.GzRecyclePriceRuleQueryBo;
+import org.dromara.gz.recycle.domain.vo.GzRecycleCategoryVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleEstimateVO;
 import org.dromara.gz.recycle.domain.vo.GzRecyclePriceRuleVO;
 
@@ -57,4 +58,14 @@ public interface IGzRecyclePriceRuleService {
      * @param qty      数量（≥ 1）
      */
     GzRecycleEstimateVO estimate(String category, int qty);
+
+    /**
+     * 可回收品类选项（D14 RECYCLE-002 mp 填单品类下拉消费）。
+     *
+     * <p>= 价目表中有 enabled 规则的 distinct category + 字典 gz_recycle_category 中文 label。
+     * 无字典 label 时 fallback 用 value。按 sort_no 升序。</p>
+     *
+     * @return 品类选项列表（value + label）
+     */
+    List<GzRecycleCategoryVO> listCategories();
 }

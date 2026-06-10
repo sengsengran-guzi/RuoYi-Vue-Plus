@@ -112,6 +112,78 @@ public class GzPayPayoutServiceImpl implements IGzPayPayoutService {
     }
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
+    public GzPayPayoutTransactionVO retryPayout(String businessOrderNo, String transferRemark) {
+        // 该业务单当前活跃单（非 failed/cancelled）若存在 → 不重试（已在途/已成，幂等防重复转账）
+        GzPayPayoutTransaction active = payoutMapper.selectByActiveBusinessOrderNo(businessOrderNo);
+        if (active != null) {
+            log.info("[gz-payout] retry business_order_no={} 已有活跃单 out_payout_no={} status={} → 不重试（幂等返回）",
+                businessOrderNo, active.getOutPayoutNo(), active.getStatus());
+            return payoutMapper.selectVoById(active.getId());
+        }
+        // 取该业务单最近一条 failed 单重置 failed→created（清 fail_reason/payout_id/batch_id）
+        GzPayPayoutTransaction failed = payoutMapper.selectByOutPayoutNo(
+            // selectByActiveBusinessOrderNo 排除 failed，单独取 failed 单：用 business_order_no 直查最新
+            findLatestFailedOutPayoutNo(businessOrderNo));
+        if (failed == null || !PayoutStatus.FAILED.equals(failed.getStatus())) {
+            throw new org.dromara.common.core.exception.ServiceException("无可重试的失败打款单（business_order_no=" + businessOrderNo + "）");
+        }
+        int reset = payoutMapper.retryFailedToCreated(failed.getId());
+        if (reset == 0) {
+            // 并发：已被其他重试/查单改动 → 重查活跃单幂等返回
+            GzPayPayoutTransaction concurrent = payoutMapper.selectByActiveBusinessOrderNo(businessOrderNo);
+            return concurrent != null ? payoutMapper.selectVoById(concurrent.getId()) : payoutMapper.selectVoById(failed.getId());
+        }
+        // 重新发起一轮受理（复用同一 out_payout_no 单，version 已 +1）
+        GzPayPayoutTransaction reloaded = payoutMapper.selectById(failed.getId());
+        TransferRequest transferReq = new TransferRequest(
+            reloaded.getOutPayoutNo(), reloaded.getReceiverOpenid(), reloaded.getAmountCent(),
+            transferRemark, businessOrderNo);
+        try {
+            TransferResult result = wechatPayClient.transferToUserWallet(transferReq);
+            int affected = payoutMapper.markProcessing(reloaded.getId(), reloaded.getVersion(),
+                result.payoutId(), result.batchId());
+            if (affected == 0) {
+                log.warn("[gz-payout] retry markProcessing affected=0 out_payout_no={}（并发，幂等跳过）", reloaded.getOutPayoutNo());
+            }
+            log.info("[gz-payout] retryPayout out_payout_no={} → processing payout_id={} batch_id={}",
+                reloaded.getOutPayoutNo(), result.payoutId(), result.batchId());
+        } catch (Exception ex) {
+            payoutMapper.markCreatedFailed(reloaded.getId(), "重试受理失败：" + ex.getMessage());
+            log.warn("[gz-payout] retryPayout 受理失败 out_payout_no={} → failed: {}", reloaded.getOutPayoutNo(), ex.getMessage());
+        }
+        return payoutMapper.selectVoById(reloaded.getId());
+    }
+
+    /** 取该业务单最近一条 failed 单的 out_payout_no（重试用）；无则 null。 */
+    private String findLatestFailedOutPayoutNo(String businessOrderNo) {
+        GzPayPayoutTransaction failed = payoutMapper.selectOne(
+            Wrappers.<GzPayPayoutTransaction>lambdaQuery()
+                .eq(GzPayPayoutTransaction::getBusinessOrderNo, businessOrderNo)
+                .eq(GzPayPayoutTransaction::getStatus, PayoutStatus.FAILED)
+                .orderByDesc(GzPayPayoutTransaction::getId)
+                .last("LIMIT 1"));
+        return failed == null ? null : failed.getOutPayoutNo();
+    }
+
+    @Override
+    public GzPayPayoutTransactionVO queryAndAdvanceByBusinessOrderNo(String businessOrderNo) {
+        GzPayPayoutTransaction active = payoutMapper.selectByActiveBusinessOrderNo(businessOrderNo);
+        if (active == null) {
+            return null;
+        }
+        if (PayoutStatus.PROCESSING.equals(active.getStatus())) {
+            // 主动查单一次推进（与 scanAndQuery 同款单条逻辑）
+            try {
+                queryOne(active.getId());
+            } catch (Exception ex) {
+                log.warn("[gz-payout] queryAndAdvance business_order_no={} 查单异常: {}", businessOrderNo, ex.getMessage());
+            }
+        }
+        return payoutMapper.selectVoById(active.getId());
+    }
+
+    @Override
     public TableDataInfo<GzPayPayoutTransactionVO> selectPageList(GzPayPayoutQueryBo query, PageQuery pageQuery) {
         LambdaQueryWrapper<GzPayPayoutTransaction> wrapper = Wrappers.<GzPayPayoutTransaction>lambdaQuery()
             .eq(StrUtil.isNotBlank(query.getStatus()), GzPayPayoutTransaction::getStatus, query.getStatus())

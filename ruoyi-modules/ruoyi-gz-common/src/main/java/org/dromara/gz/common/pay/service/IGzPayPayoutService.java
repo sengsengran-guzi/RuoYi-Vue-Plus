@@ -32,6 +32,34 @@ public interface IGzPayPayoutService {
     GzPayPayoutTransactionVO initiatePayout(InitiateBo req);
 
     /**
+     * 失败重试（ADR-0006 旁路 failed 可重试，doc/10 §13.E4 / §14.N6）：把指定业务单当前的 failed 打款单
+     * {@code failed → created}（清 fail_reason / payout_id / batch_id）后<b>重新发起一轮受理</b>（生成新 batch_id）。
+     *
+     * <p>D14 RECYCLE-003 admin「反向打款单管理」owner 对 payout_failed 单点「重试」时调用。<b>不无限自动重试</b>
+     * （仅 owner 手动触发）。重试是「就地复用同一 out_payout_no 单重置 created→再受理」（非新建单，溯源连续）。</p>
+     *
+     * <p><b>幂等守卫</b>：仅当该业务单存在 failed 单才重置；不存在 failed 单（已 success/processing/无单）→ 返回当前活跃单或抛错，
+     * 不二次转账。重置后受理失败再次落 failed（可再重试），受理成功落 processing（走查单收敛 success）。</p>
+     *
+     * @param businessOrderNo 业务订单号（回收预约号 RCY-）
+     * @param transferRemark  转账备注（重试时透传，用户零钱可见）
+     * @return 重试后的打款单 VO（processing = 受理成功 / failed = 再次受理失败）
+     */
+    GzPayPayoutTransactionVO retryPayout(String businessOrderNo, String transferRemark);
+
+    /**
+     * 按业务订单号主动查单一次（ADR-0006 §3 主动查单优先，admin owner 手动触发 / RECYCLE 回写钩子调用）。
+     *
+     * <p>对该业务单当前 {@code processing} 态的打款单调 {@code queryTransferByOutNo} 一次，命中 SUCCESS/FAIL
+     * 即推进终态 + 存档查单 body。非 processing 态（created/success/failed/cancelled/无单）→ 直接返回当前单不动。
+     * 与 {@link #scanAndQuery} 同款单条推进逻辑，区别仅是「按指定业务单」而非「全表扫 processing」。</p>
+     *
+     * @param businessOrderNo 业务订单号（回收预约号 RCY-）
+     * @return 查单推进后的打款单 VO（无单 → null）
+     */
+    GzPayPayoutTransactionVO queryAndAdvanceByBusinessOrderNo(String businessOrderNo);
+
+    /**
      * 扫 processing 态打款单 → 主动查单 → 推进 success/failed（ADR-0006 §3，SnailJob 每周期调）。
      *
      * <p>cron 无登录态 → {@code TenantHelper.ignore} 全租户扫。单条异常隔离（一条坏单不卡死整批）。
