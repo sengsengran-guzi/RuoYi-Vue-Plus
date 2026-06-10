@@ -41,6 +41,8 @@ import org.dromara.gz.common.pay.domain.bo.CreateOrderBo;
 import org.dromara.gz.common.pay.domain.vo.MpPayParamsVO;
 import org.dromara.gz.common.pay.enums.PayBusinessType;
 import org.dromara.gz.common.pay.service.IGzPayTransactionService;
+import org.dromara.gz.coupon.service.IGzUserCouponService;
+import org.dromara.gz.coupon.service.IGzUserCouponService.LockedCoupon;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
@@ -132,6 +134,12 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
      * 建单（submitPaid）才用到，构造期无需就绪，调用点 getObject() 惰性取实例。
      */
     private final ObjectProvider<IGzPayTransactionService> payServiceProvider;
+    /**
+     * V1.2 优惠券态机服务（gz-coupon COUPON-002）— 同样用 {@link ObjectProvider} 惰性注入，
+     * 与 payServiceProvider 一致防御构造期循环依赖（gz-bean → gz-coupon，coupon 当前不反依赖 bean，
+     * 但 Provider 注入对未来扩展更安全）。下单锁券 / onPaid 核销 / 关单回滚才用到。
+     */
+    private final ObjectProvider<IGzUserCouponService> couponServiceProvider;
 
     // ============================================================
     //  mp 提交预约
@@ -761,8 +769,18 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
 
         // ⑦ 计费：单笔金额 = 该类型单价 snapshot（单笔单时段无累加）
         long amountCent = config.getPriceCent() == null ? 0L : config.getPriceCent();
-        // 券抵扣 = D13 COUPON-002 实现，本卡恒 0（仅记 couponId 占位）
+
+        // ⑦.5 锁券抵扣（GZ-COUPON-002，doc/11 §11.3 / doc/10 §12.N4）：选券时事务内 unused → locked，
+        //   拿券面额快照 → 实付重算 payAmountCent = amountCent − 券面额（下限 0，差额不退不找零）。
+        //   券非法 / 非本人 / 已用 / 已过期 → service 抛 ServiceException → 整个下单事务回滚（锁券随之回滚自动解锁）。
+        //   未选券（couponId=NULL）→ discountAmountCent=0。
         long discountAmountCent = 0L;
+        String lockedCouponNo = null;
+        if (bo.getCouponId() != null) {
+            LockedCoupon locked = couponServiceProvider.getObject().lockForBooking(bo.getCouponId(), userId);
+            discountAmountCent = locked.amountSnapshotCent();
+            lockedCouponNo = locked.couponNo();
+        }
         long payAmountCent = Math.max(0L, amountCent - discountAmountCent);
 
         // ⑧ 生成 booking_no
@@ -770,10 +788,12 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         String bookingNo = generateBookingNo(now.toLocalDate());
         String seatTypeName = SEAT_TYPE_NAME.getOrDefault(bo.getSeatType(), bo.getSeatType());
 
+        // 免费单 = 实付 ≤ 0：含「免费类型无券」与「券面额 ≥ 单价（全额抵扣）」两种，均走免费单兜底（ADR-0007 §1.4）
         boolean free = payAmountCent <= 0L;
 
         // ⑨ INSERT 一行 booking。免费单（实付=0）直接 paid + 生成 verify_code（ADR-0007 §1.4）；
         //    付费单 pay_status=paying（建支付单后），verify_code 留 NULL（onPaid 才生成）。
+        //    discountAmountCent 已含券抵扣；coupon_id 透传，券态此刻已 locked。
         GzBeanBooking entity = GzBeanBooking.builder()
             .bookingNo(bookingNo)
             .userId(userId)
@@ -796,8 +816,11 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .build();
         bookingMapper.insert(entity);
 
-        // TODO(D13-COUPON-002): 选券时此处锁券（gz_user_coupon unused → locked），下单事务回滚自动解锁；
-        //   实付重算 payAmountCent = amountCent − 券面额（下限 0）。本卡仅透传 couponId 占位，不锁不抵扣。
+        // ⑨.5 免费单（券全额抵扣，实付=0 但仍锁了券）→ 核销券（locked → used，related = booking_no 占位无支付单）。
+        //   付费单的券核销在 onPindouPaid（支付成功时）；免费单无支付回调，此处即时核销，避免券卡死 locked。
+        if (free && bo.getCouponId() != null) {
+            couponServiceProvider.getObject().redeem(bo.getCouponId(), bookingNo);
+        }
 
         // ⑩ 首条 booking_log
         bookingLogMapper.insert(GzBeanBookingLog.builder()
@@ -806,7 +829,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .toStatus(STATUS_PENDING)
             .operatorType(OPERATOR_USER)
             .operatorId(String.valueOf(userId))
-            .note(free ? "用户提交付费预约（免费单，直接 paid）" : "用户提交付费预约（待支付）")
+            .note(buildSubmitLogNote(free, lockedCouponNo, discountAmountCent))
             .delFlag("0")
             .build());
 
@@ -857,6 +880,13 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .outTradeNo(e.getOutTradeNo())
             .payParams(payParams)
             .build();
+    }
+
+    /** 下单首条 booking_log note：区分免费/付费 + 是否用券（含券号 + 抵扣额，便于追溯）。 */
+    private String buildSubmitLogNote(boolean free, String couponNo, long discountAmountCent) {
+        String couponPart = couponNo == null ? ""
+            : String.format("，用券 %s 抵扣 %d 分", couponNo, discountAmountCent);
+        return (free ? "用户提交付费预约（免费单，直接 paid）" : "用户提交付费预约（待支付）") + couponPart;
     }
 
     // ============================================================
@@ -988,16 +1018,23 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             log.info("[bean-onpaid] markPaid affected=0 (concurrent), idempotent skip bookingNo={}", bookingNo);
             return;
         }
+        // 券核销（GZ-COUPON-002，doc/11 §11.2 / doc/10 §12.N5）：用券单支付成功 → locked → used + 写
+        //   used_time + related_pay_out_trade_no（= 正向支付 out_trade_no）。未用券（coupon_id=NULL）service 内跳过。
+        //   同回调事务内：若券核销异常则整笔回滚（微信重试 + PAY-102 补单兜底）。
+        couponServiceProvider.getObject().redeem(booking.getCouponId(), outTradeNo);
+
         bookingLogMapper.insert(GzBeanBookingLog.builder()
             .bookingId(booking.getId())
             .fromStatus(booking.getStatus())   // status 不变（仍 pending）
             .toStatus(booking.getStatus())
             .operatorType(OPERATOR_SYSTEM)
             .operatorId(null)
-            .note("支付成功（pay_status paying → paid），核销码已生成 outTradeNo=" + outTradeNo)
+            .note("支付成功（pay_status paying → paid），核销码已生成 outTradeNo=" + outTradeNo
+                + (booking.getCouponId() != null ? "，券已核销 couponId=" + booking.getCouponId() : ""))
             .delFlag("0")
             .build());
-        log.info("[bean-onpaid] booking paid bookingNo={} outTradeNo={} verifyCode generated", bookingNo, outTradeNo);
+        log.info("[bean-onpaid] booking paid bookingNo={} outTradeNo={} verifyCode generated couponId={}",
+            bookingNo, outTradeNo, booking.getCouponId());
     }
 
     @Override
@@ -1012,17 +1049,23 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             // 已非 unpaid/paying（已 paid / 已关闭）→ 幂等跳过
             return false;
         }
-        // TODO(D13-COUPON-002): 此处回滚锁定的券（gz_user_coupon locked → unused），ADR-0007 §1.5。
+        // 券回滚解锁（GZ-COUPON-002，doc/11 §11.2 / doc/10 §12.N6/N7，ADR-0007 §1.5）：支付关闭 / 取消 →
+        //   locked → unused（清空 related），券可再用。WHERE status='locked' 守卫保证已 used 的券绝不被复活。
+        //   未用券（coupon_id=NULL）service 内跳过。同关单事务内。
+        couponServiceProvider.getObject().unlock(booking.getCouponId());
+
         bookingLogMapper.insert(GzBeanBookingLog.builder()
             .bookingId(bookingId)
             .fromStatus(STATUS_PENDING)
             .toStatus(STATUS_CANCELLED)
             .operatorType(OPERATOR_SYSTEM)
             .operatorId(null)
-            .note("支付关闭（pay_status → pay_closed，status → cancelled），释放配额")
+            .note("支付关闭（pay_status → pay_closed，status → cancelled），释放配额"
+                + (booking.getCouponId() != null ? "，券已解锁 couponId=" + booking.getCouponId() : ""))
             .delFlag("0")
             .build());
-        log.info("[bean-payclosed] booking closed bookingId={} (quota released)", bookingId);
+        log.info("[bean-payclosed] booking closed bookingId={} (quota released) couponId={}",
+            bookingId, booking.getCouponId());
         return true;
     }
 

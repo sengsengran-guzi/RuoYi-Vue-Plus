@@ -74,6 +74,28 @@ public class MockWechatPayClient implements IWechatPayClient {
      */
     private boolean refundAcceptFail = false;
 
+    /** mock 反向打款单号前缀（GZ-PAY-105，便于 admin / 日志辨识非真实通道） */
+    public static final String MOCK_PAYOUT_ID_PREFIX = "mock_payout_";
+    /** mock 反向打款批次号前缀（GZ-PAY-105，幂等关键 batch_id 占位） */
+    public static final String MOCK_BATCH_ID_PREFIX = "mock_batch_";
+
+    /**
+     * 测试可注入的反向打款查单态（GZ-PAY-105 AC2）。默认 PROCESSING（处理中）—— 单测据此覆盖
+     * created→processing→success（注入 SUCCESS）与 failed 分支（注入 FAIL）。
+     */
+    private String queryTransferState = "PROCESSING";
+
+    /**
+     * 测试可注入的反向打款查单失败原因（GZ-PAY-105）。注入 FAIL 态时回填到 TransferQueryResult.failReason。
+     */
+    private String queryTransferFailReason = "余额不足（mock）";
+
+    /**
+     * 测试可注入的反向打款受理失败开关（GZ-PAY-105 AC2/AC8）。true → {@link #transferToUserWallet}
+     * 抛异常模拟商家转账受理失败，驱动 service「受理失败 → payout failed」分支。默认 false（受理成功 processing）。
+     */
+    private boolean transferAcceptFail = false;
+
     public MockWechatPayClient(WechatPayProperties properties) {
         log.warn("[gz-pay] MockWechatPayClient 已激活（client-mode != real）—— 不连真实微信通道，仅供 dev/单测/商户号未到位降级。");
     }
@@ -279,5 +301,57 @@ public class MockWechatPayClient implements IWechatPayClient {
      */
     public void setOverrideHashValue(String hash) {
         this.overrideHashValue = hash;
+    }
+
+    // ============================================================
+    //  GZ-PAY-105 反向打款（商家转账到零钱，mock 实现，ADR-0006）
+    // ============================================================
+
+    @Override
+    public TransferResult transferToUserWallet(TransferRequest req) {
+        if (transferAcceptFail) {
+            log.warn("[gz-pay-mock] transferToUserWallet 注入受理失败 out_payout_no={}", req.outPayoutNo());
+            throw new IllegalStateException("mock 商家转账受理失败（transferAcceptFail=true）");
+        }
+        // mock 受理成功：返回稳定占位 payout_id + batch_id（基于 out_payout_no 派生，幂等可复算），状态 ACCEPTED → service 落 processing
+        String payoutId = MOCK_PAYOUT_ID_PREFIX + req.outPayoutNo();
+        String batchId = MOCK_BATCH_ID_PREFIX + req.outPayoutNo();
+        String rawBody = String.format(
+            "{\"out_bill_no\":\"%s\",\"transfer_bill_no\":\"%s\",\"batch_id\":\"%s\",\"state\":\"ACCEPTED\",\"amount\":%d,\"openid\":\"%s\"}",
+            req.outPayoutNo(), payoutId, batchId, req.amountCent(), req.receiverOpenid());
+        log.info("[gz-pay-mock] transferToUserWallet out_payout_no={} amount_cent={} → ACCEPTED（processing）payout_id={} batch_id={}",
+            req.outPayoutNo(), req.amountCent(), payoutId, batchId);
+        return new TransferResult(payoutId, batchId, "ACCEPTED", rawBody);
+    }
+
+    @Override
+    public TransferQueryResult queryTransferByOutNo(String outPayoutNo) {
+        String payoutId = MOCK_PAYOUT_ID_PREFIX + outPayoutNo;
+        String batchId = MOCK_BATCH_ID_PREFIX + outPayoutNo;
+        String failReason = "FAIL".equals(queryTransferState) ? queryTransferFailReason : null;
+        String rawBody = String.format(
+            "{\"out_bill_no\":\"%s\",\"transfer_bill_no\":\"%s\",\"batch_id\":\"%s\",\"state\":\"%s\"%s}",
+            outPayoutNo, payoutId, batchId, queryTransferState,
+            failReason == null ? "" : ",\"fail_reason\":\"" + failReason + "\"");
+        log.info("[gz-pay-mock] queryTransferByOutNo out_payout_no={} → transfer_state={}", outPayoutNo, queryTransferState);
+        return new TransferQueryResult(outPayoutNo, payoutId, batchId, queryTransferState, failReason, rawBody);
+    }
+
+    /**
+     * 单测注入反向打款查单态（GZ-PAY-105 AC2/AC8）：PROCESSING（默认）/ SUCCESS / FAIL。
+     *
+     * @param state 转账查单态
+     */
+    public void setQueryTransferState(String state) {
+        this.queryTransferState = state;
+    }
+
+    /**
+     * 单测注入反向打款受理失败（GZ-PAY-105：true → transferToUserWallet 抛异常驱动 payout failed 分支）。
+     *
+     * @param fail true = 模拟受理失败
+     */
+    public void setTransferAcceptFail(boolean fail) {
+        this.transferAcceptFail = fail;
     }
 }

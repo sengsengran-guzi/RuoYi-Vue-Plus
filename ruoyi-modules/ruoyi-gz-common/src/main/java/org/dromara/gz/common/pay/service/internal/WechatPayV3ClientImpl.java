@@ -282,4 +282,27 @@ public class WechatPayV3ClientImpl implements IWechatPayClient {
         }
         return s.substring(0, 2) + "****" + s.substring(s.length() - 2);
     }
+
+    // ============================================================
+    //  GZ-PAY-105 反向打款（商家转账到零钱，real hook，ADR-0006）
+    // ============================================================
+
+    @Override
+    public TransferResult transferToUserWallet(TransferRequest req) {
+        // 待 transferbatch SDK 批准（ADR-0006 / 铁律 8）。
+        // 商户「商家转账到零钱」权限需在微信支付商户平台单独申请（非默认开通，有资质门槛，ADR-0006 Consequences），
+        // 且 com.wechat.pay.java.service.transferbatch 子包依赖待 Kevin 批准 —— 在此之前 real 不接通道、不私引 SDK。
+        // 权限 + 依赖到位后此处接 V3 POST /v3/transfer/batches（TransferBatchService.initiateBatchTransfer），
+        // 切 gz.pay.client.mode=real 即生效，service 层零改动（同 ADR-0003 范式）。
+        throw new UnsupportedOperationException(
+            "real 商家转账未启用：商户「商家转账到零钱」权限 + transferbatch SDK 待批准（ADR-0006 / 铁律 8）；当前请用 gz.pay.client.mode=mock");
+    }
+
+    @Override
+    public TransferQueryResult queryTransferByOutNo(String outPayoutNo) {
+        // 待 transferbatch SDK 批准（ADR-0006 / 铁律 8）。
+        // 权限 + 依赖到位后接 V3 GET /v3/transfer/batches/out-batch-no/{out_batch_no}（TransferBatchService.getTransferBatchByOutNo）。
+        throw new UnsupportedOperationException(
+            "real 商家转账查单未启用：待商户权限 + transferbatch SDK 批准（ADR-0006 / 铁律 8）；当前请用 gz.pay.client.mode=mock");
+    }
 }

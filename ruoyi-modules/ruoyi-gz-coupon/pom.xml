@@ -24,6 +24,12 @@
             <version>${revision}</version>
         </dependency>
 
+        <!-- GZ-COUPON-002 券过期 cron：SnailJob 执行器（@JobExecutor / JobArgs / ExecuteResult）。本模块首引（D12 未加） -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-job</artifactId>
+        </dependency>
+
         <!-- 单元测试（AC 8：发放乐观锁并发 + manual 策略 happy path，与 gz-news / gz-ord 同款） -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

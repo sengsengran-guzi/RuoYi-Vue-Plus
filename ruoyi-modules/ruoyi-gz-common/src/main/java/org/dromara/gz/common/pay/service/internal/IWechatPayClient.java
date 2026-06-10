@@ -126,6 +126,40 @@ public interface IWechatPayClient {
     RefundCallbackResult parseAndVerifyRefundNotify(NotifyContext ctx);
 
     /**
+     * 反向打款：商家转账到用户零钱（GZ-PAY-105，ADR-0006，doc/10 §14 / doc/11 §4.8）。
+     *
+     * <p>对应微信 V3「商家转账」（{@code POST /v3/transfer/batches}，平台 → 用户零钱）。承载回收返现等
+     * 反向资金流（与收款方向相反）。幂等键 = {@code out_payout_no}（商户侧 PAYOUT- 单号），微信侧以
+     * out_batch_no 去重，重复提交不重复打款。</p>
+     *
+     * <p>real（{@link WechatPayV3ClientImpl}）接 V3 transferbatch 接口 —— <b>当前留 hook</b>：商户「商家转账」
+     * 权限需单独申请（ADR-0006 Consequences），且 transferbatch SDK 依赖待 Kevin 批准（铁律 #8），故 real
+     * 暂抛 {@link UnsupportedOperationException}，不私引 {@code com.wechat.pay.java...transferbatch}。
+     * mock（{@link MockWechatPayClient}）返回固定占位 {@code payout_id} + {@code batch_id}，状态置
+     * {@code processing}（受理成功），驱动 {@code created→processing→success} 全链路单测 + failed 分支。</p>
+     *
+     * @param req 转账请求（out_payout_no / receiver_openid / amount_cent / transfer_remark / business_order_no）
+     * @return 受理结果（payout_id + batch_id + 受理态；mock 恒受理成功 processing，可注入 acceptFail 驱动失败）
+     */
+    TransferResult transferToUserWallet(TransferRequest req);
+
+    /**
+     * 按商户单号查反向打款单（GZ-PAY-105，ADR-0006 §3 主动查单优先，doc/10 §14）。
+     *
+     * <p>对应微信 V3 {@code GET /v3/transfer/batches/out-batch-no/{out_batch_no}}。商家转账回调到达性弱、
+     * 部分场景无回调，<b>微信官方建议主动查单为准</b> —— SnailJob（{@code gzPayoutQueryTask}）周期扫
+     * {@code processing} 态 payout 单调本方法核对真实状态，命中 {@code SUCCESS}/{@code FAIL} 推进终态。</p>
+     *
+     * <p>real <b>同样留 hook</b>（抛 {@link UnsupportedOperationException}，待权限 + SDK 批准）。mock
+     * 返回可配置 {@code transferState}（默认 {@code PROCESSING}；调 {@code setQueryTransferState} 注入
+     * {@code SUCCESS}/{@code FAIL}）驱动单测覆盖 success / failed 分支。</p>
+     *
+     * @param outPayoutNo 商户侧反向打款单号（PAYOUT-）
+     * @return 查单结果（transfer_state / payout_id / batch_id / 原始报文）
+     */
+    TransferQueryResult queryTransferByOutNo(String outPayoutNo);
+
+    /**
      * 统一下单请求。
      */
     record UnifiedOrderRequest(String outTradeNo, long amountCent, String openid, String description) {
@@ -229,5 +263,51 @@ public interface IWechatPayClient {
      */
     record QueryResult(String outTradeNo, String transactionId, String tradeState,
                        Long payerTotal, Long feeCent, String rawBody) {
+    }
+
+    /**
+     * 反向打款请求（GZ-PAY-105，{@link #transferToUserWallet}，doc/11 §4.8）。
+     *
+     * @param outPayoutNo     商户侧反向打款单号（PAYOUT-yyyyMMdd-6位序号，幂等键）
+     * @param receiverOpenid  收款用户 openid（商家转账必需，从回收预约单快照取）
+     * @param amountCent      转账金额（分，= gz_recycle_appointment.final_amount_cent）
+     * @param transferRemark  转账备注（用户零钱可见）
+     * @param businessOrderNo 业务订单号（= 回收预约号 RCY-，溯源）
+     */
+    record TransferRequest(String outPayoutNo, String receiverOpenid, long amountCent,
+                           String transferRemark, String businessOrderNo) {
+    }
+
+    /**
+     * 反向打款受理结果（GZ-PAY-105，{@link #transferToUserWallet} 同步返回）。
+     *
+     * <p>{@code payoutId} = 微信侧转账单号；{@code batchId} = 转账批次号（DB UNIQUE 幂等关键，ADR-0006 §5）；
+     * {@code state} = 受理态（{@code ACCEPTED} 受理成功 → 本地 processing）。受理失败 real 抛 SDK 异常 /
+     * mock 抛业务异常（注入 acceptFail）。</p>
+     *
+     * @param payoutId 微信侧转账单号（受理后返回）
+     * @param batchId  转账批次号（幂等基础，UNIQUE）
+     * @param state    受理态（ACCEPTED）
+     * @param rawBody  受理返回原始报文（入审计）
+     */
+    record TransferResult(String payoutId, String batchId, String state, String rawBody) {
+    }
+
+    /**
+     * 反向打款查单结果（GZ-PAY-105，{@link #queryTransferByOutNo}，ADR-0006 §3 主动查单为准）。
+     *
+     * <p>{@code transferState} 取值（微信 V3 商家转账约定，本系统归一）：{@code PROCESSING}（处理中）/
+     * {@code SUCCESS}（已到账，→ payout success + 写 transferred_time）/ {@code FAIL}（失败，→ payout failed
+     * + 写 fail_reason，可重试重置 created）。{@code rawBody} 入 {@code gz_pay_payout_callback_log.raw_body}。</p>
+     *
+     * @param outPayoutNo   商户侧反向打款单号
+     * @param payoutId      微信侧转账单号（PROCESSING 时可能为 null）
+     * @param batchId       转账批次号
+     * @param transferState 转账状态（PROCESSING / SUCCESS / FAIL）
+     * @param failReason    失败原因（FAIL 时给，否则 null）
+     * @param rawBody       查单返回原始报文（入 payout_callback_log raw_body）
+     */
+    record TransferQueryResult(String outPayoutNo, String payoutId, String batchId,
+                               String transferState, String failReason, String rawBody) {
     }
 }

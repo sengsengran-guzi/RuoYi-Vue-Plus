@@ -79,6 +79,8 @@ class GzBeanBookingServiceImplTest {
     @Mock private org.dromara.gz.bean.mapper.GzBeanTimeSlotTemplateMapper timeSlotTemplateMapper;
     @Mock private org.springframework.beans.factory.ObjectProvider<org.dromara.gz.common.pay.service.IGzPayTransactionService> payServiceProvider;
     @Mock private org.dromara.gz.common.pay.service.IGzPayTransactionService payService;
+    @Mock private org.springframework.beans.factory.ObjectProvider<org.dromara.gz.coupon.service.IGzUserCouponService> couponServiceProvider;
+    @Mock private org.dromara.gz.coupon.service.IGzUserCouponService couponService;
 
     private QrCodeSigner qrCodeSigner;
     private GzBeanBookingServiceImpl service;
@@ -90,8 +92,11 @@ class GzBeanBookingServiceImplTest {
         qrCodeSigner = new QrCodeSigner(props);
         service = new GzBeanBookingServiceImpl(
             bookingMapper, bookingLogMapper, seatMapper, storeMapper, gzUserMapper, qrCodeSigner,
-            seatTypeConfigMapper, timeSlotTemplateMapper, payServiceProvider
+            seatTypeConfigMapper, timeSlotTemplateMapper, payServiceProvider, couponServiceProvider
         );
+        // 券态机 provider：onPindouPaid / closePindou 在 markPaid/markPayClosed 成功后无条件调 redeem/unlock
+        //   （内部判 couponId==null 跳过），故 getObject() 总会被取一次 → lenient stub 返回 mock service。
+        lenient().when(couponServiceProvider.getObject()).thenReturn(couponService);
     }
 
     /**
@@ -772,6 +777,134 @@ class GzBeanBookingServiceImplTest {
 
         org.junit.jupiter.api.Assertions.assertFalse(closed);
         verify(bookingLogMapper, never()).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
+    }
+
+    // ============================================================
+    //  GZ-COUPON-002 拼豆抵扣（券锁定 / 核销 / 回滚 + 实付重算，doc/11 §11.3）
+    // ============================================================
+
+    @Test
+    @DisplayName("submitPaid · 用券抵扣（单价3000 − 券面额1000）→ 实付2000 + 下单锁券 + pay_status=paying（AC1/AC4）")
+    void submitPaid_withCoupon_payAmountIsTotalMinusDiscount() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
+        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
+        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("double", 4, 3000));
+        when(bookingMapper.countActiveUserTypeSlot(anyString(), anyLong(), anyLong(), anyString(), any(), any())).thenReturn(0L);
+        when(bookingMapper.countActiveByTypeSlotForUpdate(anyString(), anyLong(), anyString(), any(), any())).thenReturn(0L);
+        // 锁券返回券面额 1000 分
+        when(couponServiceProvider.getObject()).thenReturn(couponService);
+        when(couponService.lockForBooking(eq(99L), eq(1L)))
+            .thenReturn(new org.dromara.gz.coupon.service.IGzUserCouponService.LockedCoupon(1000L, "UC-20260620-000099"));
+        org.dromara.gz.common.pay.domain.vo.MpPayParamsVO pp =
+            org.dromara.gz.common.pay.domain.vo.MpPayParamsVO.builder().outTradeNo("PINDOU-20990101-000010").build();
+        when(payServiceProvider.getObject()).thenReturn(payService);
+        when(payService.createBusinessOrder(any())).thenReturn(pp);
+        when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
+
+        org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo bo = newPaidBo("double");
+        bo.setCouponId(99L);
+        org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO vo = spy.submitPaid(bo, 1L);
+
+        // 钉死口径：实付 = 单价 − 券面额 = 3000 − 1000 = 2000（doc/11 §11.3）
+        assertEquals(3000L, vo.getAmountCent());
+        assertEquals(1000L, vo.getDiscountAmountCent());
+        assertEquals(2000L, vo.getPayAmountCent());
+        assertEquals(Boolean.FALSE, vo.getFree());
+        assertEquals("paying", vo.getPayStatus());
+        // 锁券一次（下单事务内 unused → locked）
+        verify(couponService).lockForBooking(eq(99L), eq(1L));
+        // 支付单金额 = 实付 2000（券面额不计入支付流水 / GMV）
+        org.mockito.ArgumentCaptor<org.dromara.gz.common.pay.domain.bo.CreateOrderBo> cap =
+            org.mockito.ArgumentCaptor.forClass(org.dromara.gz.common.pay.domain.bo.CreateOrderBo.class);
+        verify(payService).createBusinessOrder(cap.capture());
+        assertEquals(2000L, cap.getValue().getAmountCent());
+        // 付费单：券核销在 onPaid，不在下单时核销
+        verify(couponService, never()).redeem(anyLong(), anyString());
+    }
+
+    @Test
+    @DisplayName("submitPaid · 券面额≥单价（券5000 ≥ 价3000）→ 实付0 走免费单兜底 + 下单即核销券（locked→used，AC4 下限0）")
+    void submitPaid_couponExceedsTotal_freeAndRedeemNow() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
+        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
+        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("double", 4, 3000));
+        when(bookingMapper.countActiveUserTypeSlot(anyString(), anyLong(), anyLong(), anyString(), any(), any())).thenReturn(0L);
+        when(bookingMapper.countActiveByTypeSlotForUpdate(anyString(), anyLong(), anyString(), any(), any())).thenReturn(0L);
+        when(couponServiceProvider.getObject()).thenReturn(couponService);
+        // 券面额 5000 > 单价 3000
+        when(couponService.lockForBooking(eq(88L), eq(1L)))
+            .thenReturn(new org.dromara.gz.coupon.service.IGzUserCouponService.LockedCoupon(5000L, "UC-20260620-000088"));
+
+        org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo bo = newPaidBo("double");
+        bo.setCouponId(88L);
+        org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO vo = spy.submitPaid(bo, 1L);
+
+        // 实付下限 0（差额不退不找零，doc/11 §11.3）
+        assertEquals(3000L, vo.getAmountCent());
+        assertEquals(5000L, vo.getDiscountAmountCent());
+        assertEquals(0L, vo.getPayAmountCent());
+        assertEquals(Boolean.TRUE, vo.getFree());
+        assertEquals("paid", vo.getPayStatus());
+        // 免费单无支付回调 → 下单当场核销券（locked → used），避免券卡死 locked
+        verify(couponService).redeem(eq(88L), anyString());
+        // 免费单不建支付单
+        verify(payServiceProvider, never()).getObject();
+    }
+
+    @Test
+    @DisplayName("submitPaid · 锁券失败（券已用/过期/越权，service 抛异常）→ 整个下单事务回滚，不 INSERT 不建支付单（AC1）")
+    void submitPaid_lockCouponFails_rejectAndRollback() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
+        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
+        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("double", 4, 3000));
+        when(bookingMapper.countActiveUserTypeSlot(anyString(), anyLong(), anyLong(), anyString(), any(), any())).thenReturn(0L);
+        when(bookingMapper.countActiveByTypeSlotForUpdate(anyString(), anyLong(), anyString(), any(), any())).thenReturn(0L);
+        when(couponServiceProvider.getObject()).thenReturn(couponService);
+        when(couponService.lockForBooking(eq(77L), eq(1L)))
+            .thenThrow(new ServiceException("优惠券不可用（已被使用或已过期）"));
+
+        org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo bo = newPaidBo("double");
+        bo.setCouponId(77L);
+
+        assertThrows(ServiceException.class, () -> spy.submitPaid(bo, 1L));
+        // 锁券在 INSERT 之前 → 失败时不应 INSERT booking、不应建支付单
+        verify(bookingMapper, never()).insert(any(GzBeanBooking.class));
+        verify(payServiceProvider, never()).getObject();
+    }
+
+    @Test
+    @DisplayName("onPindouPaid · 用券单支付成功 → 券核销（locked→used，related=out_trade_no，AC2）")
+    void onPindouPaid_withCoupon_redeems() {
+        GzBeanBooking booking = GzBeanBooking.builder()
+            .id(11L).bookingNo("BK11").sessDate(LocalDate.of(2099, 1, 1))
+            .seatType("single").status("pending").payStatus("paying").couponId(99L).build();
+        when(bookingMapper.selectByBookingNo("BK11")).thenReturn(booking);
+        when(bookingMapper.markPaid(eq(11L), anyString())).thenReturn(1);
+        when(couponServiceProvider.getObject()).thenReturn(couponService);
+
+        service.onPindouPaid("BK11", "PINDOU-20990101-000011");
+
+        // 券核销：couponId + out_trade_no
+        verify(couponService).redeem(eq(99L), eq("PINDOU-20990101-000011"));
+    }
+
+    @Test
+    @DisplayName("closePindou · 用券单支付关闭 → 券回滚解锁（locked→unused，AC3 / ADR-0007 §1.5）")
+    void closePindou_withCoupon_unlocks() {
+        GzBeanBooking booking = GzBeanBooking.builder()
+            .id(12L).status("pending").payStatus("paying").couponId(99L).build();
+        when(bookingMapper.selectById(12L)).thenReturn(booking);
+        when(bookingMapper.markPayClosed(eq(12L), any())).thenReturn(1);
+        when(couponServiceProvider.getObject()).thenReturn(couponService);
+
+        boolean closed = service.closePindou(12L);
+
+        assertTrue(closed);
+        // 券回滚：locked → unused
+        verify(couponService).unlock(eq(99L));
     }
 
     @Test

@@ -74,7 +74,7 @@ public class GzUserCoupon extends TenantEntity {
     /** 备注（公共字段，ruoyi 各 entity 显式定义） */
     private String remark;
 
-    /** 软删标志（0=正常 / 2=删除，对齐 ruoyi） */
+    /** 软删标志（0=正常 / 1=删除，logicDeleteValue=1 见 common-mybatis.yml） */
     @TableLogic
     private String delFlag;
 }

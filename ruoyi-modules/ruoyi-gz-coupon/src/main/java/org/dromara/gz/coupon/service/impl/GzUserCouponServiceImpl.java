@@ -7,19 +7,24 @@ import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.dromara.common.core.exception.ServiceException;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
+import org.dromara.common.tenant.helper.TenantHelper;
 import org.dromara.gz.common.domain.vo.GzUserVO;
 import org.dromara.gz.common.service.IGzUserService;
 import org.dromara.gz.coupon.domain.bo.GzUserCouponQueryBo;
 import org.dromara.gz.coupon.domain.entity.GzCouponTemplate;
 import org.dromara.gz.coupon.domain.entity.GzUserCoupon;
+import org.dromara.gz.coupon.domain.vo.GzUserCouponMpVO;
 import org.dromara.gz.coupon.domain.vo.GzUserCouponVO;
 import org.dromara.gz.coupon.mapper.GzCouponTemplateMapper;
 import org.dromara.gz.coupon.mapper.GzUserCouponMapper;
 import org.dromara.gz.coupon.service.IGzUserCouponService;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -107,5 +112,170 @@ public class GzUserCouponServiceImpl implements IGzUserCouponService {
         vo.setRelatedPayOutTradeNo(e.getRelatedPayOutTradeNo());
         vo.setCreateTime(e.getCreateTime());
         return vo;
+    }
+
+    // ============================================================
+    //  GZ-COUPON-003 mp 端查询（我的券列表 + 拼豆选券）
+    // ============================================================
+
+    @Override
+    public List<GzUserCouponMpVO> listUsableForPindou(Long userId, String business) {
+        if (userId == null || StrUtil.isBlank(business)) {
+            return List.of();
+        }
+        // ① 先查该租户下 applicable_business=business 的模板 id 集合（wrapper 自动 append tenant_id + del_flag）
+        List<GzCouponTemplate> templates = templateMapper.selectList(
+            Wrappers.<GzCouponTemplate>lambdaQuery()
+                .select(GzCouponTemplate::getId, GzCouponTemplate::getName)
+                .eq(GzCouponTemplate::getApplicableBusiness, business));
+        if (templates.isEmpty()) {
+            return List.of();
+        }
+        Map<Long, String> templateNameMap = templates.stream()
+            .collect(Collectors.toMap(GzCouponTemplate::getId, GzCouponTemplate::getName, (a, b) -> a));
+
+        // ② 查用户 unused + 未过期 + 模板适用的券（status CAS 由下单 lockForBooking 二次兜底，此处仅展示候选）
+        List<GzUserCoupon> coupons = baseMapper.selectList(
+            Wrappers.<GzUserCoupon>lambdaQuery()
+                .eq(GzUserCoupon::getUserId, userId)
+                .eq(GzUserCoupon::getStatus, "unused")
+                .gt(GzUserCoupon::getExpireTime, LocalDateTime.now())
+                .in(GzUserCoupon::getTemplateId, templateNameMap.keySet())
+                .orderByDesc(GzUserCoupon::getAmountSnapshotCent)
+                .orderByDesc(GzUserCoupon::getGainedTime));
+        return coupons.stream()
+            .map(e -> toMpVO(e, templateNameMap.get(e.getTemplateId()), business))
+            .toList();
+    }
+
+    @Override
+    public List<GzUserCouponMpVO> listMyCoupons(Long userId, String status) {
+        if (userId == null) {
+            return List.of();
+        }
+        LambdaQueryWrapper<GzUserCoupon> lqw = Wrappers.<GzUserCoupon>lambdaQuery()
+            .eq(GzUserCoupon::getUserId, userId)
+            // status 为空 = 全部（但永不含 locked 瞬态：locked 是下单中的券，对用户列表不可见）
+            .eq(StrUtil.isNotBlank(status), GzUserCoupon::getStatus, status)
+            .ne(StrUtil.isBlank(status), GzUserCoupon::getStatus, "locked")
+            .orderByDesc(GzUserCoupon::getGainedTime);
+        List<GzUserCoupon> records = baseMapper.selectList(lqw);
+        // 批量回填 templateName + applicableBusiness（防 N+1）
+        Map<Long, GzCouponTemplate> templateMap = resolveTemplates(records);
+        return records.stream()
+            .map(e -> {
+                GzCouponTemplate t = templateMap.get(e.getTemplateId());
+                return toMpVO(e, t == null ? null : t.getName(), t == null ? null : t.getApplicableBusiness());
+            })
+            .toList();
+    }
+
+    /** 批量取券对应模板（含 name + applicable_business，mp 列表回填用，防 N+1）。 */
+    private Map<Long, GzCouponTemplate> resolveTemplates(List<GzUserCoupon> records) {
+        Set<Long> templateIds = records.stream()
+            .map(GzUserCoupon::getTemplateId)
+            .filter(ObjectUtil::isNotNull)
+            .collect(Collectors.toSet());
+        if (templateIds.isEmpty()) {
+            return Map.of();
+        }
+        return templateMapper.selectByIds(templateIds).stream()
+            .collect(Collectors.toMap(GzCouponTemplate::getId, t -> t, (a, b) -> a));
+    }
+
+    /** entity → mp VO（templateName / applicableBusiness 由调用方 join 回填传入）。 */
+    private GzUserCouponMpVO toMpVO(GzUserCoupon e, String templateName, String applicableBusiness) {
+        GzUserCouponMpVO vo = new GzUserCouponMpVO();
+        vo.setId(e.getId());
+        vo.setCouponNo(e.getCouponNo());
+        vo.setTemplateId(e.getTemplateId());
+        vo.setTemplateName(templateName);
+        vo.setApplicableBusiness(applicableBusiness);
+        vo.setAmountSnapshotCent(e.getAmountSnapshotCent());
+        vo.setStatus(e.getStatus());
+        vo.setGainedTime(e.getGainedTime());
+        vo.setExpireTime(e.getExpireTime());
+        vo.setUsedTime(e.getUsedTime());
+        return vo;
+    }
+
+    // ============================================================
+    //  GZ-COUPON-002 券态机流转（doc/11 §11.2 / doc/10 §12）
+    // ============================================================
+
+    @Override
+    public LockedCoupon lockForBooking(Long couponId, Long userId) {
+        if (couponId == null) {
+            throw new ServiceException("优惠券 ID 不能为空");
+        }
+        // ① 券存在性（查实体拿 user_id 校验 + amount_snapshot + couponNo）
+        GzUserCoupon coupon = baseMapper.selectById(couponId);
+        if (coupon == null) {
+            throw new ServiceException("优惠券不存在");
+        }
+        // ② 越权校验：券必须属于下单本人（防用他人券）
+        if (userId == null || !userId.equals(coupon.getUserId())) {
+            log.warn("[gz-coupon] lock reject: coupon owner mismatch couponId={} couponOwner={} requestUser={}",
+                couponId, coupon.getUserId(), userId);
+            throw new ServiceException("优惠券不属于当前用户");
+        }
+        // ③ 状态 CAS 锁券：unused → locked（含过期实时拦截）。affected=0 = 券已被占用 / 已用 / 已过期。
+        int affected = baseMapper.lockCoupon(couponId, LocalDateTime.now());
+        if (affected == 0) {
+            log.info("[gz-coupon] lock failed (CAS): coupon not unused or expired couponId={} status={} expireTime={}",
+                couponId, coupon.getStatus(), coupon.getExpireTime());
+            throw new ServiceException("优惠券不可用（已被使用或已过期）");
+        }
+        long snapshot = coupon.getAmountSnapshotCent() == null ? 0L : coupon.getAmountSnapshotCent();
+        log.info("[gz-coupon] locked couponId={} couponNo={} userId={} amountSnapshotCent={}",
+            couponId, coupon.getCouponNo(), userId, snapshot);
+        return new LockedCoupon(snapshot, coupon.getCouponNo());
+    }
+
+    @Override
+    public void redeem(Long couponId, String outTradeNo) {
+        if (couponId == null) {
+            return; // 未用券的单（coupon_id 为 NULL）→ 无券可核销，跳过
+        }
+        // 状态 CAS 核销：locked → used。affected=0 仅记日志不抛（不阻塞主单核销，券态可能已被并发推进）。
+        int affected = baseMapper.redeemCoupon(couponId, LocalDateTime.now(), outTradeNo);
+        if (affected == 0) {
+            log.warn("[gz-coupon] redeem affected=0 (not locked / idempotent) couponId={} outTradeNo={}",
+                couponId, outTradeNo);
+            return;
+        }
+        log.info("[gz-coupon] redeemed couponId={} outTradeNo={}", couponId, outTradeNo);
+    }
+
+    @Override
+    public void unlock(Long couponId) {
+        if (couponId == null) {
+            return; // 未用券的单 → 无券可回滚，跳过
+        }
+        // 状态 CAS 回滚：locked → unused（清空 related）。affected=0 仅记日志不抛（已 used 的券绝不复活）。
+        int affected = baseMapper.unlockCoupon(couponId);
+        if (affected == 0) {
+            log.warn("[gz-coupon] unlock affected=0 (not locked / already used / idempotent) couponId={}", couponId);
+            return;
+        }
+        log.info("[gz-coupon] unlocked (rolled back to unused) couponId={}", couponId);
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public CouponExpireResult expireBatch() {
+        // cron 无登录态 → 关多租户拦截器全租户扫（V1 仅 '1001'），与 gz-bean markExpiredUnpaidBatch 同模式。
+        return TenantHelper.ignore(() -> {
+            LocalDateTime now = LocalDateTime.now();
+            List<Long> ids = baseMapper.selectExpiredUnusedIds(now);
+            int scanned = ids.size();
+            if (scanned == 0) {
+                log.info("[gz-coupon-expire] no expired unused coupons, skip");
+                return new CouponExpireResult(0, 0);
+            }
+            int expired = baseMapper.expireBatch(now);
+            log.info("[gz-coupon-expire] done. scanned={} expired={} (locked coupons untouched)", scanned, expired);
+            return new CouponExpireResult(scanned, expired);
+        });
     }
 }

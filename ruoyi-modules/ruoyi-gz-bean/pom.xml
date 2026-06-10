@@ -23,6 +23,14 @@
             <version>${revision}</version>
         </dependency>
 
+        <!-- GZ-COUPON-002 拼豆抵扣：下单锁券 / onPaid 核销 / 关单回滚跨模块调 IGzUserCouponService。
+             gz-coupon 仅依赖 gz-common（不反依赖 gz-bean）→ 无模块环；运行时构造期环用 ObjectProvider 惰性注入断开 -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-gz-coupon</artifactId>
+            <version>${revision}</version>
+        </dependency>
+
         <!-- GZ-BEAN-009 no_show cron：SnailJob 执行器（AbstractJobExecutor / @JobExecutor / JobArgs / ExecuteResult）-->
         <dependency>
             <groupId>org.dromara</groupId>

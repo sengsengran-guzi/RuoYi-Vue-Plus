@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <parent>
+        <groupId>org.dromara</groupId>
+        <artifactId>ruoyi-modules</artifactId>
+        <version>${revision}</version>
+    </parent>
+    <modelVersion>4.0.0</modelVersion>
+
+    <artifactId>ruoyi-gz-recycle</artifactId>
+
+    <description>
+        谷子宇宙回收预约域（GZ-RECYCLE，V1.2）：回收价目表（品类 × 数量区间 → 单价 + 时长）+ 区间不重叠校验
+        + 自动估价命中 service + admin 价目表 CRUD。字段权威 doc/11 §12.1；业务流 doc/10 §13。
+        本卡仅地基（GZ-RECYCLE-001：价目表 + 估价命中）；预约单状态机 + mp 填单 = GZ-RECYCLE-002（D14）。
+    </description>
+
+    <dependencies>
+        <!-- 谷子业务通用层（传递引入 mybatis / web / tenant / security / log / json 等） -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-gz-common</artifactId>
+            <version>${revision}</version>
+        </dependency>
+
+        <!-- 单元测试（AC 6：区间不重叠校验 + 估价命中，与 gz-coupon / gz-news 同款） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+</project>
