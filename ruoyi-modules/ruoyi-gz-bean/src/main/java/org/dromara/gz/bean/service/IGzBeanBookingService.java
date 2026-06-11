@@ -232,6 +232,19 @@ public interface IGzBeanBookingService {
     void onPindouPaid(String bookingNo, String outTradeNo);
 
     /**
+     * 退款成功业务回调（D16 P2，doc/10 §6.N10 退款 SPI）。由 {@code PindouRefundCallbackHandler.onRefunded}
+     * 在 PAY-103 退款回调事务内调用（business_order_no = booking_no 定位）。
+     *
+     * <p>条件 UPDATE {@code pay_status: paid → refunded}；仍 {@code pending}（未核销）的单同步
+     * {@code status → cancelled} <b>释放该 (类型,时段) 配额名额</b>（否则已退款单永久占名额 = 防超卖反噬）。
+     * 已 {@code used} 的单保留 status。写 booking_log。<b>券口径（保守默认）</b>：已 used 的券<b>不退还</b>
+     * （退款只退实付 = 单笔金额 − 券面额，券让利已消费，不双重让利）。幂等：已非 paid 的单跳过。</p>
+     *
+     * @param bookingNo 业务码（= 退款原交易 business_order_no）
+     */
+    void onPindouRefunded(String bookingNo);
+
+    /**
      * 支付关闭（超时未付 / 用户放弃，GZ-BEAN-014 AC 5，doc/10 §11.N13a / ADR-0007 §1.5）。
      *
      * <p>条件 UPDATE {@code pay_status: unpaid/paying → pay_closed} + {@code status: pending → cancelled}

@@ -145,6 +145,17 @@ public class GzNewsArticleController extends BaseController {
     }
 
     /**
+     * 取消定时（scheduled → draft，D16 补漏；复用 publish 权限）。
+     */
+    @SaCheckPermission("gz:news:article:publish")
+    @Log(title = "资讯文章取消定时", businessType = BusinessType.UPDATE)
+    @RepeatSubmit()
+    @PostMapping("/cancel-schedule/{id}")
+    public R<Void> cancelSchedule(@NotNull @PathVariable Long id) {
+        return toAjax(articleService.cancelSchedule(id));
+    }
+
+    /**
      * 下架（published → offline）。
      */
     @SaCheckPermission("gz:news:article:offline")

@@ -60,6 +60,19 @@ public interface MpStaffSysUserMapper {
     List<Long> selectGzUserIdsByStaffUserId(@Param("staffUserId") Long staffUserId);
 
     /**
+     * 当前所有已绑定店员的 sys_user.user_id（D16 P11，角色权限变更时保守踢全部）。
+     *
+     * <p>owner 改某角色的菜单权限（{@code updateRole}）影响所有持该角色的店员，但 V1 无「按 roleId 反查
+     * sys_user」基础设施；店员数量少、角色变更罕见，故保守踢全部已绑定店员（旧权限快照失效，下次进 mp
+     * 重登 fresh resolve）。</p>
+     *
+     * @return 去重的已绑定 staff_user_id 列表
+     */
+    @InterceptorIgnore(tenantLine = "true")
+    @Select("SELECT DISTINCT staff_user_id FROM gz_user WHERE staff_user_id IS NOT NULL AND del_flag = '0'")
+    List<Long> selectAllBoundStaffUserIds();
+
+    /**
      * 解绑：把指定 gz_user 的 staff_user_id 置 NULL（ADR 安全红线 AC5）。
      *
      * <p>显式 SQL 置 NULL（不用 LambdaUpdateWrapper.set(null) — 后者依赖 mybatis-plus lambda cache，

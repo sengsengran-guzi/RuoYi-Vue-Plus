@@ -961,7 +961,10 @@ class GzBeanBookingServiceImplTest {
             .filter(v -> "single".equals(v.getSeatType())).findFirst().orElseThrow();
         assertEquals(5, single.getRemaining());
         assertEquals(Boolean.FALSE, single.getFull());
-        assertEquals("单人", single.getSeatTypeName());
+        // 契约字段名对齐 mp TypeSlotVO（name/unitPriceCent/active），防 B1 跨端 shape 断裂复发
+        assertEquals("单人", single.getName());
+        assertEquals(Boolean.TRUE, single.getActive());
+        assertNotNull(single.getUnitPriceCent());
         org.dromara.gz.bean.domain.vo.GzBeanTypeSlotAvailabilityVO dbl = list.stream()
             .filter(v -> "double".equals(v.getSeatType())).findFirst().orElseThrow();
         assertEquals(0, dbl.getRemaining());
@@ -994,6 +997,50 @@ class GzBeanBookingServiceImplTest {
         IGzBeanBookingService.ExpiredUnpaidResult r = service.markExpiredUnpaidBatch(15);
         assertEquals(0, r.scanned());
         assertEquals(0, r.closed());
+    }
+
+    /* ---------- D16 P2 拼豆退款回调 onPindouRefunded ---------- */
+
+    @Test
+    @DisplayName("onPindouRefunded · paid 未核销单 → markRefunded（释放配额）+ 写 log（toStatus cancelled）")
+    void onPindouRefunded_paidPending_releasesQuota() {
+        GzBeanBooking booking = new GzBeanBooking();
+        booking.setId(50L);
+        booking.setBookingNo("BK20260611000050");
+        booking.setStatus("pending");
+        booking.setPayStatus("paid");
+        booking.setCouponId(7L);
+        when(bookingMapper.selectByBookingNo("BK20260611000050")).thenReturn(booking);
+        when(bookingMapper.markRefunded(eq(50L), any())).thenReturn(1);
+
+        service.onPindouRefunded("BK20260611000050");
+
+        verify(bookingMapper).markRefunded(eq(50L), any());
+        verify(bookingLogMapper).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
+    }
+
+    @Test
+    @DisplayName("onPindouRefunded · 非 paid（已 refunded）→ 幂等跳过，不调 markRefunded")
+    void onPindouRefunded_notPaid_idempotentSkip() {
+        GzBeanBooking booking = new GzBeanBooking();
+        booking.setId(51L);
+        booking.setBookingNo("BK20260611000051");
+        booking.setStatus("cancelled");
+        booking.setPayStatus("refunded");
+        when(bookingMapper.selectByBookingNo("BK20260611000051")).thenReturn(booking);
+
+        service.onPindouRefunded("BK20260611000051");
+
+        verify(bookingMapper, never()).markRefunded(anyLong(), any());
+        verify(bookingLogMapper, never()).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
+    }
+
+    @Test
+    @DisplayName("onPindouRefunded · 预约不存在 → ServiceException（回调事务回滚）")
+    void onPindouRefunded_notFound_throws() {
+        when(bookingMapper.selectByBookingNo("BK_NOPE")).thenReturn(null);
+        assertThrows(org.dromara.common.core.exception.ServiceException.class,
+            () -> service.onPindouRefunded("BK_NOPE"));
     }
 
 }

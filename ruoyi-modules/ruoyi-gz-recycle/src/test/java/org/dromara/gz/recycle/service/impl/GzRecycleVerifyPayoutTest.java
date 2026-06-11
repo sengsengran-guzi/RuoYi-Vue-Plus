@@ -78,14 +78,18 @@ class GzRecycleVerifyPayoutTest {
     private IGzPayPayoutService payoutService;
     @Mock
     private GzPayPayoutTransactionMapper payoutMapper;
+    @Mock
+    private org.dromara.common.core.service.ConfigService configService;
 
     private GzRecycleAppointmentServiceImpl service;
 
     @BeforeEach
     void setUp() {
+        // configService 未 stub → getConfigValue 返 null → final_amount 校验走默认（×3 / ¥1000），
+        // 现有 verifyAndPayout 测试金额（≤ 估价 5000×3）均放行。
         service = new GzRecycleAppointmentServiceImpl(
             baseMapper, priceRuleService, gzUserMapper, apptNoGenerator, new ObjectMapper(),
-            payoutService, payoutMapper);
+            payoutService, payoutMapper, configService);
     }
 
     /** 把 TenantHelper.ignore(Supplier) 直接执行 supplier（脱离租户上下文）。 */
@@ -177,6 +181,20 @@ class GzRecycleVerifyPayoutTest {
     }
 
     @Test
+    @DisplayName("D16 P5 final_amount 超估价×3 上限 → FINAL_AMOUNT_EXCEEDS_LIMIT 拦截、不核对不打款")
+    void verify_finalAmountExceedsLimit_rejected() {
+        GzRecycleAppointment appt = submittedAppt(7009L, 0); // estimated=5000 → 软上限 15000
+        when(baseMapper.selectById(7009L)).thenReturn(appt);
+
+        ServiceException ex = assertThrows(ServiceException.class,
+            () -> service.verifyAndPayout(verifyBo(7009L, 20000L, 91L), "店员A")); // 多打一位 20000 > 15000
+        assertEquals(GzRecycleErrorCode.FINAL_AMOUNT_EXCEEDS_LIMIT, ex.getCode());
+        // 资金安全：超限即拦截，不核对、不触发真打款
+        verify(baseMapper, never()).markConfirmedOnsite(anyLong(), anyInt(), anyString(), anyLong(), anyString(), any());
+        verify(payoutService, never()).initiatePayout(any(InitiateBo.class));
+    }
+
+    @Test
     @DisplayName("AC9 重复核对幂等：version 漂移 markConfirmedOnsite=0 → NOT_VERIFIABLE 抛错、不触发打款")
     void verify_concurrentVersionDrift_throwsNotVerifiable_noPayout() {
         GzRecycleAppointment appt = submittedAppt(7003L, 0);
@@ -211,7 +229,7 @@ class GzRecycleVerifyPayoutTest {
         GzRecycleAppointment paying = submittedAppt(7005L, 2);
         paying.setStatus("paying");
         paying.setOutPayoutNo("PAYOUT-20260623-000005");
-        when(baseMapper.selectPayingIds(anyInt())).thenReturn(List.of(7005L));
+        when(baseMapper.selectSyncablePayoutIds(anyInt())).thenReturn(List.of(7005L));
         when(baseMapper.selectById(7005L)).thenReturn(paying);
         when(payoutMapper.selectByOutPayoutNo("PAYOUT-20260623-000005"))
             .thenReturn(payoutEntity("PAYOUT-20260623-000005", PayoutStatus.SUCCESS));
@@ -231,7 +249,7 @@ class GzRecycleVerifyPayoutTest {
         GzRecycleAppointment paying = submittedAppt(7006L, 2);
         paying.setStatus("paying");
         paying.setOutPayoutNo("PAYOUT-20260623-000006");
-        when(baseMapper.selectPayingIds(anyInt())).thenReturn(List.of(7006L));
+        when(baseMapper.selectSyncablePayoutIds(anyInt())).thenReturn(List.of(7006L));
         when(baseMapper.selectById(7006L)).thenReturn(paying);
         when(payoutMapper.selectByOutPayoutNo("PAYOUT-20260623-000006"))
             .thenReturn(payoutEntity("PAYOUT-20260623-000006", PayoutStatus.FAILED));
@@ -251,7 +269,7 @@ class GzRecycleVerifyPayoutTest {
         GzRecycleAppointment paying = submittedAppt(7007L, 2);
         paying.setStatus("paying");
         paying.setOutPayoutNo("PAYOUT-20260623-000007");
-        when(baseMapper.selectPayingIds(anyInt())).thenReturn(List.of(7007L));
+        when(baseMapper.selectSyncablePayoutIds(anyInt())).thenReturn(List.of(7007L));
         when(baseMapper.selectById(7007L)).thenReturn(paying);
         when(payoutMapper.selectByOutPayoutNo("PAYOUT-20260623-000007"))
             .thenReturn(payoutEntity("PAYOUT-20260623-000007", PayoutStatus.PROCESSING));
@@ -260,6 +278,28 @@ class GzRecycleVerifyPayoutTest {
             assertEquals(0, service.syncPayoutResult());
         }
         verify(baseMapper, never()).markPaid(anyLong());
+        verify(baseMapper, never()).markPayoutFailed(anyLong());
+    }
+
+    @Test
+    @DisplayName("D16 B4 收敛：owner 从打款单页重试 → 回收单停 payout_failed，payout 查单 success → markPaid 把 payout_failed→paid（不再卡死/资金单据脱钩）")
+    void sync_payoutFailedAppt_payoutSuccess_convergesToPaid() {
+        // 回收单停在 payout_failed（owner 在 admin『打款单管理』页重试，PAY-105 只推进 payout 单、未回写回收单）
+        GzRecycleAppointment stuck = submittedAppt(7008L, 2);
+        stuck.setStatus("payout_failed");
+        stuck.setOutPayoutNo("PAYOUT-20260623-000008");
+        // 收敛扫描集纳入 payout_failed 单
+        when(baseMapper.selectSyncablePayoutIds(anyInt())).thenReturn(List.of(7008L));
+        when(baseMapper.selectById(7008L)).thenReturn(stuck);
+        // payout 单经打款单页重试 + 查单已 success
+        when(payoutMapper.selectByOutPayoutNo("PAYOUT-20260623-000008"))
+            .thenReturn(payoutEntity("PAYOUT-20260623-000008", PayoutStatus.SUCCESS));
+        when(baseMapper.markPaid(7008L)).thenReturn(1);
+
+        try (MockedStatic<TenantHelper> ignored = mockTenant()) {
+            assertEquals(1, service.syncPayoutResult()); // 收敛回写 paid
+        }
+        verify(baseMapper).markPaid(7008L);
         verify(baseMapper, never()).markPayoutFailed(anyLong());
     }
 

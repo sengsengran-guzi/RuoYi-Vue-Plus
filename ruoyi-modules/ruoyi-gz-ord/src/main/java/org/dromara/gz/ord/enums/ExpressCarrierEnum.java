@@ -50,4 +50,17 @@ public enum ExpressCarrierEnum {
             .findFirst()
             .orElse(code);
     }
+
+    /**
+     * code 是否为 9 项合法快递编码（GZ-ADMIN-104 进 in_china_dispatching 必录校验，doc/10 §9.N2）。
+     *
+     * @param code cn_carrier_code
+     * @return 命中 9 项之一为 true
+     */
+    public static boolean isValid(String code) {
+        if (code == null || code.isBlank()) {
+            return false;
+        }
+        return Arrays.stream(values()).anyMatch(e -> e.code.equals(code));
+    }
 }

@@ -124,6 +124,14 @@ public class GzReconBatchServiceImpl implements IGzReconBatchService {
     @Override
     public int runQuarterly(String quarter) {
         return TenantHelper.ignore(() -> {
+            // D16 防御：已结算季度（status=paid/settled，钱已付乙方）遇 late 跨月退款重跑时，
+            //   不静默改写已付 payable（否则审计时金额与打款流水对不上、无留痕）。仅 pending 才允许覆盖。
+            String existing = settleMapper.selectStatusByQuarter(quarter, TENANT_ID);
+            if ("paid".equals(existing) || "settled".equals(existing)) {
+                log.warn("[GZ-RECON-SETTLE] quarter={} 已 status={}（已结算），跳过重跑不覆盖 payable（如需调整请人工处理 + 留痕）",
+                    quarter, existing);
+                return 0;
+            }
             List<String> months = quarterMonths(quarter);
             // commission_total = Σ(当季 3 月 monthly.commission_cent)（不分 business_type → A+B 自然相加，合同 §4.2.3）
             long commissionTotal = monthlyMapper.sumCommissionByMonths(months);

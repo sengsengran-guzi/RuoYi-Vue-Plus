@@ -34,6 +34,10 @@ public final class GzRecycleErrorCode {
     public static final int PAYOUT_OPENID_MISSING = 4106;
     public static final String PAYOUT_OPENID_MISSING_MSG = "用户收款 openid 缺失，无法打款，请用户重新授权";
 
+    /** 店员核对 final_amount 超软上限（D16 P5，doc/11 §12.3 F12.2 资金控制）：反向真打款不可逆，超限拦截 */
+    public static final int FINAL_AMOUNT_EXCEEDS_LIMIT = 4107;
+    public static final String FINAL_AMOUNT_EXCEEDS_LIMIT_MSG = "最终金额超出允许上限，请核对后重填或联系管理员";
+
     private GzRecycleErrorCode() {
     }
 }

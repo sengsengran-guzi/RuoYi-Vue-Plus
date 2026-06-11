@@ -24,14 +24,14 @@ public class GzBeanTypeSlotAvailabilityVO implements Serializable {
     @Serial
     private static final long serialVersionUID = 1L;
 
-    /** 座位类型 value（single/double/quad） */
+    /** 座位类型 value（single/double/quad，提交时回传后端） */
     private String seatType;
 
-    /** 座位类型中文名（字典 gz_bean_seat_type 翻译） */
-    private String seatTypeName;
+    /** 座位类型中文名（字典 gz_bean_seat_type 翻译；mp 契约字段名 name） */
+    private String name;
 
-    /** 该类型单价（分） */
-    private Long priceCent;
+    /** 该类型单价（分）；选定即单笔金额。mp / 100 显示元 */
+    private Long unitPriceCent;
 
     /** 时段开始 */
     @JsonFormat(pattern = "HH:mm:ss")
@@ -44,7 +44,7 @@ public class GzBeanTypeSlotAvailabilityVO implements Serializable {
     /** 该类型该门店配额上限（admin 配置 quantity） */
     private Integer quantity;
 
-    /** 当前活跃 booking 数（占名额） */
+    /** 当前活跃 booking 数（占名额，后端内部信息；mp 仅看 remaining/full） */
     private Long activeCount;
 
     /** 剩余可约数 = quantity − activeCount（下限 0） */
@@ -52,4 +52,11 @@ public class GzBeanTypeSlotAvailabilityVO implements Serializable {
 
     /** 是否已满（remaining ≤ 0） */
     private Boolean full;
+
+    /**
+     * 座位类型 config 是否启用（mp 契约字段：active=false 灰显/过滤）。
+     * 余量接口仅查 enabled=1 的 config（service selectTypeSlotAvailability eq enabled=1），故恒 true；
+     * 显式回传以满足 mp TypeSlotVO.active 契约，避免 undefined→falsy→整档被过滤。
+     */
+    private Boolean active;
 }

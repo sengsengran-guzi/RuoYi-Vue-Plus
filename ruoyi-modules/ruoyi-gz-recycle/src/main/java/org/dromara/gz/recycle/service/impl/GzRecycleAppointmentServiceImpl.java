@@ -82,6 +82,14 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
     private final IGzPayPayoutService payoutService;
     /** 反向打款单 mapper（PAY-105，gz-common；paid 回写钩子按 out_payout_no 查 payout 终态） */
     private final GzPayPayoutTransactionMapper payoutMapper;
+    private final org.dromara.common.core.service.ConfigService configService;
+
+    /** final_amount 软上限：≤ 估价 × 倍数（sys_config gz.recycle.final_amount.max_ratio，默认 3） */
+    private static final String KEY_FINAL_MAX_RATIO = "gz.recycle.final_amount.max_ratio";
+    private static final int DEFAULT_FINAL_MAX_RATIO = 3;
+    /** final_amount 绝对硬上限（分，sys_config gz.recycle.final_amount.max_cent，默认 100000 = ¥1000） */
+    private static final String KEY_FINAL_MAX_CENT = "gz.recycle.final_amount.max_cent";
+    private static final long DEFAULT_FINAL_MAX_CENT = 100000L;
 
     @Override
     public GzRecycleEstimateAllVO estimateAll(List<GzRecycleAppointmentSubmitBo.ProductLine> products) {
@@ -242,6 +250,9 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         if (StrUtil.isBlank(appt.getReceiverOpenid())) {
             throw new ServiceException(GzRecycleErrorCode.PAYOUT_OPENID_MISSING_MSG, GzRecycleErrorCode.PAYOUT_OPENID_MISSING);
         }
+        // ②.5 final_amount 软上限（D16 P5，doc/11 §12.3 F12.2）：反向真打款不可逆，店员手输多打一位即真转出，
+        //   后端硬拦截 ≤ 估价×倍数 且 ≤ 绝对硬上限（均走 sys_config 可调）。估价缺失（≤0）只走绝对上限。
+        validateFinalAmount(bo.getFinalAmountCent(), appt.getEstimatedAmountCent());
 
         // ③ submitted→confirmed_onsite + 核对留痕（verify_image_ids 逗号分隔不存裸 url；final_amount/verified_by/verify_time）
         String verifyImageIdsStr = StrUtil.join(",", bo.getVerifyImageIds());
@@ -289,11 +300,47 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         return toAdminVO(baseMapper.selectById(id));
     }
 
+    /**
+     * final_amount 资金上限软校验（D16 P5）：① ≤ 估价 × 倍数（估价 &gt; 0 才比，sys_config 可调，默认 3 倍）；
+     * ② ≤ 绝对硬上限（sys_config 可调，默认 ¥1000）。任一超限抛 {@link GzRecycleErrorCode#FINAL_AMOUNT_EXCEEDS_LIMIT}。
+     */
+    private void validateFinalAmount(Long finalAmountCent, Long estimatedAmountCent) {
+        long finalCent = finalAmountCent == null ? 0L : finalAmountCent;
+        long absoluteCap = configLong(KEY_FINAL_MAX_CENT, DEFAULT_FINAL_MAX_CENT);
+        if (finalCent > absoluteCap) {
+            log.warn("[gz-recycle] final_amount {} 超绝对上限 {}（拦截）", finalCent, absoluteCap);
+            throw new ServiceException(GzRecycleErrorCode.FINAL_AMOUNT_EXCEEDS_LIMIT_MSG, GzRecycleErrorCode.FINAL_AMOUNT_EXCEEDS_LIMIT);
+        }
+        long estimate = estimatedAmountCent == null ? 0L : estimatedAmountCent;
+        if (estimate > 0) {
+            int ratio = (int) configLong(KEY_FINAL_MAX_RATIO, DEFAULT_FINAL_MAX_RATIO);
+            long ratioCap = estimate * Math.max(1, ratio);
+            if (finalCent > ratioCap) {
+                log.warn("[gz-recycle] final_amount {} 超估价×{} 上限 {}（估价 {}，拦截）", finalCent, ratio, ratioCap, estimate);
+                throw new ServiceException(GzRecycleErrorCode.FINAL_AMOUNT_EXCEEDS_LIMIT_MSG, GzRecycleErrorCode.FINAL_AMOUNT_EXCEEDS_LIMIT);
+            }
+        }
+    }
+
+    /** 读 sys_config long 值，缺失/非法兜底 default（同 recon rateBpOf 范式）。 */
+    private long configLong(String key, long def) {
+        String raw = configService.getConfigValue(key);
+        if (StrUtil.isBlank(raw)) {
+            return def;
+        }
+        try {
+            return Long.parseLong(raw.trim());
+        } catch (NumberFormatException ex) {
+            log.warn("[gz-recycle] sys_config {} 非法值 '{}'，兜底 {}", key, raw, def);
+            return def;
+        }
+    }
+
     @Override
     public int syncPayoutResult() {
         // 钩子无登录态 → 全租户扫（与 PAY-105 scanAndQuery 同思路）
         return TenantHelper.ignore(() -> {
-            List<Long> ids = baseMapper.selectPayingIds(SCAN_LIMIT);
+            List<Long> ids = baseMapper.selectSyncablePayoutIds(SCAN_LIMIT);
             int paidCount = 0;
             for (Long id : ids) {
                 try {
@@ -317,7 +364,10 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
      */
     private boolean syncOne(Long appointmentId) {
         GzRecycleAppointment appt = baseMapper.selectById(appointmentId);
-        if (appt == null || !"paying".equals(appt.getStatus()) || StrUtil.isBlank(appt.getOutPayoutNo())) {
+        // D16 B4：paying 与 payout_failed（owner 从打款单页重试、回收单未回写）均参与收敛；
+        // markPaid/markPayoutFailed 各自 WHERE 守卫保证幂等，不会误推进。
+        if (appt == null || StrUtil.isBlank(appt.getOutPayoutNo())
+            || !("paying".equals(appt.getStatus()) || STATUS_PAYOUT_FAILED.equals(appt.getStatus()))) {
             return false;
         }
         GzPayPayoutTransaction payout = payoutMapper.selectByOutPayoutNo(appt.getOutPayoutNo());

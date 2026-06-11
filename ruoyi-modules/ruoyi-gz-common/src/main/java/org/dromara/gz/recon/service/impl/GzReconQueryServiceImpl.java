@@ -89,9 +89,6 @@ public class GzReconQueryServiceImpl implements IGzReconQueryService {
         List<ReconDetailRowVo> details = sourceMapper.selectDetailRows(businessType, startDate, endDate);
 
         List<ReconExportRowVo> rows = new ArrayList<>(details.size() + 1);
-        long gmvSum = 0L;
-        long feeSum = 0L;
-        long refundSum = 0L;
         for (ReconDetailRowVo d : details) {
             ReconExportRowVo r = new ReconExportRowVo();
             r.setOutTradeNo(d.getOutTradeNo());
@@ -103,22 +100,21 @@ public class GzReconQueryServiceImpl implements IGzReconQueryService {
             r.setRefundYuan(d.getRefundAmountCent() == null ? "" : yuan(d.getRefundAmountCent()));
             r.setRefundedTimeText(d.getRefundedTime() == null ? "" : d.getRefundedTime().toString());
             rows.add(r);
-
-            gmvSum += nz(d.getAmountCent());
-            feeSum += nz(d.getFeeCent());
-            refundSum += nz(d.getRefundAmountCent());
         }
 
-        // 末尾四项汇总行（合同 §4.2.1）：GMV / 退款 / 通道费 / 实际到账 = GMV − 退款 − 通道费（MAX0）
-        long settleSum = Math.max(0L, gmvSum - refundSum - feeSum);
+        // 末尾四项汇总行（合同 §4.2.1）。D16 P10：汇总【直接取 gz_recon_monthly 已落库值】而非从 detail 现算 ——
+        //   monthly 跑批按 refunded_time 当月归属退款（C4），detail 按 paid_time 取交易行 + 无条件 LEFT JOIN 退款，
+        //   跨月退款（如 5 月成交 6 月退款）两口径会打架；导出汇总与对账中心月度 settle/commission 必须同源，
+        //   否则甲方核季度结算时两份凭证对不上。明细行 refund 仍按交易颗粒度展示作凭证。
+        ReconSummaryVo monthly = monthlySummary(businessType, startMonth, endMonth);
         ReconExportRowVo total = new ReconExportRowVo();
-        total.setOutTradeNo("【本期汇总】");
+        total.setOutTradeNo("【本期汇总·与对账中心同源】");
         total.setBusinessOrderNo("");
-        total.setAmountYuan(yuan(gmvSum));
+        total.setAmountYuan(yuan(monthly.getGmvCent()));
         total.setPaidTimeText("");
-        total.setStatusText("实际到账 " + yuan(settleSum) + " 元");
-        total.setFeeYuan(yuan(feeSum));
-        total.setRefundYuan(yuan(refundSum));
+        total.setStatusText("实际到账 " + yuan(monthly.getSettleCent()) + " 元");
+        total.setFeeYuan(yuan(monthly.getChannelFeeCent()));
+        total.setRefundYuan(yuan(monthly.getRefundCent()));
         total.setRefundedTimeText("");
         rows.add(total);
         return rows;

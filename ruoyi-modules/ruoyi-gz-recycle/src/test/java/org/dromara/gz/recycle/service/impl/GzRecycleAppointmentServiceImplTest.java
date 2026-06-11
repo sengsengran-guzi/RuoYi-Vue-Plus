@@ -63,6 +63,8 @@ class GzRecycleAppointmentServiceImplTest {
     private org.dromara.gz.common.pay.service.IGzPayPayoutService payoutService;
     @Mock
     private org.dromara.gz.common.pay.mapper.GzPayPayoutTransactionMapper payoutMapper;
+    @Mock
+    private org.dromara.common.core.service.ConfigService configService;
 
     private GzRecycleAppointmentServiceImpl service;
 
@@ -70,7 +72,7 @@ class GzRecycleAppointmentServiceImplTest {
     void setUp() {
         service = new GzRecycleAppointmentServiceImpl(
             baseMapper, priceRuleService, gzUserMapper, apptNoGenerator, new ObjectMapper(),
-            payoutService, payoutMapper);
+            payoutService, payoutMapper, configService);
     }
 
     private GzRecycleAppointmentSubmitBo.ProductLine line(String category, int qty) {

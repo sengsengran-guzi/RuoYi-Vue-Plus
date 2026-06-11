@@ -222,6 +222,22 @@ public class GzNewsArticleServiceImpl implements IGzNewsArticleService {
 
     @Override
     @Transactional(rollbackFor = Exception.class)
+    public boolean cancelSchedule(Long id) {
+        // D16：取消定时（scheduled → draft，清 schedule_publish_time），doc/10 §5 状态机「待定时发布→草稿」。
+        //   补此前漏实现的流转 —— 运营设错定时时间可撤回改期，不必强制立即发或删除重建（丢 article_no/阅读量）。
+        GzNewsArticle e = loadForTransition(id);
+        if (!STATUS_SCHEDULED.equals(e.getStatus())) {
+            throw new ServiceException("仅待定时发布的文章可取消定时，当前状态：" + e.getStatus());
+        }
+        boolean ok = baseMapper.cancelSchedule(id) > 0;
+        if (ok) {
+            log.info("[gz-news-admin] CANCEL-SCHEDULE id={} → draft", id);
+        }
+        return ok;
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
     public boolean offline(Long id) {
         GzNewsArticle e = loadForTransition(id);
         // doc/10 §5：published → offline（N11 下架）
@@ -334,10 +350,16 @@ public class GzNewsArticleServiceImpl implements IGzNewsArticleService {
         if (StrUtil.isBlank(videoUrls)) {
             return;
         }
-        long count = Arrays.stream(videoUrls.split(","))
-            .map(String::trim).filter(StrUtil::isNotBlank).count();
-        if (count > MAX_VIDEO_URLS) {
+        List<String> segments = Arrays.stream(videoUrls.split(","))
+            .map(String::trim).filter(StrUtil::isNotBlank).toList();
+        if (segments.size() > MAX_VIDEO_URLS) {
             throw new ServiceException("视频 URL 最多 " + MAX_VIDEO_URLS + " 个");
+        }
+        // D16：每段校验 http(s) 协议前缀（防 admin 误填非法串 → mp <video> 加载白块）
+        for (String seg : segments) {
+            if (!StrUtil.startWithAnyIgnoreCase(seg, "http://", "https://")) {
+                throw new ServiceException("视频 URL 必须以 http:// 或 https:// 开头：" + seg);
+            }
         }
     }
 

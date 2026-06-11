@@ -63,7 +63,16 @@ class GzUserCouponServiceImplTest {
         c.setStatus(status);
         c.setAmountSnapshotCent(amountCent);
         c.setExpireTime(expireTime);
+        c.setTemplateId(99L); // D16：lockForBooking 校验 applicable_business 走 templateId
         return c;
+    }
+
+    /** D16：lockForBooking 适用业务校验用的 pindou 模板 mock。 */
+    private org.dromara.gz.coupon.domain.entity.GzCouponTemplate pindouTemplate() {
+        org.dromara.gz.coupon.domain.entity.GzCouponTemplate t = new org.dromara.gz.coupon.domain.entity.GzCouponTemplate();
+        t.setId(99L);
+        t.setApplicableBusiness("pindou");
+        return t;
     }
 
     // ---------------- lockForBooking ----------------
@@ -73,6 +82,7 @@ class GzUserCouponServiceImplTest {
     void lock_happy() {
         GzUserCoupon c = coupon(1L, 7L, "unused", 500L, LocalDateTime.now().plusDays(10));
         when(baseMapper.selectById(1L)).thenReturn(c);
+        when(templateMapper.selectById(99L)).thenReturn(pindouTemplate());
         when(baseMapper.lockCoupon(eq(1L), any())).thenReturn(1);
 
         LockedCoupon locked = service.lockForBooking(1L, 7L);
@@ -105,6 +115,7 @@ class GzUserCouponServiceImplTest {
     void lock_casFails() {
         GzUserCoupon c = coupon(4L, 7L, "used", 500L, LocalDateTime.now().plusDays(10));
         when(baseMapper.selectById(4L)).thenReturn(c);
+        when(templateMapper.selectById(99L)).thenReturn(pindouTemplate());
         when(baseMapper.lockCoupon(eq(4L), any())).thenReturn(0); // 状态非 unused / 已过期
 
         assertThrows(ServiceException.class, () -> service.lockForBooking(4L, 7L));

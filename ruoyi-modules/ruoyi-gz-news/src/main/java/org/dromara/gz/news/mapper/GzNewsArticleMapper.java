@@ -45,6 +45,17 @@ public interface GzNewsArticleMapper extends BaseMapperPlus<GzNewsArticle, GzNew
     int incrementShareCount(@Param("id") Long id);
 
     /**
+     * 取消定时（D16，scheduled → draft + 清 schedule_publish_time）。显式 SQL 置 NULL
+     * （mybatis-plus updateById 默认忽略 null 字段）。WHERE 守卫 status='scheduled' 幂等。
+     *
+     * @param id 文章主键
+     * @return 影响行数（1=成功 / 0=已非 scheduled）
+     */
+    @Update("UPDATE gz_news_article SET status = 'draft', schedule_publish_time = NULL "
+        + "WHERE id = #{id} AND status = 'scheduled' AND del_flag = '0'")
+    int cancelSchedule(@Param("id") Long id);
+
+    /**
      * 查询到期待发布的定时文章 id（GZ-NEWS-004 cron，doc/10 §5 定时发布分支）。
      *
      * <p>条件：{@code status='scheduled' AND schedule_publish_time <= now() AND del_flag='0'}。

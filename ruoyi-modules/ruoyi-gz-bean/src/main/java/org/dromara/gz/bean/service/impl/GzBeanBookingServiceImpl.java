@@ -933,14 +933,17 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                     int remaining = (int) Math.max(0L, quantity - activeCount);
                     result.add(GzBeanTypeSlotAvailabilityVO.builder()
                         .seatType(cfg.getSeatType())
-                        .seatTypeName(typeName)
-                        .priceCent(cfg.getPriceCent())
+                        .name(typeName)
+                        .unitPriceCent(cfg.getPriceCent())
                         .slotStart(slot.getStartTime())
                         .slotEnd(slot.getEndTime())
                         .quantity(quantity)
                         .activeCount(activeCount)
                         .remaining(remaining)
                         .full(remaining <= 0)
+                        // mp 契约：仅 enabled=1 config 进余量接口（:914 eq enabled=1），active 恒 true。
+                        // 不回传会让 mp ts.active===undefined→falsy→整档被 filter 掉（座位列表恒空）。
+                        .active(Boolean.TRUE)
                         .build());
                 }
             }
@@ -1067,6 +1070,44 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         log.info("[bean-payclosed] booking closed bookingId={} (quota released) couponId={}",
             bookingId, booking.getCouponId());
         return true;
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void onPindouRefunded(String bookingNo) {
+        GzBeanBooking booking = bookingMapper.selectByBookingNo(bookingNo);
+        if (booking == null) {
+            // 退款回调事务内 → 抛异常让整笔回调回滚（admin 人工介入），不静默吞
+            throw new ServiceException("拼豆预约不存在（退款回调）: bookingNo=" + bookingNo);
+        }
+        // 幂等：仅 paid 单可退（已 refunded/pay_closed 跳过，防重复回调重复释放）
+        if (!PAY_STATUS_PAID.equals(booking.getPayStatus())) {
+            log.info("[bean-refund] booking pay_status={} ≠ paid, idempotent skip bookingNo={}",
+                booking.getPayStatus(), bookingNo);
+            return;
+        }
+        int affected = bookingMapper.markRefunded(booking.getId(), LocalDateTime.now());
+        if (affected == 0) {
+            // 并发已被推进 → 幂等跳过
+            log.info("[bean-refund] markRefunded affected=0 (concurrent), idempotent skip bookingNo={}", bookingNo);
+            return;
+        }
+        // 券口径（保守默认，D16 P2）：退款只退实付（= 单笔金额 − 券面额），已 used 的券【不退还】
+        //   —— 券让利已消费，退钱又退券 = 双重让利。如甲方要退券改口径，此处加 couponService.returnUsed(coupon_id)。
+        boolean wasPending = STATUS_PENDING.equals(booking.getStatus());
+        bookingLogMapper.insert(GzBeanBookingLog.builder()
+            .bookingId(booking.getId())
+            .fromStatus(booking.getStatus())
+            .toStatus(wasPending ? STATUS_CANCELLED : booking.getStatus())
+            .operatorType(OPERATOR_SYSTEM)
+            .operatorId(null)
+            .note("退款成功（pay_status paid → refunded）"
+                + (wasPending ? "，未核销单 status → cancelled，释放配额" : "，已核销单保留 status")
+                + (booking.getCouponId() != null ? "；已用券不退还 couponId=" + booking.getCouponId() : ""))
+            .delFlag("0")
+            .build());
+        log.info("[bean-refund] booking refunded bookingNo={} wasPending={} (quota {} ) couponId={}",
+            bookingNo, wasPending, wasPending ? "released" : "n/a", booking.getCouponId());
     }
 
     @Override

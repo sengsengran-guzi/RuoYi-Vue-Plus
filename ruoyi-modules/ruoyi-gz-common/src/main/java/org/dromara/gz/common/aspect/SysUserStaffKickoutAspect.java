@@ -106,4 +106,90 @@ public class SysUserStaffKickoutAspect {
             }
         }
     }
+
+    /* ---------- D16 P11：改权限（不停用/不删除）也即时回收 mp 旧权限快照 ---------- */
+
+    /**
+     * 切 {@code SysUserServiceImpl#insertUserAuth(Long, Long[])}：owner 给某店员重新分配角色后，
+     * 踢其 mp 会话（旧权限快照失效，下次进 mp 重登 fresh resolve）。
+     */
+    @AfterReturning(
+        pointcut = "execution(void org.dromara.system.service.impl.SysUserServiceImpl.insertUserAuth(Long, Long[])) && args(userId, roleIds)",
+        argNames = "userId,roleIds")
+    public void afterInsertUserAuth(Long userId, Long[] roleIds) {
+        kickQuietly(userId, "授权角色 sys_user=" + userId);
+    }
+
+    /**
+     * 切 {@code SysUserServiceImpl#updateUser(SysUserBo)}：owner 编辑用户（可能改角色绑定）成功后，
+     * 反射取 userId 踢其 mp 会话。非店员 user 踢出 0 个会话（no-op，安全）。
+     */
+    @AfterReturning(
+        pointcut = "execution(int org.dromara.system.service.impl.SysUserServiceImpl.updateUser(org.dromara.system.domain.bo.SysUserBo)) && args(userBo)",
+        returning = "result",
+        argNames = "userBo,result")
+    public void afterUpdateUser(Object userBo, Object result) {
+        if (result instanceof Integer rows && rows <= 0) {
+            return;
+        }
+        Long userId = invokeLongGetter(userBo, "getUserId");
+        kickQuietly(userId, "编辑用户 sys_user=" + userId);
+    }
+
+    /**
+     * 切 {@code SysRoleServiceImpl#updateRole(SysRoleBo)}：owner 改某角色的菜单权限影响所有持该角色的店员，
+     * 无「按 roleId 反查 sys_user」基础设施 → 保守踢<b>所有已绑定店员</b>（V1 店员少 / 角色变更罕见，安全）。
+     */
+    @AfterReturning(
+        pointcut = "execution(int org.dromara.system.service.impl.SysRoleServiceImpl.updateRole(org.dromara.system.domain.bo.SysRoleBo)) && args(roleBo)",
+        returning = "result",
+        argNames = "roleBo,result")
+    public void afterUpdateRole(Object roleBo, Object result) {
+        if (result instanceof Integer rows && rows <= 0) {
+            return;
+        }
+        try {
+            java.util.List<Long> staffIds = staffSysUserMapper.selectAllBoundStaffUserIds();
+            int total = 0;
+            for (Long staffUserId : staffIds) {
+                if (staffUserId != null) {
+                    total += mpStaffPermissionService.kickoutByStaffUserId(staffUserId);
+                }
+            }
+            if (total > 0) {
+                log.info("[gz-staff-aop] 角色权限变更 → 保守踢出 {} 个店员 mp 会话（共 {} 名绑定店员）", total, staffIds.size());
+            }
+        } catch (Exception e) {
+            log.warn("[gz-staff-aop] 角色变更后踢店员失败（不影响角色更新本身）: {}", e.getMessage());
+        }
+    }
+
+    /** 踢单个 sys_user 的 mp 会话，失败仅记日志不打断 ruoyi 主流程。 */
+    private void kickQuietly(Long userId, String scene) {
+        if (userId == null) {
+            return;
+        }
+        try {
+            int kicked = mpStaffPermissionService.kickoutByStaffUserId(userId);
+            if (kicked > 0) {
+                log.info("[gz-staff-aop] {} → 踢出 {} 个 mp 会话", scene, kicked);
+            }
+        } catch (Exception e) {
+            log.warn("[gz-staff-aop] {} 踢人失败（不影响主流程）: {}", scene, e.getMessage());
+        }
+    }
+
+    /** 反射调用无参 Long getter（不 import ruoyi-system 类，避免新增模块依赖）。 */
+    private Long invokeLongGetter(Object bo, String getter) {
+        if (bo == null) {
+            return null;
+        }
+        try {
+            Object v = bo.getClass().getMethod(getter).invoke(bo);
+            return v instanceof Long l ? l : null;
+        } catch (Exception e) {
+            log.warn("[gz-staff-aop] 反射 {}.{} 失败: {}", bo.getClass().getSimpleName(), getter, e.getMessage());
+            return null;
+        }
+    }
 }

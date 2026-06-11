@@ -10,7 +10,10 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.List;
+
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -113,5 +116,43 @@ class SysUserStaffKickoutAspectTest {
 
         verify(mpStaffPermissionService, never()).kickoutByStaffUserId(any());
         verify(staffSysUserMapper, never()).clearStaffBindingByStaffUserId(any());
+    }
+
+    /* ---------- D16 P11：改权限（不停用/不删除）即时回收 ---------- */
+
+    /** 反射用假 bo（仅需 getUserId）。 */
+    static class FakeUserBo {
+        private final Long userId;
+        FakeUserBo(Long userId) { this.userId = userId; }
+        public Long getUserId() { return userId; }
+    }
+
+    @Test
+    @DisplayName("P11 insertUserAuth 授权角色 → 踢该 userId mp 会话")
+    void afterInsertUserAuth_kicks() {
+        aspect.afterInsertUserAuth(101L, new Long[]{2L, 3L});
+        verify(mpStaffPermissionService).kickoutByStaffUserId(101L);
+    }
+
+    @Test
+    @DisplayName("P11 updateUser rows>0 → 反射取 userId 踢；rows=0 不踢")
+    void afterUpdateUser_kicksWhenRowsPositive() {
+        aspect.afterUpdateUser(new FakeUserBo(101L), 1);
+        verify(mpStaffPermissionService).kickoutByStaffUserId(101L);
+
+        aspect.afterUpdateUser(new FakeUserBo(102L), 0);
+        verify(mpStaffPermissionService, never()).kickoutByStaffUserId(102L);
+    }
+
+    @Test
+    @DisplayName("P11 updateRole 成功 → 保守踢所有已绑定店员")
+    void afterUpdateRole_kicksAllBoundStaff() {
+        when(staffSysUserMapper.selectAllBoundStaffUserIds()).thenReturn(List.of(101L, 102L));
+        when(mpStaffPermissionService.kickoutByStaffUserId(anyLong())).thenReturn(1);
+
+        aspect.afterUpdateRole(new Object(), 1);
+
+        verify(mpStaffPermissionService).kickoutByStaffUserId(101L);
+        verify(mpStaffPermissionService).kickoutByStaffUserId(102L);
     }
 }

@@ -40,9 +40,14 @@ public final class NewsHtmlSanitizer {
     private static final Pattern ON_EVENT_ATTR = Pattern.compile(
         "\\s+on[a-zA-Z]+\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)", Pattern.CASE_INSENSITIVE);
 
-    /** javascript: / vbscript: / data:text/html 伪协议（中和为 #）。 */
+    /** javascript: / vbscript: / data:text/html 伪协议（带引号，中和为 #）。 */
     private static final Pattern DANGEROUS_URI = Pattern.compile(
         "(href|src)\\s*=\\s*([\"'])\\s*(javascript|vbscript|data\\s*:\\s*text/html)[^\"']*\\2",
+        Pattern.CASE_INSENSITIVE);
+
+    /** D16：无引号伪协议 href=javascript:... / src=vbscript:...（中和为 #），补带引号正则的遗漏。 */
+    private static final Pattern DANGEROUS_URI_UNQUOTED = Pattern.compile(
+        "(href|src)\\s*=\\s*(javascript|vbscript|data\\s*:\\s*text/html)[^\\s>]*",
         Pattern.CASE_INSENSITIVE);
 
     private NewsHtmlSanitizer() {
@@ -62,8 +67,9 @@ public final class NewsHtmlSanitizer {
         String html = HtmlUtil.removeHtmlTag(raw, true, DANGEROUS_TAGS);
         // 2. 剥内联事件属性
         html = ON_EVENT_ATTR.matcher(html).replaceAll("");
-        // 3. 中和危险伪协议
+        // 3. 中和危险伪协议（带引号 + 无引号两路）
         html = DANGEROUS_URI.matcher(html).replaceAll("$1=$2#$2");
+        html = DANGEROUS_URI_UNQUOTED.matcher(html).replaceAll("$1=#");
         return html;
     }
 }

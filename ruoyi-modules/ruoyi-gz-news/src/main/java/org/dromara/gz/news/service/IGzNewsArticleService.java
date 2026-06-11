@@ -84,6 +84,14 @@ public interface IGzNewsArticleService {
     boolean schedule(Long id, LocalDateTime schedulePublishTime);
 
     /**
+     * 取消定时（scheduled → draft，清 schedule_publish_time，doc/10 §5）。补漏：定时设错可撤回改期。
+     *
+     * @param id 文章主键（须 status=scheduled）
+     * @return true=流转成功
+     */
+    boolean cancelSchedule(Long id);
+
+    /**
      * 下架（published → offline，doc/10 §5.N11）。
      *
      * @param id 文章主键

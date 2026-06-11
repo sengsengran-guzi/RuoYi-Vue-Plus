@@ -81,14 +81,19 @@ public interface GzRecycleAppointmentMapper extends BaseMapperPlus<GzRecycleAppo
     /**
      * 打款到账回写：paying → paid（GZ-RECYCLE-003 AC2，doc/10 §13.N10；查单 success 钩子调）。
      *
-     * <p>WHERE 守卫 {@code status='paying'} → 幂等（已非 paying 则 affected=0 跳过）。</p>
+     * <p>WHERE 守卫 {@code status IN ('paying','payout_failed')} → 幂等（已 paid/其它终态则 affected=0 跳过）。</p>
+     *
+     * <p><b>D16 B4 收敛</b>：纳入 {@code payout_failed} —— owner 若从 admin『打款单管理』页重试
+     * （{@code GzPayPayoutServiceImpl.retryPayout} 只推进 payout 单、不回写回收单，回收单仍停 payout_failed），
+     * payout 查单收敛 success 后本回写仍需把 payout_failed→paid，避免「钱已二次转出但回收单永久卡 payout_failed」
+     * （资金/单据脱钩）。</p>
      *
      * @param id 预约单 id
      * @return 受影响行数（1 = 推进成功 / 0 = 幂等跳过）
      */
     @Update("UPDATE gz_recycle_appointment " +
         "SET status = 'paid', version = version + 1 " +
-        "WHERE id = #{id} AND status = 'paying' AND del_flag = '0'")
+        "WHERE id = #{id} AND status IN ('paying', 'payout_failed') AND del_flag = '0'")
     int markPaid(@Param("id") Long id);
 
     /**
@@ -133,14 +138,20 @@ public interface GzRecycleAppointmentMapper extends BaseMapperPlus<GzRecycleAppo
     int markNoShow(@Param("id") Long id);
 
     /**
-     * 扫 paying 态预约单 id（RECYCLE-003 paid 回写钩子，syncPayoutResult 调）。
+     * 扫待 payout 回写收敛的预约单 id（RECYCLE-003 paid 回写钩子，syncPayoutResult 调）。
+     *
+     * <p><b>D16 B4 收敛</b>：除 {@code paying} 外，纳入 {@code payout_failed} 且 {@code out_payout_no} 非空的单 ——
+     * owner 从 admin『打款单管理』页重试（不回写回收单状态）后，payout 单可经查单收敛 success，
+     * 本扫描须把这些单也喂给 {@code syncOne} → {@code markPaid}，否则回收单永久卡 payout_failed（资金/单据脱钩）。
+     * payout 仍 failed 的单 syncOne 走 failed 分支幂等 no-op，不会误推进。</p>
      *
      * @param limit 单轮上限（防雪崩）
-     * @return paying 态预约单 id 列表
+     * @return 待收敛预约单 id 列表（paying / payout_failed 且有 out_payout_no）
      */
     @Select("SELECT id FROM gz_recycle_appointment " +
-        "WHERE status = 'paying' AND del_flag = '0' ORDER BY id LIMIT #{limit}")
-    List<Long> selectPayingIds(@Param("limit") int limit);
+        "WHERE status IN ('paying', 'payout_failed') AND out_payout_no IS NOT NULL AND del_flag = '0' " +
+        "ORDER BY id LIMIT #{limit}")
+    List<Long> selectSyncablePayoutIds(@Param("limit") int limit);
 
     /**
      * 扫超预约日仍 submitted 的单 id（no_show 凌晨任务，AC7）。

@@ -212,6 +212,23 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
     int markPayClosed(@Param("id") Long id, @Param("closedTime") LocalDateTime closedTime);
 
     /**
+     * 退款回写条件 UPDATE（D16 P2，admin 全额退款回调触发）：{@code pay_status: paid → refunded}。
+     *
+     * <p>{@code status} 仅当仍 {@code pending}（未核销）时同步 → {@code cancelled} 释放该 (类型,时段) 配额名额
+     * （活跃口径 status='pending' AND pay_status IN(paying,paid)，离开即释放）；已 {@code used}（已核销消费）的单
+     * 保留 status=used（退的是已消费单，不改业务态，仅记 pay_status=refunded）。WHERE 含 {@code pay_status='paid'}
+     * 守卫 → 幂等（重复回调 affected=0）。</p>
+     *
+     * @return 受影响行数（1 = 回写成功 / 0 = 已非 paid，幂等跳过）
+     */
+    @Update("UPDATE gz_bean_booking " +
+        "SET pay_status = 'refunded', " +
+        "    status = IF(status = 'pending', 'cancelled', status), " +
+        "    cancelled_time = IF(status = 'pending', #{refundedTime}, cancelled_time) " +
+        "WHERE id = #{id} AND pay_status = 'paid' AND del_flag = '0'")
+    int markRefunded(@Param("id") Long id, @Param("refundedTime") LocalDateTime refundedTime);
+
+    /**
      * 扫超时未付的活跃占位单（GZ-BEAN-014 AC 8 unpaid 超时回收，doc/10 §11.N13a）。
      *
      * <p>{@code pay_status IN ('unpaid','paying') AND status='pending' AND create_time < 截止时间}

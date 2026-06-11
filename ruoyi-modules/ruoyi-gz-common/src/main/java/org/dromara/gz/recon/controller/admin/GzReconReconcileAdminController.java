@@ -17,6 +17,7 @@ import org.dromara.gz.recon.domain.vo.GzReconDailyVo;
 import org.dromara.gz.recon.domain.vo.GzReconMonthlyVo;
 import org.dromara.gz.recon.domain.vo.GzReconSettleVo;
 import org.dromara.gz.recon.domain.vo.ReconSummaryVo;
+import org.dromara.gz.recon.service.IGzReconBatchService;
 import org.dromara.gz.recon.service.IGzReconQueryService;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -51,6 +52,7 @@ import java.util.List;
 public class GzReconReconcileAdminController extends BaseController {
 
     private final IGzReconQueryService queryService;
+    private final IGzReconBatchService batchService;
 
     /**
      * 月度汇总（四栏数字卡片 + 分成）：某 business_type 在 [startMonth, endMonth] SUM(gz_recon_monthly)。
@@ -117,5 +119,27 @@ public class GzReconReconcileAdminController extends BaseController {
         List<ReconExportRowVo> rows = queryService.buildExportRows(businessType, startMonth, endMonth);
         String sheet = "对账明细_" + ("preorder".equals(businessType) ? "业务线A" : "业务线B") + "_" + startMonth + "至" + endMonth;
         ExcelUtil.exportExcel(rows, sheet, ReconExportRowVo.class, response);
+    }
+
+    /**
+     * 立即重算对账（D16 #1，方案 A）：owner 手动触发跑批，<b>消除「忘了在 SnailJob 控制台注册 cron →
+     * 首月看分成全 ¥0」</b> 的部署风险——不依赖定时也能当场出数。
+     *
+     * <p>跑批 service UPSERT 幂等（重跑安全）。默认重算<b>前一日</b>（cron 同口径）+ 其所属月度；
+     * 可传 {@code businessDay=yyyy-MM-dd} / {@code month=yyyy-MM} 指定。财务敏感，复用 export 权限（仅 owner）。</p>
+     */
+    @Log(title = "对账立即重算", businessType = BusinessType.OTHER)
+    @SaCheckPermission("gz:recon:reconcile:export")
+    @PostMapping("/reconcile/rebuild")
+    public R<Void> rebuild(@RequestParam(value = "businessDay", required = false) String businessDay,
+                           @RequestParam(value = "month", required = false) String month) {
+        java.time.LocalDate day = (businessDay == null || businessDay.isBlank())
+            ? java.time.LocalDate.now().minusDays(1) : java.time.LocalDate.parse(businessDay);
+        int dailyRows = batchService.runDaily(day);
+        java.time.YearMonth ym = (month == null || month.isBlank())
+            ? java.time.YearMonth.from(day) : java.time.YearMonth.parse(month);
+        int monthlyRows = batchService.runMonthly(ym);
+        log.info("[GZ-RECON] owner 手动重算 day={} month={} dailyRows={} monthlyRows={}", day, ym, dailyRows, monthlyRows);
+        return R.ok();
     }
 }

@@ -219,6 +219,14 @@ public class GzUserCouponServiceImpl implements IGzUserCouponService {
                 couponId, coupon.getUserId(), userId);
             throw new ServiceException("优惠券不属于当前用户");
         }
+        // ②.5 D16 防御纵深：券适用业务必须为拼豆 —— lockForBooking 仅服务拼豆下单。当前 admin 仅放行
+        //     pindou 模板（双重硬闸），此校验恒过；作纵深兜底，防 V1.2+ 放开非 pindou 模板后被构造请求抵扣拼豆。
+        GzCouponTemplate template = coupon.getTemplateId() == null ? null : templateMapper.selectById(coupon.getTemplateId());
+        if (template == null || !"pindou".equals(template.getApplicableBusiness())) {
+            log.warn("[gz-coupon] lock reject: applicable_business 非拼豆 couponId={} templateId={} applicable={}",
+                couponId, coupon.getTemplateId(), template == null ? null : template.getApplicableBusiness());
+            throw new ServiceException("该优惠券不适用于本次拼豆预约");
+        }
         // ③ 状态 CAS 锁券：unused → locked（含过期实时拦截）。affected=0 = 券已被占用 / 已用 / 已过期。
         int affected = baseMapper.lockCoupon(couponId, LocalDateTime.now());
         if (affected == 0) {

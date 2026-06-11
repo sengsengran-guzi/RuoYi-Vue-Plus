@@ -35,4 +35,13 @@ public interface GzReconSettleMapper extends BaseMapperPlus<GzReconSettle, GzRec
             update_time            = NOW()
         """)
     int upsert(@Param("row") GzReconSettle row);
+
+    /**
+     * 查某季度结算单当前 status（D16 防御：已结算季度遇 late 退款重跑时守卫，不静默改写已付金额）。
+     *
+     * @return status（pending/paid/settled...）；无记录返回 null
+     */
+    @org.apache.ibatis.annotations.Select(
+        "SELECT status FROM gz_recon_settle WHERE quarter = #{quarter} AND tenant_id = #{tenantId} AND del_flag = '0' LIMIT 1")
+    String selectStatusByQuarter(@Param("quarter") String quarter, @Param("tenantId") String tenantId);
 }
