@@ -67,6 +67,7 @@ public class GzConfigMpController {
     @GetMapping("/get")
     public R<String> get(@RequestParam("key") @NotBlank String key) {
         String value = configService.getConfigValue(key);
-        return R.ok(value == null ? "" : value);
+        // value 必须放 data（R.ok(String) 会命中 msg 重载导致 data 恒 null，mp 落地页 banner/文案读 data 全空）
+        return R.ok("操作成功", value == null ? "" : value);
     }
 }
