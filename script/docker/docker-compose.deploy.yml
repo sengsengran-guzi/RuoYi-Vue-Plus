@@ -104,6 +104,9 @@ services:
       # 配齐后自动切 WxRealLoginAdapter（jscode2session）+ WxRealPhoneAdapter（getuserphonenumber）。
       WX_MA_APPID: ${WX_MA_APPID:-wxMOCK}
       WX_MA_SECRET: ${WX_MA_SECRET:-}
+      # 拼豆核销码 HMAC 签名密钥（GZ-BEAN-004）— prod 必填，否则 ProdSecretGuard fail-fast 拒绝启动。
+      # 生成：openssl rand -base64 32
+      GZ_BEAN_QR_SECRET: ${GZ_BEAN_QR_SECRET:?GZ_BEAN_QR_SECRET is required（核销码 HMAC 密钥，≥32 随机字符，生成 openssl rand -base64 32）}
     volumes:
       - ../../logs:/app/logs
     healthcheck:
