@@ -1,5 +1,6 @@
 package org.dromara.gz.recon.mapper;
 
+import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
 import org.dromara.common.mybatis.core.mapper.BaseMapperPlus;
@@ -24,7 +25,7 @@ public interface GzReconDailyMapper extends BaseMapperPlus<GzReconDaily, GzRecon
      * 幂等 UPSERT：同 (tenant_id, business_day, business_type) 重跑 → 覆盖 4 个金额 + status（不累加）。
      * <p>跑批在 TenantHelper.ignore 下执行，tenant_id 由 service 显式置 '1001' 落库。</p>
      */
-    @Select("""
+    @Insert("""
         INSERT INTO gz_recon_daily
             (tenant_id, business_day, business_type,
              system_gmv_cent, system_refund_cent, system_fee_cent, system_settle_cent,

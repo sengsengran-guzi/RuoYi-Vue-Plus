@@ -107,7 +107,19 @@ class PreorderFullChainMockTest {
         PayCallbackDispatcher dispatcher = new PayCallbackDispatcher(List.of(preorderHandler));
         dispatcher.validate();
 
-        PayOrderNoGenerator generator = new PayOrderNoGenerator(payTxMapper, refundMapper);
+        // PayOrderNoGenerator 改用 Redisson RAtomicLong 做当日原子序号 → 内存版 redisson mock 复刻「按 key 从 0 自增」
+        org.redisson.api.RedissonClient redissonMock = org.mockito.Mockito.mock(org.redisson.api.RedissonClient.class);
+        java.util.Map<String, java.util.concurrent.atomic.AtomicLong> seqCounters = new java.util.concurrent.ConcurrentHashMap<>();
+        org.mockito.Mockito.lenient().when(redissonMock.getAtomicLong(org.mockito.ArgumentMatchers.anyString())).thenAnswer(inv -> {
+            java.util.concurrent.atomic.AtomicLong backing = seqCounters.computeIfAbsent(inv.getArgument(0, String.class), k -> new java.util.concurrent.atomic.AtomicLong(0L));
+            org.redisson.api.RAtomicLong ral = org.mockito.Mockito.mock(org.redisson.api.RAtomicLong.class);
+            org.mockito.Mockito.lenient().when(ral.get()).thenAnswer(i -> backing.get());
+            org.mockito.Mockito.lenient().when(ral.compareAndSet(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.anyLong()))
+                .thenAnswer(i -> backing.compareAndSet(i.getArgument(0, Long.class), i.getArgument(1, Long.class)));
+            org.mockito.Mockito.lenient().when(ral.incrementAndGet()).thenAnswer(i -> backing.incrementAndGet());
+            return ral;
+        });
+        PayOrderNoGenerator generator = new PayOrderNoGenerator(payTxMapper, refundMapper, redissonMock);
         // 回调分发器以 ObjectProvider 延迟注入（打断构造期循环依赖）；测试 stub getObject() 返回真实 dispatcher
         @SuppressWarnings("unchecked")
         org.springframework.beans.factory.ObjectProvider<PayCallbackDispatcher> dispatcherProvider =

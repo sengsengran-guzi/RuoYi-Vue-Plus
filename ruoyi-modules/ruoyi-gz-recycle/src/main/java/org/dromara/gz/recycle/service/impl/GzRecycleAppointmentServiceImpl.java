@@ -290,7 +290,7 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             throw new ServiceException(GzRecycleErrorCode.APPOINTMENT_NOT_FOUND_MSG, GzRecycleErrorCode.APPOINTMENT_NOT_FOUND);
         }
         if (!STATUS_PAYOUT_FAILED.equals(appt.getStatus())) {
-            throw new ServiceException("仅打款失败的预约单可重试");
+            throw new ServiceException(GzRecycleErrorCode.RETRY_NOT_ALLOWED_MSG, GzRecycleErrorCode.RETRY_NOT_ALLOWED);
         }
         // PAY-105 重试：failed→created→重新受理（不无限自动，仅 owner 手动）
         GzPayPayoutTransactionVO payout = payoutService.retryPayout(appt.getAppointmentNo(), PAYOUT_REMARK);

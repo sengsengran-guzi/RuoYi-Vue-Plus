@@ -38,6 +38,10 @@ public final class GzRecycleErrorCode {
     public static final int FINAL_AMOUNT_EXCEEDS_LIMIT = 4107;
     public static final String FINAL_AMOUNT_EXCEEDS_LIMIT_MSG = "最终金额超出允许上限，请核对后重填或联系管理员";
 
+    /** admin 重试非「打款失败」态的预约单（retry-payout 状态守卫，T3-002：与回收域 4104-4107 体系一致的稳定码） */
+    public static final int RETRY_NOT_ALLOWED = 4108;
+    public static final String RETRY_NOT_ALLOWED_MSG = "仅打款失败的预约单可重试";
+
     private GzRecycleErrorCode() {
     }
 }

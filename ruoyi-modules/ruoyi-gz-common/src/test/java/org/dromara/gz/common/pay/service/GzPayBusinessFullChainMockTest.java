@@ -106,7 +106,7 @@ class GzPayBusinessFullChainMockTest {
         ObjectProvider<PayCallbackDispatcher> dispatcherProvider = mock(ObjectProvider.class);
         lenient().when(dispatcherProvider.getObject()).thenReturn(dispatcher);
 
-        PayOrderNoGenerator generator = new PayOrderNoGenerator(transactionMapper, refundMapper);
+        PayOrderNoGenerator generator = new PayOrderNoGenerator(transactionMapper, refundMapper, PayGeneratorTestSupport.inMemoryRedisson());
         service = new GzPayTransactionServiceImpl(
             transactionMapper, callbackLogMapper, generator, mockClient, props, dispatcherProvider);
 

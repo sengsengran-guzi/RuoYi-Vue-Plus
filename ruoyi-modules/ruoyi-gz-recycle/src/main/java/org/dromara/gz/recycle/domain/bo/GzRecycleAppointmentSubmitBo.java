@@ -60,10 +60,10 @@ public class GzRecycleAppointmentSubmitBo implements Serializable {
     /**
      * 用户提交时拍的实物照 file id 列表（FK gz_file_object，usage_type=recycle_submit_image）。
      *
-     * <p><b>必填</b>（AC3 / doc/10 §13.N2.5/E7）：{@code @NotEmpty} —— 无照后端拒收（报「请先拍照上传实物再提交」）。
-     * 落库逗号分隔，不存裸 url（强约束 #5）。</p>
+     * <p><b>必填</b>（AC3 / doc/10 §13.N2.5/E7）：空/缺省由 service 层校验抛业务码 4101
+     * （{@code SUBMIT_IMAGE_REQUIRED}，与 api 契约一致），不在 BO 用 {@code @NotEmpty}（那会走全局校验返 code 500、
+     * 与契约声明的 4101 分叉，T3-001）。前端 form.vue 亦有 hasImages 前置 gate。落库逗号分隔，不存裸 url（强约束 #5）。</p>
      */
-    @NotEmpty(message = "请先拍照上传实物再提交")
     @Size(max = 6, message = "实物照最多 6 张")
     private List<Long> submitImageIds;
 

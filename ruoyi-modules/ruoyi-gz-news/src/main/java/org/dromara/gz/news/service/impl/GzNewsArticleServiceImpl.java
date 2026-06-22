@@ -368,15 +368,12 @@ public class GzNewsArticleServiceImpl implements IGzNewsArticleService {
      */
     private String generateArticleNo(LocalDate date) {
         String prefix = "ART-" + date.format(ARTICLE_NO_DATE_FMT) + "-";
-        LambdaQueryWrapper<GzNewsArticle> wrapper = Wrappers.<GzNewsArticle>lambdaQuery()
-            .likeRight(GzNewsArticle::getArticleNo, prefix)
-            .orderByDesc(GzNewsArticle::getArticleNo)
-            .last("LIMIT 1");
-        GzNewsArticle last = baseMapper.selectOne(wrapper);
+        // MAX 必须含软删行（uk_article_no 唯一约束覆盖软删）：否则当日建→软删→再建会重用已软删序号触发 409。
+        String maxNo = baseMapper.selectMaxArticleNoIncludeDeleted(prefix);
         long nextSeq = 1L;
-        if (last != null && last.getArticleNo() != null && last.getArticleNo().length() == ARTICLE_NO_TOTAL_LEN) {
+        if (maxNo != null && maxNo.length() == ARTICLE_NO_TOTAL_LEN) {
             try {
-                nextSeq = Long.parseLong(last.getArticleNo().substring(prefix.length())) + 1L;
+                nextSeq = Long.parseLong(maxNo.substring(prefix.length())) + 1L;
             } catch (NumberFormatException ignored) {
                 // 异常退回 1
             }

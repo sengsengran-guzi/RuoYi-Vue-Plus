@@ -444,13 +444,18 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             throw new ServiceException("取消失败：并发冲突");
         }
 
+        // 释放已锁定的优惠券（与 closePindou 超时路径一致）：unlock 内部对 couponId=null 跳过、
+        // WHERE status='locked' 幂等（已 paid 单的券此时是 used，不会被误改）。否则带券未付单
+        // 手动取消后券永久卡 locked、对 usable/my 两个列表都隐藏，用户白丢券（T2.10）。
+        couponServiceProvider.getObject().unlock(booking.getCouponId());
+
         bookingLogMapper.insert(GzBeanBookingLog.builder()
             .bookingId(bookingId)
             .fromStatus(fromStatus)
             .toStatus(STATUS_CANCELLED)
             .operatorType(operatorType)
             .operatorId(operatorId)
-            .note(OPERATOR_USER.equals(operatorType) ? "用户取消" : "管理员代取消")
+            .note(OPERATOR_USER.equals(operatorType) ? "用户取消（券已解锁）" : "管理员代取消（券已解锁）")
             .delFlag("0")
             .build());
 
@@ -654,6 +659,12 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
      */
     private String buildQrPayload(GzBeanBookingVO vo) {
         if (StrUtil.isBlank(vo.getBookingNo()) || vo.getSessDate() == null) {
+            return null;
+        }
+        // 纵深防御（T2.8）：未付单不下发可用核销码 —— 否则有人绕过 mp 前端遮罩、直接读详情 VO 里的
+        // payload 去店员端出示即可过签名校验（verifyByType 不查 DB pay_status）。仅已支付（含旧免费单 paid
+        // 口径）才出码；未付单返 null，前端降级显 bookingNo 文本，最终核销仍由 doVerify 的 NOT_PAID 守卫兜底。
+        if (!PAY_STATUS_PAID.equals(vo.getPayStatus())) {
             return null;
         }
         // 判别真源同 doVerify：seat_id 非空 = 旧 booking（verify_code 用 seat_id 签）；

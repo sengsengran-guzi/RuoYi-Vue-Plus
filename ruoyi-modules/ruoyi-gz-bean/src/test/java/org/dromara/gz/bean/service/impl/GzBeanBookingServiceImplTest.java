@@ -439,6 +439,7 @@ class GzBeanBookingServiceImplTest {
         base.setSeatNoSnapshot("A1");
         base.setSessDate(LocalDate.of(2026, 6, 15));
         base.setStatus("pending");
+        base.setPayStatus("paid"); // 已支付才下发可用核销码（T2.8 纵深防御）
         when(bookingMapper.selectVoById(1L)).thenReturn(base);
         when(storeMapper.selectById(1L)).thenReturn(newNamedStore(1L, "成都春熙路店", "成都市锦江区春熙路 1 号"));
 
@@ -475,6 +476,7 @@ class GzBeanBookingServiceImplTest {
         base.setSeatId(101L);
         base.setSessDate(LocalDate.of(2026, 6, 15));
         base.setStatus("used");
+        base.setPayStatus("paid"); // 已支付才下发可用核销码（T2.8 纵深防御）
         when(bookingMapper.selectVoById(2L)).thenReturn(base);
         when(storeMapper.selectById(1L)).thenReturn(null);
 

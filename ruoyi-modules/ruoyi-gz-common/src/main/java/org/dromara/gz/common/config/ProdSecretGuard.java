@@ -44,21 +44,33 @@ public class ProdSecretGuard {
     public void check() {
         String appid = environment.getProperty("wx.miniapp.appid");
         String qrSecret = environment.getProperty("gz.bean.qr.signing-secret");
-        validate(appid, qrSecret);
-        log.info("[gz-prod-guard] 生产敏感配置校验通过（appid / qr-secret 已注入正式值）");
+        String payClientMode = environment.getProperty("gz.pay.client-mode");
+        validate(appid, qrSecret, payClientMode);
+        log.info("[gz-prod-guard] 生产敏感配置校验通过（appid / qr-secret / pay client-mode 已注入正式值）");
     }
 
     /**
-     * 校验 prod 敏感项；任一仍为占位值则抛 {@link IllegalStateException}（一次列全所有漏配项）。
-     * 抽成静态方法便于单测（不启 Spring context）。
+     * 旧签名保留（仅校验 appid / qr-secret）：既有单测沿用，clientMode 视为已注入正式值。
      */
     static void validate(String appid, String qrSecret) {
+        validate(appid, qrSecret, "real");
+    }
+
+    /**
+     * 校验 prod 敏感项；任一仍为占位/不安全值则抛 {@link IllegalStateException}（一次列全所有漏配项）。
+     * 抽成静态方法便于单测（不启 Spring context）。
+     */
+    static void validate(String appid, String qrSecret, String payClientMode) {
         List<String> missing = new ArrayList<>();
         if (appid == null || appid.isBlank() || APPID_PLACEHOLDERS.contains(appid)) {
             missing.add("wx.miniapp.appid（env WX_MA_APPID）仍为占位/空 [" + appid + "] → mock 登录会静默生效，鉴权失效");
         }
         if (qrSecret == null || qrSecret.isBlank() || QR_SECRET_PLACEHOLDERS.contains(qrSecret)) {
             missing.add("gz.bean.qr.signing-secret（env GZ_BEAN_QR_SECRET）仍为占位/空 → 核销码 HMAC 可被伪造");
+        }
+        if (payClientMode == null || payClientMode.isBlank() || !"real".equalsIgnoreCase(payClientMode.trim())) {
+            missing.add("gz.pay.client-mode（env WECHAT_PAY_CLIENT_MODE）非 real [" + payClientMode
+                + "] → mock 支付客户端会在 prod 生效，/api/pay/v3/notify 回调端点零验签，任意人可伪造回调把订单刷成已支付");
         }
         if (!missing.isEmpty()) {
             throw new IllegalStateException(

@@ -46,4 +46,22 @@ class ProdSecretGuardTest {
         assertDoesNotThrow(
             () -> ProdSecretGuard.validate("wx9988realappid", "Zk2026-prod-qr-secret-39chars-randomstr!!"));
     }
+
+    @Test
+    @DisplayName("pay client-mode 非 real（mock/缺省）→ 拒绝启动（回调零验签资金洞）")
+    void rejectNonRealPayClientMode() {
+        IllegalStateException mock = assertThrows(IllegalStateException.class,
+            () -> ProdSecretGuard.validate("wx9988realappid", "Zk2026-prod-qr-secret-39chars-randomstr!!", "mock"));
+        assertTrue(mock.getMessage().contains("gz.pay.client-mode"));
+        // 缺省（null = 运维漏注入 WECHAT_PAY_CLIENT_MODE，prod.yml 解析为 mock）同样拒绝
+        assertThrows(IllegalStateException.class,
+            () -> ProdSecretGuard.validate("wx9988realappid", "Zk2026-prod-qr-secret-39chars-randomstr!!", null));
+    }
+
+    @Test
+    @DisplayName("三项正式值（含 client-mode=real）→ 通过")
+    void passWithRealValuesAndRealPayMode() {
+        assertDoesNotThrow(
+            () -> ProdSecretGuard.validate("wx9988realappid", "Zk2026-prod-qr-secret-39chars-randomstr!!", "real"));
+    }
 }

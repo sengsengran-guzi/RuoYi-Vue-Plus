@@ -239,6 +239,9 @@ xss:
   # 排除链接
   excludeUrls:
     - /system/notice
+    # 资讯 CMS 富文本写接口（add/update）：内容含 <p>/<h2>/<img> 等合法标签，
+    # 不能被网关 XssFilter 无差别剥光；XSS 防护由业务层 NewsHtmlSanitizer（jsoup 白名单，落库前强制清洗）独立兜底。
+    - /system/gz/news/article
 
 --- # 分布式锁 lock4j 全局配置
 lock4j:

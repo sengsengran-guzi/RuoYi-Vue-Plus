@@ -1,5 +1,6 @@
 package org.dromara.gz.recon.mapper;
 
+import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
 import org.dromara.common.mybatis.core.mapper.BaseMapperPlus;
@@ -24,7 +25,7 @@ public interface GzReconMonthlyMapper extends BaseMapperPlus<GzReconMonthly, GzR
     /**
      * 幂等 UPSERT：同 (tenant_id, business_month, business_type) 重跑 → 覆盖金额/分成/status（不累加）。
      */
-    @Select("""
+    @Insert("""
         INSERT INTO gz_recon_monthly
             (tenant_id, business_month, business_type,
              gmv_cent, refund_cent, channel_fee_cent, settle_cent,

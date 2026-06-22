@@ -1,7 +1,7 @@
 package org.dromara.gz.recon.mapper;
 
+import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Param;
-import org.apache.ibatis.annotations.Select;
 import org.dromara.common.mybatis.core.mapper.BaseMapperPlus;
 import org.dromara.gz.recon.domain.entity.GzReconSettle;
 import org.dromara.gz.recon.domain.vo.GzReconSettleVo;
@@ -19,7 +19,7 @@ public interface GzReconSettleMapper extends BaseMapperPlus<GzReconSettle, GzRec
     /**
      * 幂等 UPSERT：同 (tenant_id, quarter) 重跑 → 覆盖三项金额合计（不累加；保留 A 已录的支付/发票字段不动）。
      */
-    @Select("""
+    @Insert("""
         INSERT INTO gz_recon_settle
             (tenant_id, quarter,
              commission_total_cent, maintenance_total_cent, payable_total_cent,

@@ -153,19 +153,34 @@ public class GzUserCouponServiceImpl implements IGzUserCouponService {
         if (userId == null) {
             return List.of();
         }
+        // 实时过期口径（T5-001）：expired 态由 GzCouponExpireJob cron 批量翻，过期当刻→下次 cron 之间
+        // （未配 job 则永久）DB status 仍是 'unused'。若仅按 DB status 硬过滤，已过期券会错留「未使用」tab、
+        // 缺席「已过期」tab。故按 expireTime 实时分流（与 listUsableForPindou 的 .gt(expireTime, now) 同口径）。
+        LocalDateTime now = LocalDateTime.now();
         LambdaQueryWrapper<GzUserCoupon> lqw = Wrappers.<GzUserCoupon>lambdaQuery()
             .eq(GzUserCoupon::getUserId, userId)
-            // status 为空 = 全部（但永不含 locked 瞬态：locked 是下单中的券，对用户列表不可见）
-            .eq(StrUtil.isNotBlank(status), GzUserCoupon::getStatus, status)
-            .ne(StrUtil.isBlank(status), GzUserCoupon::getStatus, "locked")
+            // locked 瞬态（下单中的券）对用户列表永不可见
+            .ne(GzUserCoupon::getStatus, "locked")
             .orderByDesc(GzUserCoupon::getGainedTime);
+        if ("unused".equals(status)) {
+            // 未使用 = status='unused' 且未过期
+            lqw.eq(GzUserCoupon::getStatus, "unused").gt(GzUserCoupon::getExpireTime, now);
+        }
+        else if ("expired".equals(status)) {
+            // 已过期 = status='expired' 或（status='unused' 且已过 expireTime，cron 未翻态）
+            lqw.and(w -> w.eq(GzUserCoupon::getStatus, "expired")
+                .or(o -> o.eq(GzUserCoupon::getStatus, "unused").le(GzUserCoupon::getExpireTime, now)));
+        }
+        else if (StrUtil.isNotBlank(status)) {
+            lqw.eq(GzUserCoupon::getStatus, status);
+        }
         List<GzUserCoupon> records = baseMapper.selectList(lqw);
         // 批量回填 templateName + applicableBusiness（防 N+1）
         Map<Long, GzCouponTemplate> templateMap = resolveTemplates(records);
         return records.stream()
             .map(e -> {
                 GzCouponTemplate t = templateMap.get(e.getTemplateId());
-                return toMpVO(e, t == null ? null : t.getName(), t == null ? null : t.getApplicableBusiness());
+                return toMpVO(e, t == null ? null : t.getName(), t == null ? null : t.getApplicableBusiness(), now);
             })
             .toList();
     }
@@ -183,8 +198,13 @@ public class GzUserCouponServiceImpl implements IGzUserCouponService {
             .collect(Collectors.toMap(GzCouponTemplate::getId, t -> t, (a, b) -> a));
     }
 
-    /** entity → mp VO（templateName / applicableBusiness 由调用方 join 回填传入）。 */
+    /** entity → mp VO（templateName / applicableBusiness 由调用方 join 回填传入；未过期候选场景用此重载）。 */
     private GzUserCouponMpVO toMpVO(GzUserCoupon e, String templateName, String applicableBusiness) {
+        return toMpVO(e, templateName, applicableBusiness, LocalDateTime.now());
+    }
+
+    /** entity → mp VO（now 传入以做实时过期口径：unused 但已过 expireTime → 对外 status 显 expired，T5-001）。 */
+    private GzUserCouponMpVO toMpVO(GzUserCoupon e, String templateName, String applicableBusiness, LocalDateTime now) {
         GzUserCouponMpVO vo = new GzUserCouponMpVO();
         vo.setId(e.getId());
         vo.setCouponNo(e.getCouponNo());
@@ -192,7 +212,12 @@ public class GzUserCouponServiceImpl implements IGzUserCouponService {
         vo.setTemplateName(templateName);
         vo.setApplicableBusiness(applicableBusiness);
         vo.setAmountSnapshotCent(e.getAmountSnapshotCent());
-        vo.setStatus(e.getStatus());
+        // 实时过期口径：DB 仍 unused 但已过 expireTime（cron 未翻态）→ 对外显示 expired，避免列表分类与文案自相矛盾。
+        String effectiveStatus = e.getStatus();
+        if ("unused".equals(effectiveStatus) && e.getExpireTime() != null && !e.getExpireTime().isAfter(now)) {
+            effectiveStatus = "expired";
+        }
+        vo.setStatus(effectiveStatus);
         vo.setGainedTime(e.getGainedTime());
         vo.setExpireTime(e.getExpireTime());
         vo.setUsedTime(e.getUsedTime());

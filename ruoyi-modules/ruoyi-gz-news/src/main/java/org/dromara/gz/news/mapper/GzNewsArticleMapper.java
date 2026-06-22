@@ -56,6 +56,20 @@ public interface GzNewsArticleMapper extends BaseMapperPlus<GzNewsArticle, GzNew
     int cancelSchedule(@Param("id") Long id);
 
     /**
+     * 取当日 article_no 前缀下的最大值（<b>含软删行</b>）—— 用于生成下一个 article_no。
+     *
+     * <p>uk_article_no(tenant_id, article_no) 唯一约束覆盖软删行，故序号生成必须把软删行也纳入 MAX，
+     * 否则「当日建文 → 软删 → 当日再建」会重用已软删的 article_no 触发 409（@TableLogic 只过滤业务查询、
+     * 不放宽唯一约束）。本 @Select 自定义 SQL 不经 @TableLogic 自动加 del_flag，天然含软删行；
+     * 租户条件仍由 TenantLineInnerInterceptor 自动 append。</p>
+     *
+     * @param prefix 形如 {@code ART-20260621-}
+     * @return 该前缀下最大 article_no（无则 null）
+     */
+    @Select("SELECT MAX(article_no) FROM gz_news_article WHERE article_no LIKE CONCAT(#{prefix}, '%')")
+    String selectMaxArticleNoIncludeDeleted(@Param("prefix") String prefix);
+
+    /**
      * 查询到期待发布的定时文章 id（GZ-NEWS-004 cron，doc/10 §5 定时发布分支）。
      *
      * <p>条件：{@code status='scheduled' AND schedule_publish_time <= now() AND del_flag='0'}。

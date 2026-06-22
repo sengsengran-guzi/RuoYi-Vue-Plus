@@ -110,7 +110,7 @@ class PayRefundServiceImplTest {
         refundDispatcher = new RefundCallbackDispatcher(List.of(preorderRefundHandler));
         refundDispatcher.validate();
 
-        PayOrderNoGenerator generator = new PayOrderNoGenerator(transactionMapper, refundMapper);
+        PayOrderNoGenerator generator = new PayOrderNoGenerator(transactionMapper, refundMapper, PayGeneratorTestSupport.inMemoryRedisson());
         refundTxService = new PayRefundTxService(refundMapper, transactionMapper, generator);
         service = new PayRefundServiceImpl(
             refundMapper, transactionMapper, callbackLogMapper, refundTxService, mockClient, props, refundDispatcher);

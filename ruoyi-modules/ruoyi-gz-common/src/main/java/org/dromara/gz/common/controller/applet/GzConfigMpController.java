@@ -12,6 +12,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.Set;
+
 /**
  * GZ-BEAN-010 mp 端公开 sys_config 读取 Controller（C 端）。
  *
@@ -44,6 +46,19 @@ public class GzConfigMpController {
     private final ConfigService configService;
 
     /**
+     * 公开可匿名读的 sys_config key 白名单（仅运营素材类）。
+     *
+     * <p>本端点 {@link SaIgnore} 匿名可达 + key 由 {@code @RequestParam} 传入，若不限定 key 则任意人
+     * 可读任意配置（含 {@code gz.commission.*} 分成率 / {@code sys.user.initPassword} 默认密码）。
+     * 故只放行 mp 落地页真实使用的运营素材 key（{@link org.dromara.gz.common ...} api/gz-common.ts 常量），
+     * 非白名单 key 一律拒绝。新增运营素材 key 时同步加入本集合。</p>
+     */
+    private static final Set<String> PUBLIC_CONFIG_KEYS = Set.of(
+        "gz.bean.home.banner",
+        "gz.home.banners"
+    );
+
+    /**
      * 按 key 读取单个 sys_config 配置值（mp 落地页运营素材）。
      *
      * <pre>
@@ -66,6 +81,11 @@ public class GzConfigMpController {
      */
     @GetMapping("/get")
     public R<String> get(@RequestParam("key") @NotBlank String key) {
+        // 安全门槛：仅放行运营素材类 key（白名单），杜绝匿名读分成率 / 默认密码等敏感配置。
+        if (!PUBLIC_CONFIG_KEYS.contains(key)) {
+            log.warn("[gz-config-mp] 拒绝读取非白名单配置 key: {}", key);
+            return R.fail("非法的配置项");
+        }
         String value = configService.getConfigValue(key);
         // value 必须放 data（R.ok(String) 会命中 msg 重载导致 data 恒 null，mp 落地页 banner/文案读 data 全空）
         return R.ok("操作成功", value == null ? "" : value);

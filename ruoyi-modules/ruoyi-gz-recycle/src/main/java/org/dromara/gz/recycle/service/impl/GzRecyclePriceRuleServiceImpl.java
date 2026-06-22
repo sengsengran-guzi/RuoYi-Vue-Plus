@@ -148,9 +148,14 @@ public class GzRecyclePriceRuleServiceImpl implements IGzRecyclePriceRuleService
         if (e == null) {
             throw new ServiceException("价目规则不存在：" + id);
         }
+        int normalized = normalizeEnabled(enabled);
+        // 停用→启用 前校验区间不与其它已启用规则重叠（assertNoOverlap 只看启用规则，T7.2）。
+        if (normalized == ENABLED_ON && normalizeEnabled(e.getEnabled()) != ENABLED_ON) {
+            assertNoOverlap(e.getCategory(), e.getQtyMin(), e.getQtyMax(), id);
+        }
         GzRecyclePriceRule update = new GzRecyclePriceRule();
         update.setId(id);
-        update.setEnabled(normalizeEnabled(enabled));
+        update.setEnabled(normalized);
         boolean ok = baseMapper.updateById(update) > 0;
         if (ok) {
             log.info("[gz-recycle] priceRule TOGGLE id={} enabled={}", id, update.getEnabled());
@@ -256,15 +261,27 @@ public class GzRecyclePriceRuleServiceImpl implements IGzRecyclePriceRuleService
      * @param excludeId 编辑时排除的自身 id（新增传 null）
      */
     private void assertNoOverlap(GzRecyclePriceRuleBo bo, Long excludeId) {
+        assertNoOverlap(bo.getCategory(), bo.getQtyMin(), bo.getQtyMax(), excludeId);
+    }
+
+    /**
+     * 数量区间重叠校验（仅针对**已启用**规则）。
+     *
+     * <p>停用规则不占位 —— 「先停用旧档、再加同区间新档」不应被旧档阻挡（T7.2）。逆向的「启用」
+     * 也走本校验（见 {@link #toggleEnabled}），避免把规则启用到已被其它启用规则占用的区间、
+     * 致 {@link #estimate} 命中多条报「配置有误」。</p>
+     */
+    private void assertNoOverlap(String category, int qtyMin, Integer qtyMax, Long excludeId) {
         LambdaQueryWrapper<GzRecyclePriceRule> lqw = Wrappers.<GzRecyclePriceRule>lambdaQuery()
-            .eq(GzRecyclePriceRule::getCategory, bo.getCategory())
+            .eq(GzRecyclePriceRule::getCategory, category)
+            .eq(GzRecyclePriceRule::getEnabled, ENABLED_ON)
             .ne(excludeId != null, GzRecyclePriceRule::getId, excludeId);
         List<GzRecyclePriceRule> existing = baseMapper.selectList(lqw);
         for (GzRecyclePriceRule other : existing) {
-            if (rangesOverlap(bo.getQtyMin(), bo.getQtyMax(), other.getQtyMin(), other.getQtyMax())) {
+            if (rangesOverlap(qtyMin, qtyMax, other.getQtyMin(), other.getQtyMax())) {
                 throw new ServiceException(StrUtil.format(
-                    "区间 [{}, {}] 与品类「{}」已有区间 [{}, {}] 重叠，请调整",
-                    bo.getQtyMin(), rangeUpperLabel(bo.getQtyMax()), bo.getCategory(),
+                    "区间 [{}, {}] 与品类「{}」已启用区间 [{}, {}] 重叠，请调整",
+                    qtyMin, rangeUpperLabel(qtyMax), category,
                     other.getQtyMin(), rangeUpperLabel(other.getQtyMax())));
             }
         }
