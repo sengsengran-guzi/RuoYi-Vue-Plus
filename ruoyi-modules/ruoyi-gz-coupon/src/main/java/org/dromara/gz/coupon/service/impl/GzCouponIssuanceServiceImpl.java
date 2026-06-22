@@ -4,12 +4,15 @@ import cn.hutool.core.util.StrUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.exception.ServiceException;
 import org.dromara.gz.common.service.IGzUserService;
+import org.dromara.gz.coupon.domain.bo.CouponAudienceConditionDto;
 import org.dromara.gz.coupon.domain.bo.GzCouponIssueBo;
 import org.dromara.gz.coupon.domain.entity.GzCouponTemplate;
 import org.dromara.gz.coupon.domain.vo.GzCouponIssueResultVO;
 import org.dromara.gz.coupon.mapper.GzCouponTemplateMapper;
 import org.dromara.gz.coupon.service.IGzCouponIssuanceService;
+import org.dromara.gz.coupon.strategy.CouponAudienceResolver;
 import org.dromara.gz.coupon.strategy.CouponIssuanceContext;
+import org.dromara.gz.coupon.strategy.FilteredIssuanceStrategy;
 import org.dromara.gz.coupon.strategy.ICouponIssuanceStrategy;
 import org.dromara.gz.coupon.strategy.ManualIssuanceStrategy;
 import org.springframework.stereotype.Service;
@@ -22,14 +25,15 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
- * 优惠券发放编排服务实现（GZ-COUPON-001 AC 4/5/6）。
+ * 优惠券发放编排服务实现（GZ-COUPON-001 AC 4/5/6 + ADR-0010 条件筛选）。
  *
  * <p>按模板 {@code issue_strategy} 路由到 {@link ICouponIssuanceStrategy}（Spring 注入全部策略 bean，
  * 按 {@link ICouponIssuanceStrategy#supports()} 建路由表）；事务内执行发放（乐观锁防超发在策略内）。</p>
  *
- * <p>V1.2 admin 主动发放仅放行 manual 策略模板（event 走监听器，register_window 未实现）。</p>
+ * <p>admin 主动发放放行 {@code manual}（选名单）与 {@code filtered}（条件筛选，服务端按 issue_config_json
+ * 解析 audience）；{@code event} 走监听器编排，不在 admin 主动发放路径。</p>
  *
- * @author kevin-coder (sensenran-guzi · GZ-COUPON-001)
+ * @author kevin-coder (sensenran-guzi · GZ-COUPON-001 / ADR-0010)
  */
 @Slf4j
 @Service
@@ -39,14 +43,17 @@ public class GzCouponIssuanceServiceImpl implements IGzCouponIssuanceService {
 
     private final GzCouponTemplateMapper templateMapper;
     private final IGzUserService userService;
+    private final CouponAudienceResolver audienceResolver;
     /** issue_strategy code → 策略实现（构造期建路由表，SPI 扩展自动注册）。 */
     private final Map<String, ICouponIssuanceStrategy> strategyRouter;
 
     public GzCouponIssuanceServiceImpl(GzCouponTemplateMapper templateMapper,
                                        IGzUserService userService,
+                                       CouponAudienceResolver audienceResolver,
                                        List<ICouponIssuanceStrategy> strategies) {
         this.templateMapper = templateMapper;
         this.userService = userService;
+        this.audienceResolver = audienceResolver;
         this.strategyRouter = strategies.stream()
             .collect(Collectors.toMap(ICouponIssuanceStrategy::supports, Function.identity()));
     }
@@ -64,21 +71,26 @@ public class GzCouponIssuanceServiceImpl implements IGzCouponIssuanceService {
         if (!STATUS_ACTIVE.equals(template.getStatus())) {
             throw new ServiceException("模板非启用状态，不可发放：" + template.getStatus());
         }
-        // V1.2 admin 主动发放仅放行 manual（event 走监听器编排，register_window 未实现）
-        if (!ManualIssuanceStrategy.STRATEGY.equals(template.getIssueStrategy())) {
-            throw new ServiceException("admin 批量发放仅支持手动发放（manual）策略模板，当前策略："
-                + template.getIssueStrategy());
-        }
 
-        // 解析名单：userIds 优先，否则按 userKeyword 模糊筛（两者皆空 → 拒绝盲发）
-        List<Long> userIds = resolveUserIds(bo);
-        if (userIds.isEmpty()) {
-            throw new ServiceException("发放名单为空：请选择用户或填写有效检索关键词");
+        String strat = template.getIssueStrategy();
+        boolean isManual = ManualIssuanceStrategy.STRATEGY.equals(strat);
+        boolean isFiltered = FilteredIssuanceStrategy.STRATEGY.equals(strat);
+        // admin 主动发放仅放行 manual / filtered（event 走监听器编排）
+        if (!isManual && !isFiltered) {
+            throw new ServiceException("admin 批量发放仅支持 手动指定（manual）/ 条件筛选（filtered）策略，当前策略：" + strat);
         }
-
-        ICouponIssuanceStrategy strategy = strategyRouter.get(template.getIssueStrategy());
+        ICouponIssuanceStrategy strategy = strategyRouter.get(strat);
         if (strategy == null) {
-            throw new ServiceException("未找到发放策略实现：" + template.getIssueStrategy());
+            throw new ServiceException("未找到发放策略实现：" + strat);
+        }
+
+        // manual：解析 admin 名单（userIds 优先，否则 keyword）；filtered：名单由策略按 issue_config_json 解析
+        List<Long> userIds = null;
+        if (isManual) {
+            userIds = resolveUserIds(bo);
+            if (userIds.isEmpty()) {
+                throw new ServiceException("发放名单为空：请选择用户或填写有效检索关键词");
+            }
         }
 
         CouponIssuanceContext ctx = CouponIssuanceContext.builder()
@@ -91,14 +103,21 @@ public class GzCouponIssuanceServiceImpl implements IGzCouponIssuanceService {
         GzCouponTemplate after = templateMapper.selectById(template.getId());
         GzCouponIssueResultVO vo = new GzCouponIssueResultVO();
         vo.setIssuedCount(issued);
-        vo.setRequestedUserCount(userIds.size());
+        // filtered 命中即实发（原子占配额，全发或全不发）→ 请求数 = 实发数；manual = 名单数
+        vo.setRequestedUserCount(isManual ? userIds.size() : issued);
         vo.setTemplateIssuedCount(after.getIssuedCount());
         vo.setTotalQuota(after.getTotalQuota());
         vo.setRemainingQuota(after.getTotalQuota() == null ? null
             : Math.max(0, after.getTotalQuota() - after.getIssuedCount()));
-        log.info("[gz-coupon] issue done templateId={} issued={} issuedCountTotal={} remaining={}",
-            template.getId(), issued, after.getIssuedCount(), vo.getRemainingQuota());
+        log.info("[gz-coupon] issue done templateId={} strategy={} issued={} issuedCountTotal={} remaining={}",
+            template.getId(), strat, issued, after.getIssuedCount(), vo.getRemainingQuota());
         return vo;
+    }
+
+    @Override
+    public long previewAudience(List<CouponAudienceConditionDto> conditions) {
+        // 与 filtered 发放共用 resolver（预览口径 = 实发口径）；conditions 非法即抛
+        return audienceResolver.resolveByConditions(conditions).size();
     }
 
     /**

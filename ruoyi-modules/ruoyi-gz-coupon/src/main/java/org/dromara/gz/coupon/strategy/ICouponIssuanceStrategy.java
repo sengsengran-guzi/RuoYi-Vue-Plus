@@ -8,12 +8,13 @@ package org.dromara.gz.coupon.strategy;
  * 输出批量 INSERT {@code gz_user_coupon}（事务内乐观锁校验 {@code issued_count + N <= total_quota}，
  * §11.4 F11.4）。</p>
  *
- * <p><b>V1.2 落地边界</b>（§11.1.a / F11.5）：</p>
+ * <p><b>落地边界</b>（§11.1.a / ADR-0010）：</p>
  * <ul>
- *   <li>{@code manual} — {@link ManualIssuanceStrategy} 全链路落地</li>
- *   <li>{@code register_window} — {@link RegisterWindowIssuanceStrategy} 仅接口存在（不实现逻辑）</li>
+ *   <li>{@code manual} — {@link ManualIssuanceStrategy} 全链路落地（admin 选名单）</li>
+ *   <li>{@code filtered} — {@link FilteredIssuanceStrategy} 全链路落地（admin 配条件，
+ *       {@link CouponAudienceResolver} 解析 audience；条件 SPI {@link ICouponAudienceCondition} 可扩展）</li>
  *   <li>{@code event} — {@link EventIssuanceStrategy} 留接口 + 事件钩子（{@link
- *       org.dromara.gz.coupon.event.CouponIssuanceEvent} 发布/监听骨架）</li>
+ *       org.dromara.gz.coupon.event.CouponIssuanceEvent} 发布/监听骨架，待甲方定义事件类型）</li>
  * </ul>
  *
  * <p>后续加策略只补一个本接口实现 + {@link #supports} 返回对应 strategy code，不动模板 DDL / SPI 路由。</p>
@@ -23,7 +24,7 @@ package org.dromara.gz.coupon.strategy;
 public interface ICouponIssuanceStrategy {
 
     /**
-     * 本策略支持的 issue_strategy code（manual / register_window / event）。
+     * 本策略支持的 issue_strategy code（manual / filtered / event）。
      *
      * @return 策略 code（对齐字典 gz_coupon_issue_strategy 的 value）
      */

@@ -4,6 +4,7 @@ import org.dromara.common.core.exception.ServiceException;
 import org.dromara.gz.coupon.domain.bo.GzCouponTemplateBo;
 import org.dromara.gz.coupon.domain.entity.GzCouponTemplate;
 import org.dromara.gz.coupon.mapper.GzCouponTemplateMapper;
+import org.dromara.gz.coupon.strategy.CouponAudienceResolver;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -34,12 +35,14 @@ class GzCouponTemplateServiceImplTest {
 
     @Mock
     private GzCouponTemplateMapper baseMapper;
+    @Mock
+    private CouponAudienceResolver audienceResolver;
 
     private GzCouponTemplateServiceImpl service;
 
     @BeforeEach
     void setUp() {
-        service = new GzCouponTemplateServiceImpl(baseMapper);
+        service = new GzCouponTemplateServiceImpl(baseMapper, audienceResolver);
     }
 
     private GzCouponTemplateBo validBo() {

@@ -22,7 +22,7 @@ public class GzCouponTemplateQueryBo implements Serializable {
     /** 模板态精确（active/paused/archived） */
     private String status;
 
-    /** 发放策略精确（manual/register_window/event） */
+    /** 发放策略精确（manual/filtered/event） */
     private String issueStrategy;
 
     /** 折扣类型精确（cash） */

@@ -49,7 +49,7 @@ public class GzCouponTemplateVO implements Serializable {
     /** 已发放数 */
     private Integer issuedCount;
 
-    /** 发放策略 manual/register_window/event */
+    /** 发放策略 manual/filtered/event */
     private String issueStrategy;
 
     /** 策略参数 JSON */

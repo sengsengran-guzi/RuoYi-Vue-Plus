@@ -6,6 +6,7 @@ import org.dromara.gz.coupon.domain.bo.GzCouponIssueBo;
 import org.dromara.gz.coupon.domain.entity.GzCouponTemplate;
 import org.dromara.gz.coupon.domain.vo.GzCouponIssueResultVO;
 import org.dromara.gz.coupon.mapper.GzCouponTemplateMapper;
+import org.dromara.gz.coupon.strategy.CouponAudienceResolver;
 import org.dromara.gz.coupon.strategy.ICouponIssuanceStrategy;
 import org.dromara.gz.coupon.strategy.ManualIssuanceStrategy;
 import org.junit.jupiter.api.DisplayName;
@@ -47,6 +48,8 @@ class GzCouponIssuanceServiceImplTest {
     private GzCouponTemplateMapper templateMapper;
     @Mock
     private IGzUserService userService;
+    @Mock
+    private CouponAudienceResolver audienceResolver;
 
     /** 用一个可控的 manual 策略 stub（避免依赖真实 ManualIssuanceStrategy 的 DB 行为）。 */
     private static class StubManualStrategy implements ICouponIssuanceStrategy {
@@ -80,7 +83,7 @@ class GzCouponIssuanceServiceImplTest {
     }
 
     private GzCouponIssuanceServiceImpl service(StubManualStrategy stub) {
-        return new GzCouponIssuanceServiceImpl(templateMapper, userService, List.of(stub));
+        return new GzCouponIssuanceServiceImpl(templateMapper, userService, audienceResolver, List.of(stub));
     }
 
     @Test
@@ -207,7 +210,7 @@ class GzCouponIssuanceServiceImplTest {
             }
         };
         GzCouponIssuanceServiceImpl svc =
-            new GzCouponIssuanceServiceImpl(templateMapper, userService, List.of(lastSeatStrategy));
+            new GzCouponIssuanceServiceImpl(templateMapper, userService, audienceResolver, List.of(lastSeatStrategy));
 
         // 两轮发放，第一轮入口 + 重读，第二轮入口（发放抛异常前不会重读）
         lenient().when(templateMapper.selectById(2001L))

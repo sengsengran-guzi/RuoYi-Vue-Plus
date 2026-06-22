@@ -7,6 +7,7 @@ import org.dromara.gz.common.domain.entity.GzUser;
 import org.dromara.gz.common.domain.vo.GzUserVO;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
 
+import java.time.LocalDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -105,4 +106,35 @@ public interface IGzUserService {
      * @return 命中 user_id 列表（无匹配 → 空列表）
      */
     List<Long> selectIdsByKeyword(String keyword);
+
+    /**
+     * 注册时间区间命中的有效用户 id（券「条件筛选发放」register_time 条件，ADR-0010）。
+     *
+     * <p>仅返回未禁用用户（is_disabled=0）；软删 / 租户由拦截器自动处理。start/end 至少一侧非空
+     * （调用方 RegisterTimeCondition 已校验，含「新人=近 N 天」=相对今天的下界）。</p>
+     *
+     * @param start 注册时间下界（含；null 表示不限下界）
+     * @param end   注册时间上界（含；null 表示不限上界）
+     * @return 命中 user_id 列表
+     */
+    List<Long> selectUserIdsByRegisterTimeBetween(LocalDateTime start, LocalDateTime end);
+
+    /**
+     * 指定状态的有效用户 id（券「条件筛选发放」phone_bound 条件，ADR-0010）。
+     *
+     * @param status gz_user.status（如 phone_bound）；空 → 空列表
+     * @return 命中 user_id 列表
+     */
+    List<Long> selectUserIdsByStatus(String status);
+
+    /**
+     * 做过拼豆预约的有效用户 id（券「条件筛选发放」did_pindou 条件，ADR-0010）。
+     *
+     * <p>先从 gz_bean_booking 取去重 user_id（租户由拦截器注入），再过滤到有效用户
+     * （未禁用 / 未删除），保证条件单独使用也不会发券给禁用用户。</p>
+     *
+     * @param completedOnly true=仅已核销（status='used'）；false=有效预约（status in pending,used）
+     * @return 命中 user_id 列表
+     */
+    List<Long> selectUserIdsWithBeanBooking(boolean completedOnly);
 }

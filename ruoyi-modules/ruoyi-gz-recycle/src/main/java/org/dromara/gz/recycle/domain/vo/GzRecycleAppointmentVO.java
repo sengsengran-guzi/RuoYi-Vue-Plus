@@ -92,6 +92,9 @@ public class GzRecycleAppointmentVO implements Serializable {
         /** 数量 */
         private Integer qty;
 
+        /** IP / 系列（如 火影 / 海贼王）；从 product_snapshot_json 反序列化，可空 */
+        private String ip;
+
         /** 备注 / 描述 */
         private String remark;
     }

@@ -86,6 +86,15 @@ public class GzRecycleAppointmentSubmitBo implements Serializable {
         @Min(value = 1, message = "数量至少为 1")
         private Integer qty;
 
+        /**
+         * IP / 系列（可空，如 火影 / 海贼王）。前端文本输入或预设建议块选择，自由填写。
+         *
+         * <p>本轮纯透传：随 {@code products} 序列化进 product_snapshot_json 落库（store/admin 端可读）；
+         * 不建字典、不参与估价命中（估价仍只按 category 维度）。可空，长度 ≤ 32。</p>
+         */
+        @Size(max = 32, message = "IP 长度不能超过 32")
+        private String ip;
+
         /** 备注 / 描述（可空，≤ 200） */
         @Size(max = 200, message = "备注长度不能超过 200")
         private String remark;

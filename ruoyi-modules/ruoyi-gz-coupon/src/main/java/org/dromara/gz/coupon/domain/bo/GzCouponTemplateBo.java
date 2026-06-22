@@ -64,7 +64,7 @@ public class GzCouponTemplateBo implements Serializable {
     @Min(value = 0, message = "总配额不能为负", groups = {AddGroup.class, EditGroup.class})
     private Integer totalQuota;
 
-    /** 发放策略（manual/register_window/event，枚举校验在 service；V1.2 仅 manual 可选） */
+    /** 发放策略（manual/filtered/event，枚举校验在 service；仅 manual/filtered 可新建，event 预留） */
     @NotBlank(message = "发放策略不能为空", groups = {AddGroup.class, EditGroup.class})
     @Size(max = 32, message = "发放策略长度不能超过 32", groups = {AddGroup.class, EditGroup.class})
     private String issueStrategy;

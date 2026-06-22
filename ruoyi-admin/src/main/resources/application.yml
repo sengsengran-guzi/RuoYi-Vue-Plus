@@ -157,6 +157,10 @@ tenant:
     - sys_client
     - sys_oss_config
     - flow_spel
+    # 字典为系统级跨租户共享（全部 seed 在 tenant_id='000000'，未按 ruoyi 的「建租户时拷贝字典」流程逐租户复制）。
+    # 不排除则租户 1001 查 sys_dict_* 被 AND tenant_id='1001' 过滤为空 → 所有字典下拉「无数据」。
+    - sys_dict_type
+    - sys_dict_data
 
 # MyBatisPlus配置
 # https://baomidou.com/config/

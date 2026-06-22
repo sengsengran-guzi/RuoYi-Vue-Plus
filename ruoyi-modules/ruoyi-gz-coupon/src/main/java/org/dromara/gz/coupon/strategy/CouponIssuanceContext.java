@@ -28,7 +28,7 @@ public class CouponIssuanceContext {
 
     /**
      * 目标用户 id（去重后）。manual 策略由 admin 名单解析得到；
-     * register_window / event 策略可置空，由策略内部按 config 自解析名单（预留）。
+     * filtered 策略置空，由策略内部按 issue_config_json 条件解析名单（event 预留）。
      */
     private List<Long> targetUserIds;
 }

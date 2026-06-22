@@ -17,9 +17,10 @@ import org.dromara.gz.coupon.domain.entity.GzCouponTemplate;
 import org.dromara.gz.coupon.domain.vo.GzCouponTemplateVO;
 import org.dromara.gz.coupon.mapper.GzCouponTemplateMapper;
 import org.dromara.gz.coupon.service.IGzCouponTemplateService;
+import org.dromara.gz.coupon.strategy.CouponAudienceResolver;
 import org.dromara.gz.coupon.strategy.EventIssuanceStrategy;
+import org.dromara.gz.coupon.strategy.FilteredIssuanceStrategy;
 import org.dromara.gz.coupon.strategy.ManualIssuanceStrategy;
-import org.dromara.gz.coupon.strategy.RegisterWindowIssuanceStrategy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -59,12 +60,13 @@ public class GzCouponTemplateServiceImpl implements IGzCouponTemplateService {
     /** 适用业务（附录 A.9；V1.2 仅 pindou）。 */
     private static final Set<String> VALID_APPLICABLE_BUSINESS_V1_2 = Set.of("pindou");
 
-    /** 发放策略字典 value（附录 A.22；V1.2 仅 manual 可由 admin 新建）。 */
-    private static final Set<String> VALID_ISSUE_STRATEGIES_V1_2 = Set.of(ManualIssuanceStrategy.STRATEGY);
+    /** admin 可新建的发放策略（manual 手动指定 / filtered 条件筛选；event 预留不放行，ADR-0010）。 */
+    private static final Set<String> VALID_ISSUE_STRATEGIES = Set.of(
+        ManualIssuanceStrategy.STRATEGY, FilteredIssuanceStrategy.STRATEGY);
 
-    /** 全部已知策略 code（编译期校验 SPI 留位齐全；register_window/event 不允许 admin 新建但列入已知集）。 */
+    /** 全部已知策略 code（含预留 event，编译期校验 SPI 留位齐全）。 */
     private static final Set<String> ALL_KNOWN_STRATEGIES = Set.of(
-        ManualIssuanceStrategy.STRATEGY, RegisterWindowIssuanceStrategy.STRATEGY, EventIssuanceStrategy.STRATEGY);
+        ManualIssuanceStrategy.STRATEGY, FilteredIssuanceStrategy.STRATEGY, EventIssuanceStrategy.STRATEGY);
 
     /** template_no = "CPN-" (4) + yyyyMMdd (8) + "-" (1) + 6 位序号 = 19。 */
     private static final DateTimeFormatter TEMPLATE_NO_DATE_FMT = DateTimeFormatter.ofPattern("yyyyMMdd");
@@ -72,6 +74,8 @@ public class GzCouponTemplateServiceImpl implements IGzCouponTemplateService {
     private static final int TEMPLATE_NO_SEQ_LEN = 6;
 
     private final GzCouponTemplateMapper baseMapper;
+    /** 条件筛选配置的结构校验（filtered 策略保存期复用解析器，ADR-0010）。 */
+    private final CouponAudienceResolver audienceResolver;
 
     @Override
     public TableDataInfo<GzCouponTemplateVO> selectPage(GzCouponTemplateQueryBo query, PageQuery pageQuery) {
@@ -100,7 +104,7 @@ public class GzCouponTemplateServiceImpl implements IGzCouponTemplateService {
     @Transactional(rollbackFor = Exception.class)
     public Long insertByBo(GzCouponTemplateBo bo) {
         validateEnums(bo);
-        validateConfigJson(bo.getIssueConfigJson());
+        validateConfigJson(bo);
         GzCouponTemplate add = new GzCouponTemplate();
         copyEditableFields(bo, add);
         add.setTemplateNo(generateTemplateNo(LocalDate.now()));
@@ -130,7 +134,7 @@ public class GzCouponTemplateServiceImpl implements IGzCouponTemplateService {
             throw new ServiceException("已归档模板不可编辑");
         }
         validateEnums(bo);
-        validateConfigJson(bo.getIssueConfigJson());
+        validateConfigJson(bo);
         GzCouponTemplate update = new GzCouponTemplate();
         update.setId(bo.getId());
         copyEditableFields(bo, update);
@@ -225,7 +229,7 @@ public class GzCouponTemplateServiceImpl implements IGzCouponTemplateService {
     }
 
     /**
-     * 枚举合法性（走 sys_dict value 白名单；V1.2 落地边界：仅 cash / pindou / manual 可新建）。
+     * 枚举合法性（走 sys_dict value 白名单；V1.2 落地边界：仅 cash / pindou；策略放行 manual / filtered）。
      */
     private void validateEnums(GzCouponTemplateBo bo) {
         if (!VALID_DISCOUNT_TYPES_V1_2.contains(bo.getDiscountType())) {
@@ -237,16 +241,22 @@ public class GzCouponTemplateServiceImpl implements IGzCouponTemplateService {
         if (!ALL_KNOWN_STRATEGIES.contains(bo.getIssueStrategy())) {
             throw new ServiceException("非法发放策略：" + bo.getIssueStrategy());
         }
-        if (!VALID_ISSUE_STRATEGIES_V1_2.contains(bo.getIssueStrategy())) {
-            throw new ServiceException("V1.2 仅支持手动发放（manual）策略，"
-                + bo.getIssueStrategy() + " 为预留策略（doc/11 §11.4 F11.5）");
+        if (!VALID_ISSUE_STRATEGIES.contains(bo.getIssueStrategy())) {
+            throw new ServiceException("仅支持手动指定（manual）/ 条件筛选（filtered）策略，"
+                + bo.getIssueStrategy() + " 为预留策略（ADR-0010）");
         }
     }
 
     /**
-     * issue_config_json 合法性（manual 可空；非空须为合法 JSON）。
+     * issue_config_json 合法性：filtered 必须有合法条件配置（≥1 + 类型合法 + register_time 日期，
+     * 走 {@link CouponAudienceResolver#parseConfig} 结构校验）；其余策略 config 可空，非空须为合法 JSON。
      */
-    private void validateConfigJson(String configJson) {
+    private void validateConfigJson(GzCouponTemplateBo bo) {
+        String configJson = bo.getIssueConfigJson();
+        if (FilteredIssuanceStrategy.STRATEGY.equals(bo.getIssueStrategy())) {
+            audienceResolver.parseConfig(configJson);
+            return;
+        }
         if (StrUtil.isBlank(configJson)) {
             return;
         }

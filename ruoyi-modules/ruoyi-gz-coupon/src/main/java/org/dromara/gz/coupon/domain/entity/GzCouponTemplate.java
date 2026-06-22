@@ -25,7 +25,7 @@ import java.io.Serial;
  *   <li>{@code totalQuota} — NULL=不限；发券乐观锁 issued_count + N &lt;= total_quota（§11.4 F11.4）</li>
  *   <li>{@code issuedCount} — 已发放数，发券事务内 +N</li>
  *   <li>{@code version} — {@link Version} 乐观锁，issued_count 并发发券防超发（§11.4）</li>
- *   <li>{@code issueStrategy} — 发放策略 manual/register_window/event（SPI 路由，§11.1.a）</li>
+ *   <li>{@code issueStrategy} — 发放策略 manual/filtered/event（SPI 路由，§11.1.a / ADR-0010）</li>
  *   <li>{@code issueConfigJson} — 策略参数通用 JSON 列（schema 不为每策略加专列，§11.1.a D4）</li>
  * </ul>
  *
@@ -70,7 +70,7 @@ public class GzCouponTemplate extends TenantEntity {
     /** 已发放数；发券事务内 +N */
     private Integer issuedCount;
 
-    /** 发放策略 manual/register_window/event（字典 gz_coupon_issue_strategy，SPI 路由） */
+    /** 发放策略 manual/filtered/event（字典 gz_coupon_issue_strategy，SPI 路由） */
     private String issueStrategy;
 
     /** 策略参数 JSON（与 issue_strategy 配对；manual 可空） */

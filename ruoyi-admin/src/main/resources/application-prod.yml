@@ -289,7 +289,7 @@ gz:
   pay:
     client-mode: ${WECHAT_PAY_CLIENT_MODE:mock}
     appid: ${WECHAT_PAY_APPID:CHANGE_ME_BEFORE_PROD_DEPLOY}
-    mch-id: ${WECHAT_PAY_MCH_ID:}
+    mch-id: ${WECHAT_PAY_MCH_ID:1731037015}   # 成都谷子宇宙贸易有限公司 · 谷子宇宙；非机密可入 git，仍允许 env var 覆盖
     api-v3-key: ${WECHAT_PAY_API_V3_KEY:}
     mch-cert-serial: ${WECHAT_PAY_CERT_SERIAL:}
     private-key-path: ${WECHAT_PAY_PRIVATE_KEY_PATH:}

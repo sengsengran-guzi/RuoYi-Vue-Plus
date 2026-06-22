@@ -192,6 +192,43 @@ public class GzUserServiceImpl implements IGzUserService {
     }
 
     @Override
+    public java.util.List<Long> selectUserIdsByRegisterTimeBetween(LocalDateTime start, LocalDateTime end) {
+        // 券条件筛选 register_time（ADR-0010）：仅有效用户（is_disabled=0）；软删/租户拦截器处理
+        LambdaQueryWrapper<GzUser> lqw = new LambdaQueryWrapper<GzUser>()
+            .select(GzUser::getId)
+            .eq(GzUser::getIsDisabled, 0)
+            .ge(start != null, GzUser::getRegisterTime, start)
+            .le(end != null, GzUser::getRegisterTime, end);
+        return baseMapper.selectList(lqw).stream().map(GzUser::getId).toList();
+    }
+
+    @Override
+    public java.util.List<Long> selectUserIdsByStatus(String status) {
+        if (StrUtil.isBlank(status)) {
+            return java.util.Collections.emptyList();
+        }
+        LambdaQueryWrapper<GzUser> lqw = new LambdaQueryWrapper<GzUser>()
+            .select(GzUser::getId)
+            .eq(GzUser::getIsDisabled, 0)
+            .eq(GzUser::getStatus, status);
+        return baseMapper.selectList(lqw).stream().map(GzUser::getId).toList();
+    }
+
+    @Override
+    public java.util.List<Long> selectUserIdsWithBeanBooking(boolean completedOnly) {
+        // 先取做过预约的 user_id（gz_bean_booking），再过滤到有效用户（未禁用/未删除）—— 保证单条件也不发给禁用用户
+        java.util.List<Long> bookerIds = baseMapper.selectUserIdsWithBeanBooking(completedOnly ? 1 : 0);
+        if (bookerIds.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+        LambdaQueryWrapper<GzUser> lqw = new LambdaQueryWrapper<GzUser>()
+            .select(GzUser::getId)
+            .eq(GzUser::getIsDisabled, 0)
+            .in(GzUser::getId, bookerIds);
+        return baseMapper.selectList(lqw).stream().map(GzUser::getId).toList();
+    }
+
+    @Override
     public java.util.Map<Long, GzUserVO> selectVoMapByIds(java.util.Collection<Long> ids) {
         if (ids == null || ids.isEmpty()) {
             return java.util.Collections.emptyMap();

@@ -15,6 +15,7 @@ import org.dromara.common.log.enums.BusinessType;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.web.core.BaseController;
+import org.dromara.gz.coupon.domain.bo.CouponAudienceConfig;
 import org.dromara.gz.coupon.domain.bo.GzCouponIssueBo;
 import org.dromara.gz.coupon.domain.bo.GzCouponTemplateBo;
 import org.dromara.gz.coupon.domain.bo.GzCouponTemplateQueryBo;
@@ -134,12 +135,19 @@ public class GzCouponTemplateController extends BaseController {
         return toAjax(templateService.archive(id));
     }
 
-    /** 批量发放（manual 策略；乐观锁防超发，配额耗尽拦截）。 */
+    /** 批量发放（manual 选名单 / filtered 条件筛选；乐观锁防超发，配额耗尽拦截）。 */
     @SaCheckPermission("gz:coupon:issue")
     @Log(title = "优惠券批量发放", businessType = BusinessType.INSERT)
     @RepeatSubmit()
     @PostMapping("/issue")
     public R<GzCouponIssueResultVO> issue(@Valid @RequestBody GzCouponIssueBo bo) {
         return R.ok("发放成功", issuanceService.issue(bo));
+    }
+
+    /** 条件筛选「预览命中人数」（ADR-0010）：配置 / 发放前校验 audience，预览口径 = 实发口径。 */
+    @SaCheckPermission("gz:coupon:issue")
+    @PostMapping("/preview-audience")
+    public R<Long> previewAudience(@RequestBody CouponAudienceConfig config) {
+        return R.ok(issuanceService.previewAudience(config.getConditions()));
     }
 }

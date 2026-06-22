@@ -480,7 +480,7 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         return vo;
     }
 
-    /** 序列化 product_snapshot_json（仅取 category/qty/remark，与 SubmitBo.ProductLine 同构）。 */
+    /** 序列化 product_snapshot_json（category/qty/ip/remark 全字段透传，与 SubmitBo.ProductLine 同构）。 */
     private String writeProductJson(List<GzRecycleAppointmentSubmitBo.ProductLine> products) {
         try {
             return objectMapper.writeValueAsString(products);
