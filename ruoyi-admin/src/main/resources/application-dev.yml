@@ -306,3 +306,6 @@ gz:
     appid: ${WECHAT_PAY_APPID:wx_dev_placeholder}
     test:
       amount-cent: 1
+  # mp 真机自测入口（/app/gz/test/**）总开关。dev 默认开（本地/模拟器自测方便）。
+  test:
+    enabled: ${GZ_TEST_ENABLED:true}

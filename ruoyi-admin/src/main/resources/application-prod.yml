@@ -300,3 +300,7 @@ gz:
     refund-notify-url: ${WECHAT_PAY_REFUND_NOTIFY_URL:}
     test:
       amount-cent: 1
+  # mp 真机自测入口（/app/gz/test/**）总开关。prod 默认关（防生产被刷真实订单/打款）；
+  # Kevin 真机测试窗口临时注入 GZ_TEST_ENABLED=true 重启开，测完关回。
+  test:
+    enabled: ${GZ_TEST_ENABLED:false}
