@@ -13,54 +13,18 @@ import java.time.LocalTime;
 import java.util.List;
 
 /**
- * gz_bean_booking 数据层（GZ-BEAN-004）。
+ * gz_bean_booking 数据层（GZ-BEAN-004 / GZ-BEAN-017）。
  *
  * <p>多租户 / 软删由 ruoyi 拦截器自动处理；本接口仅暴露少量直查方法：</p>
  * <ul>
- *   <li>{@link #selectOccupiedSeatIds} — mp /availability 查指定时段已占用 seat_id 列表（接力 BEAN-003 留位）</li>
- *   <li>{@link #countActiveUserBooking} — 应用层校验"同一用户同时段最多 1 pending"（doc/10 §3 并发 / 业务校验）</li>
+ *   <li>{@link #countActiveCoveringSlotForUpdate} — 逐格防超卖：区间重叠计数 FOR UPDATE（GZ-BEAN-017 / ADR-0011 §3）</li>
  *   <li>{@link #selectExpiredPendingIds} — no_show cron 扫"昨日及之前仍 pending"的预约 id（GZ-BEAN-009）</li>
  *   <li>{@link #markNoShow} — no_show cron 条件 UPDATE（status=pending 守卫，天然原子幂等，GZ-BEAN-009）</li>
  * </ul>
  *
- * @author kevin-coder (sensenran-guzi · GZ-BEAN-004 / GZ-BEAN-009)
+ * @author kevin-coder (sensenran-guzi · GZ-BEAN-004 / GZ-BEAN-009 / GZ-BEAN-017)
  */
 public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBeanBookingVO> {
-
-    /**
-     * 查指定门店 × 日期 × 时段开始 已被占用（status='pending'）的 seat_id 列表。
-     *
-     * <p>用于 mp /availability 端点判断座位是否可选（BEAN-003 留位接口本 ticket 接力）。</p>
-     *
-     * @param tenantId  租户 ID
-     * @param storeId   门店 ID
-     * @param sessDate  预约日期
-     * @param slotStart 时段开始时间
-     * @return 已占用的 seat_id 列表
-     */
-    @Select("SELECT seat_id FROM gz_bean_booking " +
-        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} " +
-        "  AND sess_date = #{sessDate} AND slot_start = #{slotStart} " +
-        "  AND status = 'pending' AND del_flag = '0'")
-    List<Long> selectOccupiedSeatIds(@Param("tenantId") String tenantId,
-                                     @Param("storeId") Long storeId,
-                                     @Param("sessDate") LocalDate sessDate,
-                                     @Param("slotStart") LocalTime slotStart);
-
-    /**
-     * 统计同一用户同门店同时段已有 pending 预约数（应用层校验"同用户同时段最多 1 个 active"）。
-     *
-     * @return 0 = 无活跃预约 / >=1 = 已有
-     */
-    @Select("SELECT COUNT(*) FROM gz_bean_booking " +
-        "WHERE tenant_id = #{tenantId} AND user_id = #{userId} " +
-        "  AND store_id = #{storeId} AND sess_date = #{sessDate} AND slot_start = #{slotStart} " +
-        "  AND status = 'pending' AND del_flag = '0'")
-    long countActiveUserBooking(@Param("tenantId") String tenantId,
-                                @Param("userId") Long userId,
-                                @Param("storeId") Long storeId,
-                                @Param("sessDate") LocalDate sessDate,
-                                @Param("slotStart") LocalTime slotStart);
 
     /**
      * 扫"昨日及之前（sess_date &lt; CURDATE()）仍 pending"的预约 id 列表（GZ-BEAN-009 no_show cron）。
@@ -115,67 +79,75 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
     // ============================================================
 
     /**
-     * 配额计数防超卖核心查询（GZ-BEAN-014 AC 3，doc/11 §3.6 + ADR-0008 §2）。
+     * 逐格防超卖核心查询（GZ-BEAN-017 AC 2，doc/15a §A.2 + ADR-0011 §3）。
      *
-     * <p>在下单<b>同一事务</b>内对 {@code (store_id, seat_type, sess_date, slot_start)} 组合统计<b>活跃</b>
-     * booking 行数，{@code FOR UPDATE} 悲观锁锁住该组合的活跃行 → 并发下单串行化比对配额。</p>
+     * <p>在下单<b>同一事务</b>内对单个 1h 格 {@code gi}（格起整点）统计<b>覆盖该格的活跃</b> booking 行数，
+     * {@code FOR UPDATE} 悲观锁锁住覆盖该格的活跃行 → 并发下单逐格串行化比对配额。一行区间预约对它覆盖的
+     * 每一个 1h 格各占 1 配额，service 层对区间内每格各调一次本查询（按格升序加锁防交叠区间死锁，ADR-0011 §3）。</p>
      *
-     * <p><b>活跃定义（doc/11 §3.6 钉死）</b>：{@code status='pending' AND pay_status IN ('paying','paid')}
-     * —— 即「付款中 / 已付的待核销单」占名额；{@code used}（已核销，status≠pending）/ {@code cancelled} /
-     * {@code no_show}（status 已离 pending）+ {@code pay_closed} / {@code refunded}（pay_status 已离 paying/paid）
-     * 全部释放配额不计数。</p>
+     * <p><b>「覆盖 gi」= 区间重叠，不是 slot_start 相等</b>（ADR-0011 §3）：一个 14:00–17:00 的活跃单确实占了
+     * 15:00 这格，但它的 slot_start≠15:00。重叠条件钉死为 {@code slot_start <= gi AND slot_end > gi}
+     * （gi 为格起整点，左闭右开）。</p>
+     *
+     * <p><b>活跃定义（doc/11 §3.6 钉死，不变）</b>：{@code status='pending' AND pay_status IN ('paying','paid')}
+     * —— 付款中 / 已付的待核销单占名额；{@code used / cancelled / no_show / pay_closed / refunded} 全部释放不计数。</p>
      *
      * <p><b>tenant_id 显式传</b>：mp 下单事务用户态 JWT 无 tenant，不依赖 ruoyi 拦截器自动注入
      * （同 submit 注释），由 service 从 store / user 取 tenant 显式传入。</p>
      *
-     * @return 该组合当前活跃 booking 数（与 gz_bean_seat_type_config.quantity 比对）
+     * @param slot 1h 格起整点 gi（service 把下单区间按 1h 展开后逐格传入）
+     * @return 覆盖该格的当前活跃 booking 数（与 gz_bean_seat_type_config.quantity 比对）
      */
     @Select("SELECT COUNT(*) FROM gz_bean_booking " +
         "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_type = #{seatType} " +
-        "  AND sess_date = #{sessDate} AND slot_start = #{slotStart} " +
+        "  AND sess_date = #{sessDate} AND slot_start <= #{slot} AND slot_end > #{slot} " +
         "  AND status = 'pending' AND pay_status IN ('paying','paid') AND del_flag = '0' " +
         "FOR UPDATE")
-    long countActiveByTypeSlotForUpdate(@Param("tenantId") String tenantId,
-                                        @Param("storeId") Long storeId,
-                                        @Param("seatType") String seatType,
-                                        @Param("sessDate") LocalDate sessDate,
-                                        @Param("slotStart") LocalTime slotStart);
+    long countActiveCoveringSlotForUpdate(@Param("tenantId") String tenantId,
+                                          @Param("storeId") Long storeId,
+                                          @Param("seatType") String seatType,
+                                          @Param("sessDate") LocalDate sessDate,
+                                          @Param("slot") LocalTime slot);
 
     /**
-     * 余量查询（GZ-BEAN-014 AC 4，无锁 — mp 选座实时显余量用）。
+     * 余量查询（GZ-BEAN-017 AC 1，无锁 — mp 选座实时显「可约/已满」用）。
      *
-     * <p>对某门店某日某 {@code (seat_type, slot_start)} 统计活跃 booking 数（活跃定义同
-     * {@link #countActiveByTypeSlotForUpdate}，但<b>不加 FOR UPDATE</b>，仅展示用）。
-     * 余量 = {@code gz_bean_seat_type_config.quantity − 本计数}（service 层做减法）。</p>
+     * <p>对某门店某日某 1h 格 {@code gi} 统计<b>覆盖该格的活跃</b> booking 数（重叠 + 活跃定义同
+     * {@link #countActiveCoveringSlotForUpdate}，但<b>不加 FOR UPDATE</b>，仅展示用）。
+     * 余量 = {@code gz_bean_seat_type_config.quantity − 本计数}（service 层做减法，只把 full 布尔给 mp）。</p>
      *
-     * @return 该组合当前活跃 booking 数
+     * @param slot 1h 格起整点 gi
+     * @return 覆盖该格的当前活跃 booking 数
      */
     @Select("SELECT COUNT(*) FROM gz_bean_booking " +
         "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_type = #{seatType} " +
-        "  AND sess_date = #{sessDate} AND slot_start = #{slotStart} " +
+        "  AND sess_date = #{sessDate} AND slot_start <= #{slot} AND slot_end > #{slot} " +
         "  AND status = 'pending' AND pay_status IN ('paying','paid') AND del_flag = '0'")
-    long countActiveByTypeSlot(@Param("tenantId") String tenantId,
-                               @Param("storeId") Long storeId,
-                               @Param("seatType") String seatType,
-                               @Param("sessDate") LocalDate sessDate,
-                               @Param("slotStart") LocalTime slotStart);
-
-    /**
-     * 同用户同 (类型,日期,时段) 已有活跃 booking 数（幂等校验，doc/10 §11 Q11.3）。
-     *
-     * <p>活跃同上（status=pending AND pay_status IN paying/paid）。{@code >0} 则该用户已占该档名额，
-     * service 层幂等返回原单（防恶意/误触重复占配额）。</p>
-     */
-    @Select("SELECT COUNT(*) FROM gz_bean_booking " +
-        "WHERE tenant_id = #{tenantId} AND user_id = #{userId} AND store_id = #{storeId} " +
-        "  AND seat_type = #{seatType} AND sess_date = #{sessDate} AND slot_start = #{slotStart} " +
-        "  AND status = 'pending' AND pay_status IN ('paying','paid') AND del_flag = '0'")
-    long countActiveUserTypeSlot(@Param("tenantId") String tenantId,
-                                 @Param("userId") Long userId,
+    long countActiveCoveringSlot(@Param("tenantId") String tenantId,
                                  @Param("storeId") Long storeId,
                                  @Param("seatType") String seatType,
                                  @Param("sessDate") LocalDate sessDate,
-                                 @Param("slotStart") LocalTime slotStart);
+                                 @Param("slot") LocalTime slot);
+
+    /**
+     * 同用户同 (类型,日期) 已有与 {@code [reqStart, reqEnd)} <b>区间重叠</b>的活跃 booking 数（幂等校验，doc/10 §11 Q11.3）。
+     *
+     * <p>区间模型下「同一时段」= 区间重叠（两区间相交 ⟺ {@code slot_start < reqEnd AND slot_end > reqStart}）。
+     * 活跃同上（status=pending AND pay_status IN paying/paid）。{@code >0} 则该用户已占重叠时段名额，
+     * service 层拒单（防同用户重复占配额）。</p>
+     */
+    @Select("SELECT COUNT(*) FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND user_id = #{userId} AND store_id = #{storeId} " +
+        "  AND seat_type = #{seatType} AND sess_date = #{sessDate} " +
+        "  AND slot_start < #{reqEnd} AND slot_end > #{reqStart} " +
+        "  AND status = 'pending' AND pay_status IN ('paying','paid') AND del_flag = '0'")
+    long countActiveUserOverlap(@Param("tenantId") String tenantId,
+                                @Param("userId") Long userId,
+                                @Param("storeId") Long storeId,
+                                @Param("seatType") String seatType,
+                                @Param("sessDate") LocalDate sessDate,
+                                @Param("reqStart") LocalTime reqStart,
+                                @Param("reqEnd") LocalTime reqEnd);
 
     /**
      * 按 out_trade_no 查 booking（支付回调 onPaid 用 business_order_no=booking_no 定位，此辅以 out_trade_no 校验）。

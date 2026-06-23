@@ -11,17 +11,13 @@ import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.redis.utils.RedisUtils;
 import org.dromara.common.tenant.helper.TenantHelper;
-import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingQueryBo;
-import org.dromara.gz.bean.domain.bo.GzBeanBookingSubmitBo;
 import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
 import org.dromara.gz.bean.domain.entity.GzBeanBooking;
 import org.dromara.gz.bean.domain.entity.GzBeanBookingLog;
-import org.dromara.gz.bean.domain.entity.GzBeanSeat;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
 import org.dromara.gz.bean.domain.entity.GzBeanStore;
 import org.dromara.gz.bean.domain.entity.GzBeanTimeSlotTemplate;
-import org.dromara.gz.bean.domain.vo.GzBeanBookingMpSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
 import org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanStaffOverviewVO;
@@ -29,7 +25,6 @@ import org.dromara.gz.bean.domain.vo.GzBeanTypeSlotAvailabilityVO;
 import org.dromara.gz.bean.exception.GzBeanErrorCode;
 import org.dromara.gz.bean.mapper.GzBeanBookingLogMapper;
 import org.dromara.gz.bean.mapper.GzBeanBookingMapper;
-import org.dromara.gz.bean.mapper.GzBeanSeatMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper;
 import org.dromara.gz.bean.mapper.GzBeanStoreMapper;
 import org.dromara.gz.bean.mapper.GzBeanTimeSlotTemplateMapper;
@@ -44,7 +39,6 @@ import org.dromara.gz.common.pay.service.IGzPayTransactionService;
 import org.dromara.gz.coupon.service.IGzUserCouponService;
 import org.dromara.gz.coupon.service.IGzUserCouponService.LockedCoupon;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -107,8 +101,6 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
 
     /** Redis 锁前缀：同用户提交（防连点） */
     private static final String LOCK_USER_SUBMIT_PREFIX = "gz:bean:lock:user_submit:";
-    /** Redis 锁前缀：座位抢占（DB UNIQUE 前的应用层防线） */
-    private static final String LOCK_SEAT_PREFIX = "gz:bean:lock:seat:";
     /** Redis 锁 TTL（doc/11 §3.7） */
     private static final Duration LOCK_TTL = Duration.ofSeconds(5);
 
@@ -119,7 +111,6 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
 
     private final GzBeanBookingMapper bookingMapper;
     private final GzBeanBookingLogMapper bookingLogMapper;
-    private final GzBeanSeatMapper seatMapper;
     private final GzBeanStoreMapper storeMapper;
     private final GzUserMapper gzUserMapper;
     private final QrCodeSigner qrCodeSigner;
@@ -141,142 +132,6 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
      */
     private final ObjectProvider<IGzUserCouponService> couponServiceProvider;
 
-    // ============================================================
-    //  mp 提交预约
-    // ============================================================
-
-    @Override
-    @Transactional(rollbackFor = Exception.class)
-    public GzBeanBookingMpSubmitVO submit(GzBeanBookingSubmitBo bo, Long userId) {
-        if (userId == null) {
-            throw new ServiceException("未登录");
-        }
-
-        // ① 校验用户手机号已绑（doc/10 §3.N6 + §1.N8）
-        GzUser user = gzUserMapper.selectById(userId);
-        if (user == null) {
-            throw new ServiceException("user.notFound");
-        }
-        if (StrUtil.isBlank(user.getMobile())) {
-            // 业务码 PHONE_REQUIRED — mp 端按 code 决定弹手机号授权流程
-            throw new ServiceException(GzBeanErrorCode.PHONE_REQUIRED_MSG, GzBeanErrorCode.PHONE_REQUIRED);
-        }
-
-        // ② Redis 锁 1：用户提交锁（含 dedupClientToken 时合并到 key — 5s 内同 UUID 视为重试幂等）
-        String userLockKey = LOCK_USER_SUBMIT_PREFIX + userId
-            + (StrUtil.isNotBlank(bo.getDedupClientToken()) ? ":" + bo.getDedupClientToken() : "");
-        if (!tryAcquireRedisLock(userLockKey)) {
-            log.info("[bean-submit] user_submit lock taken userId={} dedupClientToken={}",
-                userId, bo.getDedupClientToken());
-            throw new ServiceException(GzBeanErrorCode.SUBMIT_TOO_FAST_MSG, GzBeanErrorCode.SUBMIT_TOO_FAST);
-        }
-
-        // ③ Redis 锁 2：座位抢占锁
-        String seatLockKey = LOCK_SEAT_PREFIX
-            + bo.getStoreId() + ":" + bo.getSeatId() + ":" + bo.getSessDate() + ":" + bo.getSlotStart();
-        if (!tryAcquireRedisLock(seatLockKey)) {
-            log.info("[bean-submit] seat lock taken storeId={} seatId={} sessDate={} slotStart={}",
-                bo.getStoreId(), bo.getSeatId(), bo.getSessDate(), bo.getSlotStart());
-            throw new ServiceException(GzBeanErrorCode.SEAT_TAKEN_MSG, GzBeanErrorCode.SEAT_TAKEN);
-        }
-
-        try {
-            // ④ 校验门店 + 座位存在 + 启用
-            GzBeanStore store = storeMapper.selectById(bo.getStoreId());
-            if (store == null) {
-                throw new ServiceException("门店不存在");
-            }
-            GzBeanSeat seat = seatMapper.selectById(bo.getSeatId());
-            if (seat == null) {
-                throw new ServiceException("座位不存在");
-            }
-            if (!seat.getStoreId().equals(bo.getStoreId())) {
-                throw new ServiceException("座位不属于该门店");
-            }
-            if (seat.getEnabled() == null || seat.getEnabled() != 1) {
-                throw new ServiceException(GzBeanErrorCode.SEAT_DISABLED_MSG, GzBeanErrorCode.SEAT_DISABLED);
-            }
-
-            // ⑤ 应用层校验：同用户同时段同店无其他 pending（doc/10 §3 §并发控制 第 3 层）
-            // 注：tenantId 取自 user.getTenantId()（DB 字段），不用 LoginHelper.getTenantId()。
-            //   mp 用户登录 JWT extra 无 tenantId，LoginHelper.getTenantId() 返 null
-            //   → WHERE 条件失效 → 同用户同时段不同座位可重复预约（应用层第 3 层防御穿透）。
-            String tenantId = user.getTenantId();
-            long activeCount = bookingMapper.countActiveUserBooking(
-                tenantId, userId, bo.getStoreId(), bo.getSessDate(), bo.getSlotStart());
-            if (activeCount > 0) {
-                throw new ServiceException(GzBeanErrorCode.DUPLICATE_USER_BOOKING_MSG, GzBeanErrorCode.DUPLICATE_USER_BOOKING);
-            }
-
-            // ⑥ 生成 booking_no
-            LocalDateTime now = LocalDateTime.now();
-            String bookingNo = generateBookingNo(now.toLocalDate());
-
-            // ⑦ 构造 dedupToken（pending 状态用座位 + 时段组合）
-            String dedupToken = buildDedupTokenForPending(bo.getSeatId(), bo.getSessDate(), bo.getSlotStart());
-
-            // ⑧ 生成 verifyCode（HMAC 截 32 位）
-            String verifyCode = qrCodeSigner.sign(bookingNo, bo.getSessDate(), bo.getSeatId());
-
-            // ⑨ INSERT booking（撞 UNIQUE → SEAT_TAKEN）
-            GzBeanBooking entity = GzBeanBooking.builder()
-                .bookingNo(bookingNo)
-                .userId(userId)
-                .storeId(bo.getStoreId())
-                .seatId(bo.getSeatId())
-                .seatNoSnapshot(seat.getSeatNo())
-                .sessDate(bo.getSessDate())
-                .slotStart(bo.getSlotStart())
-                .slotEnd(bo.getSlotEnd())
-                .mobileSnapshot(user.getMobile())
-                .status(STATUS_PENDING)
-                .verifyCode(verifyCode)
-                .dedupToken(dedupToken)
-                .delFlag("0")
-                .build();
-
-            try {
-                bookingMapper.insert(entity);
-            } catch (DuplicateKeyException dke) {
-                log.info("[bean-submit] DB UNIQUE collide → SEAT_TAKEN storeId={} seatId={} sessDate={} slotStart={}",
-                    bo.getStoreId(), bo.getSeatId(), bo.getSessDate(), bo.getSlotStart(), dke);
-                throw new ServiceException(GzBeanErrorCode.SEAT_TAKEN_MSG, GzBeanErrorCode.SEAT_TAKEN);
-            }
-
-            // ⑩ INSERT booking_log（首条审计）
-            GzBeanBookingLog logEntity = GzBeanBookingLog.builder()
-                .bookingId(entity.getId())
-                .fromStatus(null)
-                .toStatus(STATUS_PENDING)
-                .operatorType(OPERATOR_USER)
-                .operatorId(String.valueOf(userId))
-                .note("用户提交预约")
-                .delFlag("0")
-                .build();
-            bookingLogMapper.insert(logEntity);
-
-            log.info("[bean-submit] success bookingNo={} userId={} storeId={} seatId={} sessDate={} slotStart={}",
-                bookingNo, userId, bo.getStoreId(), bo.getSeatId(), bo.getSessDate(), bo.getSlotStart());
-
-            // ⑪ 返回 mp 端 VO（含 QR payload）
-            String qrPayload = qrCodeSigner.buildQrPayload(bookingNo, verifyCode);
-            return GzBeanBookingMpSubmitVO.builder()
-                .id(entity.getId())
-                .bookingNo(bookingNo)
-                .seatId(bo.getSeatId())
-                .seatNoSnapshot(seat.getSeatNo())
-                .sessDate(bo.getSessDate())
-                .slotStart(bo.getSlotStart())
-                .slotEnd(bo.getSlotEnd())
-                .verifyCode(verifyCode)
-                .qrPayload(qrPayload)
-                .build();
-        } finally {
-            // 释放座位锁；user_submit 锁保留到 5s TTL 自动失效（防快速重试）
-            releaseRedisLock(seatLockKey);
-        }
-    }
-
     /**
      * 抢 Redis 锁（{@code SET key NX EX 5}）。protected 便于单测 spy override —
      * RedisUtils 是静态工具类，类初始化依赖 Spring 容器（{@code SpringUtils.getBean(RedissonClient.class)}），
@@ -291,21 +146,6 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
      */
     protected void releaseRedisLock(String key) {
         RedisUtils.deleteObject(key);
-    }
-
-    // ============================================================
-    //  mp /availability 端点
-    // ============================================================
-
-    @Override
-    public List<Long> selectOccupiedSeatIds(Long storeId, LocalDate sessDate, LocalTime slotStart) {
-        // 注：tenantId 从 store 查（数据驱动）— 同上原因，mp JWT 无 tenantId 不能依赖 LoginHelper。
-        //   store 不存 → 返空 list（mp /availability 容错；上游 GzBeanSeatMpController 自有 store 校验）。
-        GzBeanStore store = storeMapper.selectById(storeId);
-        if (store == null) {
-            return List.of();
-        }
-        return bookingMapper.selectOccupiedSeatIds(store.getTenantId(), storeId, sessDate, slotStart);
     }
 
     // ============================================================
@@ -762,24 +602,37 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         }
         long quantity = config.getQuantity() == null ? 0L : config.getQuantity();
 
-        // ⑤ 幂等：同用户同 (类型,日期,时段) 已有活跃 booking → 返回原单（doc/10 §11 Q11.3）
-        long userActive = bookingMapper.countActiveUserTypeSlot(
-            tenantId, userId, bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), bo.getSlotStart());
+        // ④.5 区间连续性校验（ADR-0011 §5 / doc/15a §A.2）：把下单区间 [slotStart, slotEnd) 按 1h 展开成
+        //   格序列 g1..gN，逐格校验「整点 + 落在某启用窗口内 + 物理相邻连续（午休 gap 不可跨窗口桥接）」。
+        //   非法 → SLOT_RANGE_INVALID 拒单（前后端双校验，后端是真源，不信任前端）。
+        List<LocalTime> reqSlots = validateAndExpandInterval(tenantId, bo.getStoreId(), bo.getSessDate(),
+            bo.getSlotStart(), bo.getSlotEnd());
+        int hours = reqSlots.size();
+
+        // ⑤ 幂等：同用户同 (类型,日期) 已有与本区间重叠的活跃 booking → 拒单（doc/10 §11 Q11.3）
+        long userActive = bookingMapper.countActiveUserOverlap(
+            tenantId, userId, bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), bo.getSlotStart(), bo.getSlotEnd());
         if (userActive > 0) {
             throw new ServiceException(GzBeanErrorCode.DUPLICATE_USER_BOOKING_MSG, GzBeanErrorCode.DUPLICATE_USER_BOOKING);
         }
 
-        // ⑥ 防超卖：COUNT(活跃) FOR UPDATE 比对 quantity，满则拒单回滚（AC 3，doc/11 §3.6）
-        long active = bookingMapper.countActiveByTypeSlotForUpdate(
-            tenantId, bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), bo.getSlotStart());
-        if (active >= quantity) {
-            log.info("[bean-paid-submit] quota full storeId={} seatType={} date={} slot={} active={} quantity={}",
-                bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), bo.getSlotStart(), active, quantity);
-            throw new ServiceException(GzBeanErrorCode.QUOTA_FULL_MSG, GzBeanErrorCode.QUOTA_FULL);
+        // ⑥ 逐格防超卖：区间内每个 1h 格各调一次 COUNT(覆盖该格的活跃) FOR UPDATE 比对 quantity（ADR-0011 §3）。
+        //   按格升序加锁（reqSlots 已升序，validateAndExpandInterval 保证）固定加锁顺序防交叠区间死锁；
+        //   任一格满即整笔回滚（部分格满无部分成交），msg 含哪格满。
+        for (LocalTime slot : reqSlots) {
+            long active = bookingMapper.countActiveCoveringSlotForUpdate(
+                tenantId, bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), slot);
+            if (active >= quantity) {
+                log.info("[bean-paid-submit] quota full storeId={} seatType={} date={} slot={} active={} quantity={}",
+                    bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), slot, active, quantity);
+                throw new ServiceException(GzBeanErrorCode.QUOTA_FULL_MSG + "（" + slot + " 已满）",
+                    GzBeanErrorCode.QUOTA_FULL);
+            }
         }
 
-        // ⑦ 计费：单笔金额 = 该类型单价 snapshot（单笔单时段无累加）
-        long amountCent = config.getPriceCent() == null ? 0L : config.getPriceCent();
+        // ⑦ 计费：实付 = 该类型单价 snapshot × 连续小时数 N（区间格数，ADR-0011 §4 / doc/15a §A.3）
+        long unitPriceCent = config.getPriceCent() == null ? 0L : config.getPriceCent();
+        long amountCent = unitPriceCent * hours;
 
         // ⑦.5 锁券抵扣（GZ-COUPON-002，doc/11 §11.3 / doc/10 §12.N4）：选券时事务内 unused → locked，
         //   拿券面额快照 → 实付重算 payAmountCent = amountCent − 券面额（下限 0，差额不退不找零）。
@@ -858,7 +711,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .amountCent(payAmountCent)
             .openid(user.getOpenid())
             .userId(userId)
-            .description("谷子宇宙拼豆预约 · " + seatTypeName)
+            .description("谷子宇宙拼豆预约 · " + seatTypeName + " · " + bo.getSlotStart() + "-" + bo.getSlotEnd())
             .build();
         MpPayParamsVO payParams = payServiceProvider.getObject().createBusinessOrder(orderBo);
 
@@ -901,7 +754,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     }
 
     // ============================================================
-    //  GZ-BEAN-014 余量查询（AC 4）
+    //  GZ-BEAN-017 余量查询（按 1h 整点格，ADR-0011 / doc/15a §A.1）
     // ============================================================
 
     @Override
@@ -928,31 +781,30 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             if (configs.isEmpty()) {
                 return List.of();
             }
-            // 该日启用的时段模板（weekday / 生效区间过滤）
-            List<GzBeanTimeSlotTemplate> slots = selectEnabledSlotsForDate(tenantId, storeId, sessDate);
-            if (slots.isEmpty()) {
+            // 该日启用的营业窗口（weekday / 生效区间过滤）→ 按 1h 切成整点格序列（午休那格不生成，ADR-0011 §1）
+            List<GzBeanTimeSlotTemplate> windows = selectEnabledSlotsForDate(tenantId, storeId, sessDate);
+            List<LocalTime> hourSlots = sliceWindowsToHourSlots(windows);
+            if (hourSlots.isEmpty()) {
                 return List.of();
             }
 
-            List<GzBeanTypeSlotAvailabilityVO> result = new ArrayList<>(configs.size() * slots.size());
+            List<GzBeanTypeSlotAvailabilityVO> result = new ArrayList<>(configs.size() * hourSlots.size());
             for (GzBeanSeatTypeConfig cfg : configs) {
                 int quantity = cfg.getQuantity() == null ? 0 : cfg.getQuantity();
                 String typeName = SEAT_TYPE_NAME.getOrDefault(cfg.getSeatType(), cfg.getSeatType());
-                for (GzBeanTimeSlotTemplate slot : slots) {
-                    long activeCount = bookingMapper.countActiveByTypeSlot(
-                        tenantId, storeId, cfg.getSeatType(), sessDate, slot.getStartTime());
-                    int remaining = (int) Math.max(0L, quantity - activeCount);
+                for (LocalTime slot : hourSlots) {
+                    long activeCount = bookingMapper.countActiveCoveringSlot(
+                        tenantId, storeId, cfg.getSeatType(), sessDate, slot);
+                    // 内部算 full，不暴露 remaining 数字给 mp（doc/15a §A.1 铁律）
+                    boolean full = (quantity - activeCount) <= 0L;
                     result.add(GzBeanTypeSlotAvailabilityVO.builder()
                         .seatType(cfg.getSeatType())
                         .name(typeName)
                         .unitPriceCent(cfg.getPriceCent())
-                        .slotStart(slot.getStartTime())
-                        .slotEnd(slot.getEndTime())
-                        .quantity(quantity)
-                        .activeCount(activeCount)
-                        .remaining(remaining)
-                        .full(remaining <= 0)
-                        // mp 契约：仅 enabled=1 config 进余量接口（:914 eq enabled=1），active 恒 true。
+                        .slotStart(slot)
+                        .slotEnd(slot.plusHours(1))
+                        .full(full)
+                        // mp 契约：仅 enabled=1 config 进余量接口（上面 eq enabled=1），active 恒 true。
                         // 不回传会让 mp ts.active===undefined→falsy→整档被 filter 掉（座位列表恒空）。
                         .active(Boolean.TRUE)
                         .build());
@@ -960,6 +812,80 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             }
             return result;
         });
+    }
+
+    /**
+     * 把启用营业窗口按 1h 切成整点格序列（ADR-0011 §1）。
+     *
+     * <p>窗口 {@code [s, e)}（整点边界，admin 侧已校验）→ 格 {@code [s, s+1h), [s+1h, s+2h), …, [e-1h, e)}。
+     * 多窗口（午休断档）的格各自切，按格起整点全局升序去重合并 —— 午休那格根本不生成（物理不可约）。
+     * 非整点 / 残格（窗口长度非整小时或起止非整点）的尾部不足 1h 部分忽略（防越界生成残格，admin 校验兜底）。</p>
+     *
+     * @param windows 该日启用营业窗口列表
+     * @return 全局升序去重后的 1h 格起整点列表
+     */
+    private List<LocalTime> sliceWindowsToHourSlots(List<GzBeanTimeSlotTemplate> windows) {
+        if (windows == null || windows.isEmpty()) {
+            return List.of();
+        }
+        // TreeSet 去重 + 自然升序（跨窗口合并后整体升序，午休格天然不在集合内）
+        java.util.TreeSet<LocalTime> slots = new java.util.TreeSet<>();
+        for (GzBeanTimeSlotTemplate w : windows) {
+            LocalTime start = w.getStartTime();
+            LocalTime end = w.getEndTime();
+            if (start == null || end == null || !start.isBefore(end)) {
+                continue;
+            }
+            // 仅切整点格：cursor 从 start 起逐 +1h，直到 cursor+1h 超过 end（不足 1h 残格不生成）
+            for (LocalTime cursor = start; !cursor.plusHours(1).isAfter(end); cursor = cursor.plusHours(1)) {
+                slots.add(cursor);
+            }
+        }
+        return new ArrayList<>(slots);
+    }
+
+    /**
+     * 区间连续性校验 + 按 1h 展开（GZ-BEAN-017，ADR-0011 §5 / doc/15a §A.2）。
+     *
+     * <p>校验链（任一不过 → {@link GzBeanErrorCode#SLOT_RANGE_INVALID}）：</p>
+     * <ol>
+     *   <li>{@code reqStart < reqEnd}，二者均整点（分=秒=0）</li>
+     *   <li>区间长度为整小时（{@code (reqEnd − reqStart)} 是整 N 小时）</li>
+     *   <li>区间内每个 1h 格 {@code [g, g+1h)} 都是该日可约格（落在某启用营业窗口内的整点格）—— 由
+     *       {@link #sliceWindowsToHourSlots} 算出的可约格集合逐格 contains 校验；午休 gap 那格不在集合内
+     *       → 跨午休区间自然被拦（物理相邻连续 + 不可跨窗口桥接）。</li>
+     * </ol>
+     *
+     * @return 区间内升序的 1h 格起整点列表（防超卖逐格加锁用，保证升序）
+     */
+    private List<LocalTime> validateAndExpandInterval(String tenantId, Long storeId, LocalDate sessDate,
+                                                      LocalTime reqStart, LocalTime reqEnd) {
+        if (reqStart == null || reqEnd == null || !reqStart.isBefore(reqEnd)
+            || !isWholeHour(reqStart) || !isWholeHour(reqEnd)) {
+            throw new ServiceException(GzBeanErrorCode.SLOT_RANGE_INVALID_MSG, GzBeanErrorCode.SLOT_RANGE_INVALID);
+        }
+        // 该日可约格集合（启用窗口切 1h；午休格不在内）
+        List<GzBeanTimeSlotTemplate> windows = selectEnabledSlotsForDate(tenantId, storeId, sessDate);
+        java.util.Set<LocalTime> bookableSlots = new java.util.HashSet<>(sliceWindowsToHourSlots(windows));
+        if (bookableSlots.isEmpty()) {
+            throw new ServiceException(GzBeanErrorCode.SLOT_RANGE_INVALID_MSG, GzBeanErrorCode.SLOT_RANGE_INVALID);
+        }
+        // 逐格展开 + 校验落在可约格集合内（连续性 = 每格相接 + 都可约；跨午休某格缺失即拦）
+        List<LocalTime> reqSlots = new ArrayList<>();
+        for (LocalTime cursor = reqStart; cursor.isBefore(reqEnd); cursor = cursor.plusHours(1)) {
+            if (!bookableSlots.contains(cursor)) {
+                log.info("[bean-paid-submit] slot range invalid storeId={} date={} req={}-{} badSlot={}",
+                    storeId, sessDate, reqStart, reqEnd, cursor);
+                throw new ServiceException(GzBeanErrorCode.SLOT_RANGE_INVALID_MSG, GzBeanErrorCode.SLOT_RANGE_INVALID);
+            }
+            reqSlots.add(cursor);
+        }
+        return reqSlots;
+    }
+
+    /** 整点判定：分钟 = 0 且秒 = 0（纳秒由 LocalTime TIME 精度天然为 0）。 */
+    private boolean isWholeHour(LocalTime t) {
+        return t.getMinute() == 0 && t.getSecond() == 0 && t.getNano() == 0;
     }
 
     /**
@@ -1163,7 +1089,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
      * 生成 booking_no：BK + yyyyMMdd + 6 位序号（同 user_no 模式，doc/11 §3.4）。
      *
      * <p>性能：V1.0 量级（日单量 < 200）单次 SELECT MAX 微秒级；V1.1 量级上来切 snowflake。</p>
-     * <p>并发：UNIQUE 兜底，撞 → 上游 catch DuplicateKeyException → 用户友好错误（极小概率）。</p>
+     * <p>并发：{@code (tenant_id, booking_no)} UNIQUE 兜底，撞键时 INSERT 抛 DuplicateKey 让下单事务回滚（极小概率）。</p>
      */
     private String generateBookingNo(LocalDate date) {
         String datePart = date.format(BOOKING_NO_DATE_FMT);
@@ -1182,15 +1108,5 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             }
         }
         return prefix + String.format("%0" + BOOKING_NO_SEQ_LEN + "d", nextSeq);
-    }
-
-    /**
-     * 构造 pending 状态的 dedup_token（方案 C）。
-     *
-     * <p>格式：{@code "{seatId}|{sessDate}|{slotStart}"}。同座位时段组合在 (tenant_id, store_id, dedup_token) UNIQUE
-     * 约束下保证至多 1 个 pending。</p>
-     */
-    private String buildDedupTokenForPending(Long seatId, LocalDate sessDate, LocalTime slotStart) {
-        return seatId + "|" + sessDate + "|" + slotStart;
     }
 }

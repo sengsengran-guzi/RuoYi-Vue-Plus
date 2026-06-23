@@ -42,6 +42,12 @@ public class WechatPayProperties {
     /** 商户证书文件路径（env var ${WECHAT_PAY_CERT_PATH}） */
     private String certPath;
 
+    /** 微信支付公钥文件路径（公钥模式必填，env var ${WECHAT_PAY_PUBLIC_KEY_PATH}；商户平台-API安全下载的 pub_key.pem） */
+    private String publicKeyPath;
+
+    /** 微信支付公钥 ID（公钥模式必填，形如 PUB_KEY_ID_xxxxx，env var ${WECHAT_PAY_PUBLIC_KEY_ID}） */
+    private String publicKeyId;
+
     /** 回调地址完整 URL（统一下单 notify_url 传给微信，需含域名；real 必填） */
     private String notifyUrl;
 

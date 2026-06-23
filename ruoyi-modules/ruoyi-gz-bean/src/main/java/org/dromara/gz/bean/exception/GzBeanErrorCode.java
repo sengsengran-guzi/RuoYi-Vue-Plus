@@ -62,7 +62,7 @@ public final class GzBeanErrorCode {
     //  GZ-BEAN-014 V1.2 付费模型错误码
     // ============================================================
 
-    /** 该 (座位类型,日期,时段) 配额已满（活跃 booking 数 ≥ quantity，doc/10 §11.E1） */
+    /** 该 (座位类型,日期,1h 格) 配额已满（区间内某格活跃 booking 数 ≥ quantity，doc/15a §A.6 / ADR-0011 §3） */
     public static final int QUOTA_FULL = 4011;
     public static final String QUOTA_FULL_MSG = "该时段座位已约满，请重选类型或时段";
 
@@ -81,6 +81,15 @@ public final class GzBeanErrorCode {
     /** 核销前置未满足：仅 pay_status='paid' 的 pending 单可核销（ADR-0007 §1.2） */
     public static final int NOT_PAID = 4015;
     public static final String NOT_PAID_MSG = "该预约尚未完成支付，不可核销";
+
+    /**
+     * 所选 1h 区间不连续 / 跨越休息时段 / 含不可约格（GZ-BEAN-017，ADR-0011 §5 / doc/15a §A.2/§A.6）。
+     *
+     * <p><b>码偏差说明</b>：doc/15a §A.6 给的建议码是 4015，但 4015 已被 {@link #NOT_PAID} 占用（早于本批落地）。
+     * 为不破坏既有 NOT_PAID 契约，本码取下一空位 4016。mp/admin 端按本常量对接（4016），不要按文档 4015。</p>
+     */
+    public static final int SLOT_RANGE_INVALID = 4016;
+    public static final String SLOT_RANGE_INVALID_MSG = "所选时段不连续或跨越休息时段，请重选";
 
     private GzBeanErrorCode() {
     }

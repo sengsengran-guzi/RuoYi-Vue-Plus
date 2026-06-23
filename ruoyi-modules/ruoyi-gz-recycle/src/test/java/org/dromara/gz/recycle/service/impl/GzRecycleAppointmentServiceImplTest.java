@@ -4,15 +4,18 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.dromara.common.core.exception.ServiceException;
 import org.dromara.gz.common.domain.entity.GzUser;
 import org.dromara.gz.common.mapper.GzUserMapper;
+import org.dromara.gz.recycle.config.GzRecycleQrProperties;
 import org.dromara.gz.recycle.domain.bo.GzRecycleAppointmentSubmitBo;
 import org.dromara.gz.recycle.domain.entity.GzRecycleAppointment;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentVO;
-import org.dromara.gz.recycle.domain.vo.GzRecycleEstimateAllVO;
-import org.dromara.gz.recycle.domain.vo.GzRecycleEstimateVO;
+import org.dromara.gz.recycle.domain.vo.GzRecycleProductVO;
+import org.dromara.gz.recycle.domain.vo.GzRecycleQtyRangeVO;
 import org.dromara.gz.recycle.exception.GzRecycleErrorCode;
 import org.dromara.gz.recycle.mapper.GzRecycleAppointmentMapper;
-import org.dromara.gz.recycle.service.IGzRecyclePriceRuleService;
+import org.dromara.gz.recycle.service.IGzRecycleIpService;
+import org.dromara.gz.recycle.service.IGzRecycleQtyRangeService;
 import org.dromara.gz.recycle.service.internal.RecycleApptNoGenerator;
+import org.dromara.gz.recycle.service.internal.RecycleQrSigner;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -28,10 +31,11 @@ import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
@@ -39,13 +43,13 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * {@link GzRecycleAppointmentServiceImpl} 单测（GZ-RECYCLE-002 AC 2/3/5）。
+ * {@link GzRecycleAppointmentServiceImpl} 单测（ADR-0012：去估价 + 单份多选 + 桶→时长 + parse 兼容）。
  *
- * <p>覆盖：① 多品类累加估价（金额 Σ + total_qty Σ + 时长 Σ 冻结）；② E1 未估价品类 hasUnpriced 标记 +
- * 含未估价拒收；③ submit_image_ids 空照拒收（AC3 后端二次校验）+ image_id 入库（逗号分隔，非裸 url）；
- * ④ receiver_openid 缺失拦截（E5）。estimate 单品类口径已在 GzRecyclePriceRuleEstimateTest 覆盖。</p>
+ * <p>覆盖：① 单份多选 happy path（无金额、桶→时长、ipNames 快照、arrivalSlot→slot 映射、image_id 逗号入库）；
+ * ② imageIds 空照拒收（4101）；③ categories 空拒收（4108）；④ 数量桶无效拒收（4107）；⑤ openid 缺失拦截（4103）；
+ * ⑥ parseProducts 双分支：旧数组根可读 + 投影正确 / 新对象根可读；⑦ 越权详情返 null。</p>
  *
- * @author kevin-coder (sensenran-guzi · GZ-RECYCLE-002)
+ * @author kevin-coder (sensenran-guzi · GZ-RECYCLE-004)
  */
 @Tag("dev")
 @ExtendWith(MockitoExtension.class)
@@ -54,11 +58,13 @@ class GzRecycleAppointmentServiceImplTest {
     @Mock
     private GzRecycleAppointmentMapper baseMapper;
     @Mock
-    private IGzRecyclePriceRuleService priceRuleService;
-    @Mock
     private GzUserMapper gzUserMapper;
     @Mock
     private RecycleApptNoGenerator apptNoGenerator;
+    @Mock
+    private IGzRecycleQtyRangeService qtyRangeService;
+    @Mock
+    private IGzRecycleIpService ipService;
     @Mock
     private org.dromara.gz.common.pay.service.IGzPayPayoutService payoutService;
     @Mock
@@ -66,29 +72,25 @@ class GzRecycleAppointmentServiceImplTest {
     @Mock
     private org.dromara.common.core.service.ConfigService configService;
 
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final RecycleQrSigner qrSigner = new RecycleQrSigner(new GzRecycleQrProperties());
+
     private GzRecycleAppointmentServiceImpl service;
 
     @BeforeEach
     void setUp() {
         service = new GzRecycleAppointmentServiceImpl(
-            baseMapper, priceRuleService, gzUserMapper, apptNoGenerator, new ObjectMapper(),
+            baseMapper, gzUserMapper, apptNoGenerator, qtyRangeService, ipService, qrSigner, objectMapper,
             payoutService, payoutMapper, configService);
     }
 
-    private GzRecycleAppointmentSubmitBo.ProductLine line(String category, int qty) {
-        GzRecycleAppointmentSubmitBo.ProductLine p = new GzRecycleAppointmentSubmitBo.ProductLine();
-        p.setCategory(category);
-        p.setQty(qty);
-        return p;
-    }
-
-    private GzRecycleEstimateVO hit(String category, int qty, long unitPriceCent, int duration) {
-        GzRecycleEstimateVO vo = new GzRecycleEstimateVO();
-        vo.setCategory(category);
-        vo.setQty(qty);
-        vo.setUnitPriceCent(unitPriceCent);
-        vo.setEstimatedAmountCent(unitPriceCent * qty);
-        vo.setMatchedDurationMinutes(duration);
+    private GzRecycleQtyRangeVO bucket(String code, String label, int duration) {
+        GzRecycleQtyRangeVO vo = new GzRecycleQtyRangeVO();
+        vo.setId(1L);
+        vo.setCode(code);
+        vo.setLabel(label);
+        vo.setDurationMinutes(duration);
+        vo.setEnabled(1);
         return vo;
     }
 
@@ -102,98 +104,50 @@ class GzRecycleAppointmentServiceImplTest {
         return u;
     }
 
-    private GzRecycleAppointmentSubmitBo submitBo(List<GzRecycleAppointmentSubmitBo.ProductLine> products,
-                                                  List<Long> imageIds) {
+    private GzRecycleAppointmentSubmitBo.ProductBo product(List<String> categories, List<Long> ipIds,
+                                                           List<String> customIps, String bucketCode) {
+        GzRecycleAppointmentSubmitBo.ProductBo p = new GzRecycleAppointmentSubmitBo.ProductBo();
+        p.setCategories(categories);
+        p.setIpIds(ipIds);
+        p.setCustomIps(customIps);
+        p.setQtyBucketCode(bucketCode);
+        return p;
+    }
+
+    private GzRecycleAppointmentSubmitBo submitBo(GzRecycleAppointmentSubmitBo.ProductBo product,
+                                                  List<Long> imageIds, String arrivalSlot) {
         GzRecycleAppointmentSubmitBo bo = new GzRecycleAppointmentSubmitBo();
         bo.setStoreId(1L);
-        bo.setProducts(products);
+        bo.setProduct(product);
         bo.setApptDate(LocalDate.of(2026, 6, 22));
-        bo.setSlotStart(LocalTime.of(10, 0));
-        bo.setSlotEnd(LocalTime.of(12, 0));
-        bo.setSubmitImageIds(imageIds);
+        bo.setArrivalSlot(arrivalSlot);
+        bo.setImageIds(imageIds);
+        bo.setRemark("旧物清仓");
         return bo;
     }
 
-    // ===== AC2 多品类累加估价 =====
+    // ===== 单份多选 happy path =====
 
     @Test
-    @DisplayName("AC2 多品类累加：card×3@500 + goods×5@300 → 金额 1500+1500=3000 / total_qty 8 / 时长 15+20=35")
-    void estimateAll_multiCategorySum() {
-        when(priceRuleService.estimate(eq("card"), eq(3))).thenReturn(hit("card", 3, 500L, 15));
-        when(priceRuleService.estimate(eq("goods"), eq(5))).thenReturn(hit("goods", 5, 300L, 20));
-
-        GzRecycleEstimateAllVO vo = service.estimateAll(List.of(line("card", 3), line("goods", 5)));
-
-        assertEquals(8, vo.getTotalQty());
-        assertEquals(3000L, vo.getEstimatedAmountCent());
-        assertEquals(35, vo.getMatchedDurationMinutes(), "时长冻结口径 = Σ 各命中 duration_minutes");
-        assertFalse(vo.getHasUnpriced());
-        assertEquals(2, vo.getLines().size());
-        assertTrue(vo.getLines().get(0).getPriced());
-        assertEquals(1500L, vo.getLines().get(0).getEstimatedAmountCent());
-    }
-
-    @Test
-    @DisplayName("AC5 E1：goods 未命中区间 → 该 line.priced=false + hasUnpriced=true，不阻断 card 估价")
-    void estimateAll_e1UnpricedDoesNotBlockOthers() {
-        when(priceRuleService.estimate(eq("card"), eq(3))).thenReturn(hit("card", 3, 500L, 15));
-        when(priceRuleService.estimate(eq("goods"), eq(99)))
-            .thenThrow(new ServiceException("品类「goods」数量 99 无报价规则"));
-
-        GzRecycleEstimateAllVO vo = service.estimateAll(List.of(line("card", 3), line("goods", 99)));
-
-        assertTrue(vo.getHasUnpriced(), "含未估价品类");
-        assertEquals(102, vo.getTotalQty(), "total_qty 仍含未估价品类数量");
-        assertEquals(1500L, vo.getEstimatedAmountCent(), "金额仅累加已估价品类");
-        assertEquals(15, vo.getMatchedDurationMinutes(), "时长仅累加已估价品类");
-        assertTrue(vo.getLines().get(0).getPriced());
-        assertFalse(vo.getLines().get(1).getPriced());
-    }
-
-    // ===== AC3 submit_image_ids 必填 =====
-
-    @Test
-    @DisplayName("AC3 submit_image_ids 空 → 后端拒收 4101，不查用户/不 INSERT")
-    void submit_rejectEmptyImages() {
-        GzRecycleAppointmentSubmitBo bo = submitBo(List.of(line("card", 3)), new ArrayList<>());
-
-        ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
-        assertEquals(GzRecycleErrorCode.SUBMIT_IMAGE_REQUIRED, ex.getCode());
-        verify(gzUserMapper, never()).selectById(org.mockito.ArgumentMatchers.any());
-        verify(baseMapper, never()).insert(org.mockito.ArgumentMatchers.any(GzRecycleAppointment.class));
-    }
-
-    @Test
-    @DisplayName("AC3 submit_image_ids 含 null 元素 → 后端拒收 4101")
-    void submit_rejectImagesWithNull() {
-        GzRecycleAppointmentSubmitBo bo = submitBo(List.of(line("card", 3)), Arrays.asList(9L, null));
-
-        ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
-        assertEquals(GzRecycleErrorCode.SUBMIT_IMAGE_REQUIRED, ex.getCode());
-        verify(baseMapper, never()).insert(org.mockito.ArgumentMatchers.any(GzRecycleAppointment.class));
-    }
-
-    @Test
-    @DisplayName("AC3+AC4 正常提交：image_id 逗号入库（非裸 url）+ 估价/时长/total_qty 冻结 + openid/mobile/wechat 快照")
-    void submit_happyPath() {
-        when(priceRuleService.estimate(eq("card"), eq(3))).thenReturn(hit("card", 3, 500L, 15));
-        when(priceRuleService.estimate(eq("goods"), eq(5))).thenReturn(hit("goods", 5, 300L, 20));
+    @DisplayName("happy：单份多选 → 桶→时长落 matched_duration / 无金额 / ipNames 快照 / morning→10:00-13:00 / image_id 逗号入库")
+    void submit_happyPath_singleForm() {
+        when(qtyRangeService.getEnabledByCode("25-50")).thenReturn(bucket("25-50", "25-50 件", 60));
+        when(ipService.listNamesByIds(List.of(3L, 7L))).thenReturn(List.of("火影", "海贼王"));
         when(gzUserMapper.selectById(1001L)).thenReturn(userWithOpenid("o_wx_abc123"));
         when(apptNoGenerator.generate()).thenReturn("RCY-20260622-000001");
-        when(baseMapper.insert(org.mockito.ArgumentMatchers.any(GzRecycleAppointment.class))).thenReturn(1);
+        when(baseMapper.insert(any(GzRecycleAppointment.class))).thenReturn(1);
 
         GzRecycleAppointmentSubmitBo bo = submitBo(
-            List.of(line("card", 3), line("goods", 5)), List.of(11L, 12L));
+            product(List.of("card", "goods"), List.of(3L, 7L), List.of("我推的孩子"), "25-50"),
+            List.of(11L, 12L), "morning");
 
         GzRecycleAppointmentVO vo = service.submit(bo, 1001L);
 
         assertEquals("RCY-20260622-000001", vo.getAppointmentNo());
-        assertEquals(8, vo.getTotalQty());
-        assertEquals(3000L, vo.getEstimatedAmountCent());
-        assertEquals(35, vo.getMatchedDurationMinutes());
         assertEquals("submitted", vo.getStatus());
+        assertEquals(60, vo.getMatchedDurationMinutes(), "预计时长 = 命中桶 duration_minutes");
+        assertEquals("morning", vo.getArrivalSlot());
 
-        // 断言落库实体：image_id 逗号分隔（非裸 url）+ 快照 + 冻结
         org.mockito.ArgumentCaptor<GzRecycleAppointment> captor =
             org.mockito.ArgumentCaptor.forClass(GzRecycleAppointment.class);
         verify(baseMapper).insert(captor.capture());
@@ -202,41 +156,174 @@ class GzRecycleAppointmentServiceImplTest {
         assertEquals("o_wx_abc123", saved.getReceiverOpenid());
         assertEquals("13800000000", saved.getMobileSnapshot());
         assertEquals("wx_zhang", saved.getWechatIdSnapshot());
-        assertEquals(3000L, saved.getEstimatedAmountCent());
-        assertEquals(35, saved.getMatchedDurationMinutes());
-        assertEquals(8, saved.getTotalQty());
+        assertNull(saved.getEstimatedAmountCent(), "去估价：estimated_amount_cent 落 null");
+        assertNull(saved.getTotalQty(), "无精确件数：total_qty 落 null");
+        assertEquals(60, saved.getMatchedDurationMinutes());
+        assertEquals(LocalTime.of(10, 0), saved.getSlotStart());
+        assertEquals(LocalTime.of(13, 0), saved.getSlotEnd());
         assertEquals("submitted", saved.getStatus());
-        assertTrue(saved.getProductSnapshotJson().contains("card"), "product 快照写 JSON 列");
+        // product_snapshot_json 落对象（含 categories/ipNames/customIps/qtyBucketCode/qtyBucketLabel）
+        String json = saved.getProductSnapshotJson();
+        assertTrue(json.startsWith("{"), "snapshot 是对象根");
+        assertTrue(json.contains("\"categories\""));
+        assertTrue(json.contains("火影") && json.contains("海贼王"), "ipNames 快照");
+        assertTrue(json.contains("我推的孩子"), "customIps 并存");
+        assertTrue(json.contains("25-50 件"), "qtyBucketLabel 快照");
     }
 
     @Test
-    @DisplayName("AC5 提交含未估价品类（E1）→ 拒收 4102，不 INSERT")
-    void submit_rejectHasUnpriced() {
-        when(priceRuleService.estimate(eq("card"), eq(3))).thenReturn(hit("card", 3, 500L, 15));
-        when(priceRuleService.estimate(eq("goods"), eq(99)))
-            .thenThrow(new ServiceException("无报价规则"));
-        when(gzUserMapper.selectById(1001L)).thenReturn(userWithOpenid("o_wx_abc123"));
+    @DisplayName("happy：afternoon → 13:00-17:00 映射")
+    void submit_afternoonSlotMapping() {
+        when(qtyRangeService.getEnabledByCode("1-25")).thenReturn(bucket("1-25", "1-25 件", 30));
+        when(ipService.listNamesByIds(any())).thenReturn(List.of());
+        when(gzUserMapper.selectById(1001L)).thenReturn(userWithOpenid("o_wx"));
+        when(apptNoGenerator.generate()).thenReturn("RCY-20260622-000002");
+        when(baseMapper.insert(any(GzRecycleAppointment.class))).thenReturn(1);
 
+        service.submit(submitBo(product(List.of("card"), null, null, "1-25"), List.of(11L), "afternoon"), 1001L);
+
+        org.mockito.ArgumentCaptor<GzRecycleAppointment> captor =
+            org.mockito.ArgumentCaptor.forClass(GzRecycleAppointment.class);
+        verify(baseMapper).insert(captor.capture());
+        assertEquals(LocalTime.of(13, 0), captor.getValue().getSlotStart());
+        assertEquals(LocalTime.of(17, 0), captor.getValue().getSlotEnd());
+    }
+
+    // ===== 提交校验 =====
+
+    @Test
+    @DisplayName("imageIds 空 → 拒收 4101，不查桶/不查用户/不 INSERT")
+    void submit_rejectEmptyImages() {
         GzRecycleAppointmentSubmitBo bo = submitBo(
-            List.of(line("card", 3), line("goods", 99)), List.of(11L));
+            product(List.of("card"), null, null, "1-25"), new ArrayList<>(), "morning");
 
         ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
-        assertEquals(GzRecycleErrorCode.HAS_UNPRICED_CATEGORY, ex.getCode());
-        verify(baseMapper, never()).insert(org.mockito.ArgumentMatchers.any(GzRecycleAppointment.class));
+        assertEquals(GzRecycleErrorCode.SUBMIT_IMAGE_REQUIRED, ex.getCode());
+        verify(gzUserMapper, never()).selectById(any());
+        verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
     }
 
     @Test
-    @DisplayName("AC4 E5：receiver_openid 缺失 → 拦截 4103，不 INSERT")
-    void submit_rejectMissingOpenid() {
-        // estimate 在 openid 校验之后才调用，用 lenient 避免 UnnecessaryStubbing
-        lenient().when(priceRuleService.estimate(eq("card"), anyInt())).thenReturn(hit("card", 3, 500L, 15));
-        when(gzUserMapper.selectById(1001L)).thenReturn(userWithOpenid(""));
+    @DisplayName("imageIds 含 null → 拒收 4101")
+    void submit_rejectImagesWithNull() {
+        GzRecycleAppointmentSubmitBo bo = submitBo(
+            product(List.of("card"), null, null, "1-25"), Arrays.asList(9L, null), "morning");
 
-        GzRecycleAppointmentSubmitBo bo = submitBo(List.of(line("card", 3)), List.of(11L));
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
+        assertEquals(GzRecycleErrorCode.SUBMIT_IMAGE_REQUIRED, ex.getCode());
+        verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
+    }
+
+    @Test
+    @DisplayName("categories 空 → 拒收 4108，不 INSERT")
+    void submit_rejectEmptyCategories() {
+        GzRecycleAppointmentSubmitBo bo = submitBo(
+            product(new ArrayList<>(), null, null, "1-25"), List.of(11L), "morning");
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
+        assertEquals(GzRecycleErrorCode.CATEGORY_REQUIRED, ex.getCode());
+        verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
+    }
+
+    @Test
+    @DisplayName("数量桶未命中启用桶 → 拒收 4107，不 INSERT")
+    void submit_rejectInvalidBucket() {
+        when(qtyRangeService.getEnabledByCode("99-100")).thenReturn(null);
+        GzRecycleAppointmentSubmitBo bo = submitBo(
+            product(List.of("card"), null, null, "99-100"), List.of(11L), "morning");
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
+        assertEquals(GzRecycleErrorCode.QTY_BUCKET_INVALID, ex.getCode());
+        verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
+    }
+
+    @Test
+    @DisplayName("receiver_openid 缺失 → 拦截 4103，不 INSERT")
+    void submit_rejectMissingOpenid() {
+        when(qtyRangeService.getEnabledByCode("1-25")).thenReturn(bucket("1-25", "1-25 件", 30));
+        when(gzUserMapper.selectById(1001L)).thenReturn(userWithOpenid(""));
+        lenient().when(ipService.listNamesByIds(any())).thenReturn(List.of());
+
+        GzRecycleAppointmentSubmitBo bo = submitBo(
+            product(List.of("card"), null, null, "1-25"), List.of(11L), "morning");
 
         ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
         assertEquals(GzRecycleErrorCode.OPENID_REQUIRED, ex.getCode());
-        verify(baseMapper, never()).insert(org.mockito.ArgumentMatchers.any(GzRecycleAppointment.class));
+        verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
+    }
+
+    @Test
+    @DisplayName("arrivalSlot 非法 → 拒收（不映射时间）")
+    void submit_rejectInvalidArrivalSlot() {
+        when(qtyRangeService.getEnabledByCode("1-25")).thenReturn(bucket("1-25", "1-25 件", 30));
+        GzRecycleAppointmentSubmitBo bo = submitBo(
+            product(List.of("card"), null, null, "1-25"), List.of(11L), "midnight");
+
+        assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
+        verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
+    }
+
+    // ===== parseProducts 双分支兼容（旧数组根 / 新对象根）=====
+
+    @Test
+    @DisplayName("parse 旧数组根：[{category,qty,ip}] 投影成单对象（categories/customIps 去重，桶字段空）")
+    void parse_legacyArrayRoot_projectsToObject() {
+        // 旧 V1.1 多明细 JSON 数组
+        String legacy = "[{\"category\":\"card\",\"qty\":3,\"ip\":\"火影\"},"
+            + "{\"category\":\"goods\",\"qty\":5,\"ip\":\"火影\"},"
+            + "{\"category\":\"card\",\"qty\":2,\"ip\":\"海贼王\"}]";
+        GzRecycleAppointment e = new GzRecycleAppointment();
+        e.setId(5L);
+        e.setUserId(1001L);
+        e.setStatus("paid");
+        e.setProductSnapshotJson(legacy);
+        when(baseMapper.selectById(5L)).thenReturn(e);
+
+        GzRecycleAppointmentVO vo = service.selectMyDetail(5L, 1001L);
+        GzRecycleProductVO p = vo.getProduct();
+        // categories 去重保序：card, goods
+        assertEquals(List.of("card", "goods"), p.getCategories());
+        // 旧行级 ip 进 customIps 去重：火影, 海贼王
+        assertEquals(List.of("火影", "海贼王"), p.getCustomIps());
+        assertNull(p.getQtyBucketCode(), "旧数据无桶 → null");
+        assertNull(p.getQtyBucketLabel());
+        assertTrue(p.getIpIds().isEmpty(), "旧数据无主数据 IP id");
+    }
+
+    @Test
+    @DisplayName("parse 新对象根：{categories,ipIds,ipNames,customIps,qtyBucketCode} 直读")
+    void parse_newObjectRoot_readsDirect() {
+        String obj = "{\"categories\":[\"card\"],\"ipIds\":[3,7],\"ipNames\":[\"火影\",\"海贼王\"],"
+            + "\"customIps\":[\"我推\"],\"qtyBucketCode\":\"25-50\",\"qtyBucketLabel\":\"25-50 件\"}";
+        GzRecycleAppointment e = new GzRecycleAppointment();
+        e.setId(6L);
+        e.setUserId(1001L);
+        e.setStatus("submitted");
+        e.setProductSnapshotJson(obj);
+        when(baseMapper.selectById(6L)).thenReturn(e);
+
+        GzRecycleAppointmentVO vo = service.selectMyDetail(6L, 1001L);
+        GzRecycleProductVO p = vo.getProduct();
+        assertEquals(List.of("card"), p.getCategories());
+        assertEquals(List.of(3L, 7L), p.getIpIds());
+        assertEquals(List.of("火影", "海贼王"), p.getIpNames());
+        assertEquals(List.of("我推"), p.getCustomIps());
+        assertEquals("25-50", p.getQtyBucketCode());
+        assertEquals("25-50 件", p.getQtyBucketLabel());
+    }
+
+    @Test
+    @DisplayName("parse 脏 JSON → 不抛、返空对象（防线上详情崩）")
+    void parse_malformedJson_returnsEmptyNoThrow() {
+        GzRecycleAppointment e = new GzRecycleAppointment();
+        e.setId(7L);
+        e.setUserId(1001L);
+        e.setStatus("submitted");
+        e.setProductSnapshotJson("{not-json");
+        when(baseMapper.selectById(7L)).thenReturn(e);
+
+        GzRecycleAppointmentVO vo = service.selectMyDetail(7L, 1001L);
+        assertNull(vo.getProduct().getCategories(), "脏数据 → 空对象、不崩");
     }
 
     @Test
@@ -244,9 +331,9 @@ class GzRecycleAppointmentServiceImplTest {
     void selectMyDetail_forbiddenWhenNotOwner() {
         GzRecycleAppointment e = new GzRecycleAppointment();
         e.setId(5L);
-        e.setUserId(2002L); // 属于别人
+        e.setUserId(2002L);
         when(baseMapper.selectById(5L)).thenReturn(e);
 
-        assertEquals(null, service.selectMyDetail(5L, 1001L));
+        assertNull(service.selectMyDetail(5L, 1001L));
     }
 }

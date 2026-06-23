@@ -4,7 +4,7 @@ import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
-import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -23,40 +23,43 @@ import org.dromara.gz.common.pay.service.IGzPayPayoutService.InitiateBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleAppointmentQueryBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleAppointmentSubmitBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyBo;
+import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyScanBo;
 import org.dromara.gz.recycle.domain.entity.GzRecycleAppointment;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentAdminVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentVO;
-import org.dromara.gz.recycle.domain.vo.GzRecycleEstimateAllVO;
-import org.dromara.gz.recycle.domain.vo.GzRecycleEstimateVO;
+import org.dromara.gz.recycle.domain.vo.GzRecycleProductVO;
+import org.dromara.gz.recycle.domain.vo.GzRecycleQtyRangeVO;
+import org.dromara.gz.recycle.domain.vo.RecycleVerifyCodeVO;
 import org.dromara.gz.recycle.exception.GzRecycleErrorCode;
 import org.dromara.gz.recycle.mapper.GzRecycleAppointmentMapper;
 import org.dromara.gz.recycle.service.IGzRecycleAppointmentService;
-import org.dromara.gz.recycle.service.IGzRecyclePriceRuleService;
+import org.dromara.gz.recycle.service.IGzRecycleIpService;
+import org.dromara.gz.recycle.service.IGzRecycleQtyRangeService;
 import org.dromara.gz.recycle.service.internal.RecycleApptNoGenerator;
+import org.dromara.gz.recycle.service.internal.RecycleQrSigner;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
 
 /**
- * 回收预约单服务实现（GZ-RECYCLE-002）。
+ * 回收预约单服务实现（ADR-0012：去估价 + 单份多选 + 桶→时长 + 核销码 + 聚合详情）。
  *
- * <p>字段口径权威：doc/11 §12.2；业务流：doc/10 §13。多租户 / 软删 / 公共字段自动注入由拦截器完成。</p>
+ * <p>字段口径权威：契约 15a §B/§E/§F。多租户 / 软删 / 公共字段自动注入由拦截器完成。</p>
  *
- * <p><b>估价累加口径</b>（doc/11 F12.1，钉死）：对 {@code products} 每条 {@code (category, qty)} 调
- * {@link IGzRecyclePriceRuleService#estimate} 单品类命中 →
- * {@code estimatedAmountCent = Σ unit_price_cent × qty}；{@code totalQty = Σ qty}；
- * {@code matchedDurationMinutes = Σ 各命中 duration_minutes}（多品类核对累计时长 —— 件数越多核对越久，
- * 与 total_qty 取 Σ 自洽；选型理由见 reports）。</p>
+ * <p><b>去估价</b>（ADR-0012 §1）：提交不调价目表估价，{@code estimated_amount_cent}/{@code total_qty} 落 null；
+ * 预计时长取命中数量桶 {@code duration_minutes}。<b>单份多选</b>（§2）：product_snapshot_json 落对象，
+ * parseProducts 探测根节点兼容旧数组数据。<b>金额上限</b>（§1）：validateFinalAmount 仅留绝对硬上限。</p>
  *
- * <p><b>金额防伪</b>：提交时后端按价目表重算估价 + 时长 + total_qty 冻结进预约单，<b>不信任前端实时估价</b>
- * （前端 estimateAll 仅展示）。</p>
- *
- * @author kevin-coder (sensenran-guzi · GZ-RECYCLE-002)
+ * @author kevin-coder (sensenran-guzi · GZ-RECYCLE-004)
  */
 @Slf4j
 @Service
@@ -64,6 +67,7 @@ import java.util.List;
 public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentService {
 
     private static final String STATUS_SUBMITTED = "submitted";
+    private static final String STATUS_CONFIRMED_ONSITE = "confirmed_onsite";
     private static final String STATUS_PAYOUT_FAILED = "payout_failed";
     /** 反向打款 business_type（doc/11 §4.8，独立核算不计 GMV） */
     private static final String PAYOUT_BUSINESS_TYPE = "recycle";
@@ -72,68 +76,32 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
     /** 钩子 / no_show 单轮扫描上限（防雪崩，与 PAY-105 SCAN_LIMIT 同口径） */
     private static final int SCAN_LIMIT = 100;
 
+    /** 到店档：早晨 10:00-13:00 */
+    private static final String ARRIVAL_MORNING = "morning";
+    private static final LocalTime MORNING_START = LocalTime.of(10, 0);
+    private static final LocalTime MORNING_END = LocalTime.of(13, 0);
+    /** 到店档：下午 13:00-17:00 */
+    private static final String ARRIVAL_AFTERNOON = "afternoon";
+    private static final LocalTime AFTERNOON_START = LocalTime.of(13, 0);
+    private static final LocalTime AFTERNOON_END = LocalTime.of(17, 0);
+
     private final GzRecycleAppointmentMapper baseMapper;
-    private final IGzRecyclePriceRuleService priceRuleService;
     private final GzUserMapper gzUserMapper;
     private final RecycleApptNoGenerator apptNoGenerator;
+    private final IGzRecycleQtyRangeService qtyRangeService;
+    private final IGzRecycleIpService ipService;
+    private final RecycleQrSigner qrSigner;
     /** 全局 Jackson ObjectMapper（spring 注入；product_snapshot_json 序列化/反序列化，可单测注入真实实例） */
     private final ObjectMapper objectMapper;
     /** 反向打款服务（PAY-105，gz-common；触发打款 + 重试，幂等内建） */
     private final IGzPayPayoutService payoutService;
-    /** 反向打款单 mapper（PAY-105，gz-common；paid 回写钩子按 out_payout_no 查 payout 终态） */
+    /** 反向打款单 mapper（PAY-105，gz-common；paid 回写钩子 + 转账段聚合按 out_payout_no 查 payout） */
     private final GzPayPayoutTransactionMapper payoutMapper;
     private final org.dromara.common.core.service.ConfigService configService;
 
-    /** final_amount 软上限：≤ 估价 × 倍数（sys_config gz.recycle.final_amount.max_ratio，默认 3） */
-    private static final String KEY_FINAL_MAX_RATIO = "gz.recycle.final_amount.max_ratio";
-    private static final int DEFAULT_FINAL_MAX_RATIO = 3;
     /** final_amount 绝对硬上限（分，sys_config gz.recycle.final_amount.max_cent，默认 100000 = ¥1000） */
     private static final String KEY_FINAL_MAX_CENT = "gz.recycle.final_amount.max_cent";
     private static final long DEFAULT_FINAL_MAX_CENT = 100000L;
-
-    @Override
-    public GzRecycleEstimateAllVO estimateAll(List<GzRecycleAppointmentSubmitBo.ProductLine> products) {
-        if (products == null || products.isEmpty()) {
-            throw new ServiceException("请至少填写一项回收物品");
-        }
-        GzRecycleEstimateAllVO result = new GzRecycleEstimateAllVO();
-        List<GzRecycleEstimateAllVO.EstimateLine> lines = new ArrayList<>(products.size());
-        long sumAmountCent = 0L;
-        int sumQty = 0;
-        int sumDuration = 0;
-        boolean hasUnpriced = false;
-
-        for (GzRecycleAppointmentSubmitBo.ProductLine p : products) {
-            GzRecycleEstimateAllVO.EstimateLine line = new GzRecycleEstimateAllVO.EstimateLine();
-            line.setCategory(p.getCategory());
-            line.setQty(p.getQty());
-            sumQty += (p.getQty() == null ? 0 : p.getQty());
-            try {
-                GzRecycleEstimateVO hit = priceRuleService.estimate(p.getCategory(), p.getQty());
-                line.setPriced(true);
-                line.setUnitPriceCent(hit.getUnitPriceCent());
-                line.setEstimatedAmountCent(hit.getEstimatedAmountCent());
-                line.setMatchedDurationMinutes(hit.getMatchedDurationMinutes());
-                sumAmountCent += hit.getEstimatedAmountCent();
-                sumDuration += (hit.getMatchedDurationMinutes() == null ? 0 : hit.getMatchedDurationMinutes());
-            }
-            catch (ServiceException e) {
-                // E1：该品类未命中价目区间 → 标记未估价，不阻断其余品类（doc/10 §13.E1）
-                line.setPriced(false);
-                hasUnpriced = true;
-                log.info("[gz-recycle] estimateAll unpriced category={} qty={} reason={}",
-                    p.getCategory(), p.getQty(), e.getMessage());
-            }
-            lines.add(line);
-        }
-
-        result.setLines(lines);
-        result.setTotalQty(sumQty);
-        result.setEstimatedAmountCent(sumAmountCent);
-        result.setMatchedDurationMinutes(sumDuration);
-        result.setHasUnpriced(hasUnpriced);
-        return result;
-    }
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -142,13 +110,29 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             throw new ServiceException("未登录");
         }
 
-        // ① submit_image_ids 必填二次校验（AC3 / doc/10 §13.E7，前端已先拦截，后端兜底）
-        List<Long> imageIds = bo.getSubmitImageIds();
-        if (imageIds == null || imageIds.isEmpty() || imageIds.stream().anyMatch(java.util.Objects::isNull)) {
+        // ① imageIds 必填二次校验（拍照前置声明 §5，前端已先拦截，后端兜底）
+        List<Long> imageIds = bo.getImageIds();
+        if (imageIds == null || imageIds.isEmpty() || imageIds.stream().anyMatch(Objects::isNull)) {
             throw new ServiceException(GzRecycleErrorCode.SUBMIT_IMAGE_REQUIRED_MSG, GzRecycleErrorCode.SUBMIT_IMAGE_REQUIRED);
         }
 
-        // ② 用户存在 + receiver_openid（E5，反向打款必需）+ 快照
+        // ② product 对象 + categories 非空（契约 §B.5 4108）
+        GzRecycleAppointmentSubmitBo.ProductBo product = bo.getProduct();
+        if (product == null || product.getCategories() == null
+            || product.getCategories().stream().filter(StrUtil::isNotBlank).findAny().isEmpty()) {
+            throw new ServiceException(GzRecycleErrorCode.CATEGORY_REQUIRED_MSG, GzRecycleErrorCode.CATEGORY_REQUIRED);
+        }
+
+        // ③ 数量桶命中启用桶（契约 §B.3/§B.5 4107）→ 取 duration_minutes + label 快照
+        GzRecycleQtyRangeVO bucket = qtyRangeService.getEnabledByCode(product.getQtyBucketCode());
+        if (bucket == null) {
+            throw new ServiceException(GzRecycleErrorCode.QTY_BUCKET_INVALID_MSG, GzRecycleErrorCode.QTY_BUCKET_INVALID);
+        }
+
+        // ④ 到店档 → slot_start/slot_end 映射（service 内固定，前端不传时间）
+        LocalTime[] slot = resolveArrivalSlot(bo.getArrivalSlot());
+
+        // ⑤ 用户存在 + receiver_openid（E5，反向打款必需）+ 快照
         GzUser user = gzUserMapper.selectById(userId);
         if (user == null) {
             throw new ServiceException("用户不存在");
@@ -157,34 +141,38 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             throw new ServiceException(GzRecycleErrorCode.OPENID_REQUIRED_MSG, GzRecycleErrorCode.OPENID_REQUIRED);
         }
 
-        // ③ 后端重算估价 + 时长 + total_qty 冻结（不信前端金额，doc/11 估价口径）
-        GzRecycleEstimateAllVO estimate = estimateAll(bo.getProducts());
+        // ⑥ IP 名快照（ipIds → join 取名 + customIps 并存）
+        List<String> ipNames = ipService.listNamesByIds(product.getIpIds());
 
-        // ④ 含未估价品类（E1）→ 整单不可提交（doc/10 §13.E1 / Q13.2 默认到店咨询）
-        if (Boolean.TRUE.equals(estimate.getHasUnpriced())) {
-            throw new ServiceException(GzRecycleErrorCode.HAS_UNPRICED_CATEGORY_MSG, GzRecycleErrorCode.HAS_UNPRICED_CATEGORY);
-        }
+        // ⑦ product_snapshot_json 落对象（categories/ipIds/ipNames/customIps/qtyBucketCode/qtyBucketLabel）
+        GzRecycleProductVO snapshot = new GzRecycleProductVO();
+        snapshot.setCategories(product.getCategories().stream().filter(StrUtil::isNotBlank).toList());
+        snapshot.setIpIds(product.getIpIds() == null ? List.of()
+            : product.getIpIds().stream().filter(Objects::nonNull).toList());
+        snapshot.setIpNames(ipNames);
+        snapshot.setCustomIps(product.getCustomIps() == null ? List.of()
+            : product.getCustomIps().stream().filter(StrUtil::isNotBlank).map(StrUtil::trim).toList());
+        snapshot.setQtyBucketCode(bucket.getCode());
+        snapshot.setQtyBucketLabel(bucket.getLabel());
+        String productJson = writeProductJson(snapshot);
 
-        // ⑤ product_snapshot_json（用户填的物品清单，JSON 列不散列，强约束 #12）
-        String productJson = writeProductJson(bo.getProducts());
+        // ⑧ imageIds 落库逗号分隔 image_id（不存裸 url，强约束 #5）
+        String imageIdsStr = StrUtil.join(",", imageIds);
 
-        // ⑥ submit_image_ids 落库逗号分隔 image_id（不存裸 url，强约束 #5）
-        String submitImageIdsStr = StrUtil.join(",", imageIds);
-
-        // ⑦ 生成业务码 + INSERT（status=submitted，估价 / 时长 / total_qty 冻结 + 快照）
+        // ⑨ 生成业务码 + INSERT（status=submitted；去估价：estimated/total_qty=null，时长=桶 duration）
         String appointmentNo = apptNoGenerator.generate();
         GzRecycleAppointment entity = GzRecycleAppointment.builder()
             .appointmentNo(appointmentNo)
             .userId(userId)
             .storeId(bo.getStoreId())
             .productSnapshotJson(productJson)
-            .totalQty(estimate.getTotalQty())
-            .matchedDurationMinutes(estimate.getMatchedDurationMinutes())
-            .estimatedAmountCent(estimate.getEstimatedAmountCent())
+            .totalQty(null)
+            .matchedDurationMinutes(bucket.getDurationMinutes())
+            .estimatedAmountCent(null)
             .apptDate(bo.getApptDate())
-            .slotStart(bo.getSlotStart())
-            .slotEnd(bo.getSlotEnd())
-            .submitImageIds(submitImageIdsStr)
+            .slotStart(slot[0])
+            .slotEnd(slot[1])
+            .submitImageIds(imageIdsStr)
             .receiverOpenid(user.getOpenid())
             .mobileSnapshot(user.getMobile())
             .wechatIdSnapshot(user.getWechatId())
@@ -194,11 +182,33 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             .build();
         baseMapper.insert(entity);
 
-        log.info("[gz-recycle] appointment SUBMIT no={} userId={} storeId={} totalQty={} estimatedAmountCent={} duration={} images={}",
-            appointmentNo, userId, bo.getStoreId(), estimate.getTotalQty(), estimate.getEstimatedAmountCent(),
-            estimate.getMatchedDurationMinutes(), imageIds.size());
+        log.info("[gz-recycle] appointment SUBMIT no={} userId={} storeId={} categories={} bucket={} duration={} images={}",
+            appointmentNo, userId, bo.getStoreId(), snapshot.getCategories(), bucket.getCode(),
+            bucket.getDurationMinutes(), imageIds.size());
 
         return toVO(entity);
+    }
+
+    /** 到店档 → [slot_start, slot_end] 映射（契约 §B.1，非法取值抛 4107 桶/档无效语义）。 */
+    private LocalTime[] resolveArrivalSlot(String arrivalSlot) {
+        if (ARRIVAL_MORNING.equals(arrivalSlot)) {
+            return new LocalTime[]{MORNING_START, MORNING_END};
+        }
+        if (ARRIVAL_AFTERNOON.equals(arrivalSlot)) {
+            return new LocalTime[]{AFTERNOON_START, AFTERNOON_END};
+        }
+        throw new ServiceException("到店时段无效，请选择早晨或下午");
+    }
+
+    /** 由 slot_start 反推到店档（详情 VO 回显；旧单非 10:00/13:00 起 → null）。 */
+    private String deriveArrivalSlot(LocalTime slotStart) {
+        if (MORNING_START.equals(slotStart)) {
+            return ARRIVAL_MORNING;
+        }
+        if (AFTERNOON_START.equals(slotStart)) {
+            return ARRIVAL_AFTERNOON;
+        }
+        return null;
     }
 
     @Override
@@ -250,9 +260,8 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         if (StrUtil.isBlank(appt.getReceiverOpenid())) {
             throw new ServiceException(GzRecycleErrorCode.PAYOUT_OPENID_MISSING_MSG, GzRecycleErrorCode.PAYOUT_OPENID_MISSING);
         }
-        // ②.5 final_amount 软上限（D16 P5，doc/11 §12.3 F12.2）：反向真打款不可逆，店员手输多打一位即真转出，
-        //   后端硬拦截 ≤ 估价×倍数 且 ≤ 绝对硬上限（均走 sys_config 可调）。估价缺失（≤0）只走绝对上限。
-        validateFinalAmount(bo.getFinalAmountCent(), appt.getEstimatedAmountCent());
+        // ②.5 final_amount 绝对硬上限（ADR-0012 §1）：去估价后仅留绝对上限防店员手输多打一位（真转出不可逆）。
+        validateFinalAmount(bo.getFinalAmountCent());
 
         // ③ submitted→confirmed_onsite + 核对留痕（verify_image_ids 逗号分隔不存裸 url；final_amount/verified_by/verify_time）
         String verifyImageIdsStr = StrUtil.join(",", bo.getVerifyImageIds());
@@ -301,24 +310,15 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
     }
 
     /**
-     * final_amount 资金上限软校验（D16 P5）：① ≤ 估价 × 倍数（估价 &gt; 0 才比，sys_config 可调，默认 3 倍）；
-     * ② ≤ 绝对硬上限（sys_config 可调，默认 ¥1000）。任一超限抛 {@link GzRecycleErrorCode#FINAL_AMOUNT_EXCEEDS_LIMIT}。
+     * final_amount 资金绝对硬上限校验（ADR-0012 §1）：去估价后<b>仅留绝对硬上限</b>（sys_config 可调，默认 ¥1000），
+     * 防店员手输多打一位即真转出（反向真打款不可逆）。超限抛 {@link GzRecycleErrorCode#FINAL_AMOUNT_EXCEEDS_LIMIT}。
      */
-    private void validateFinalAmount(Long finalAmountCent, Long estimatedAmountCent) {
+    private void validateFinalAmount(Long finalAmountCent) {
         long finalCent = finalAmountCent == null ? 0L : finalAmountCent;
         long absoluteCap = configLong(KEY_FINAL_MAX_CENT, DEFAULT_FINAL_MAX_CENT);
         if (finalCent > absoluteCap) {
             log.warn("[gz-recycle] final_amount {} 超绝对上限 {}（拦截）", finalCent, absoluteCap);
             throw new ServiceException(GzRecycleErrorCode.FINAL_AMOUNT_EXCEEDS_LIMIT_MSG, GzRecycleErrorCode.FINAL_AMOUNT_EXCEEDS_LIMIT);
-        }
-        long estimate = estimatedAmountCent == null ? 0L : estimatedAmountCent;
-        if (estimate > 0) {
-            int ratio = (int) configLong(KEY_FINAL_MAX_RATIO, DEFAULT_FINAL_MAX_RATIO);
-            long ratioCap = estimate * Math.max(1, ratio);
-            if (finalCent > ratioCap) {
-                log.warn("[gz-recycle] final_amount {} 超估价×{} 上限 {}（估价 {}，拦截）", finalCent, ratio, ratioCap, estimate);
-                throw new ServiceException(GzRecycleErrorCode.FINAL_AMOUNT_EXCEEDS_LIMIT_MSG, GzRecycleErrorCode.FINAL_AMOUNT_EXCEEDS_LIMIT);
-            }
         }
     }
 
@@ -380,7 +380,7 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
                 log.info("[gz-recycle] payout success → 回写 paid appointment_no={} out_payout_no={}",
                     appt.getAppointmentNo(), appt.getOutPayoutNo());
                 // doc/10 §13.N10：paid 发 CouponIssuanceEvent（event_type='recycle_paid'）。
-                // TODO(GZ-COUPON recycle-issuance): V1 仅留位钩子，发券策略待优惠券域接入；此处不强制发券。
+                // V1 仅留位钩子，发券策略待优惠券域接入；此处不强制发券（GZ-COUPON recycle-issuance 接入时补）。
                 return true;
             }
         } else if (PayoutStatus.FAILED.equals(payout.getStatus())) {
@@ -430,6 +430,65 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         });
     }
 
+    /* ===================== T6 到店核销码 ===================== */
+
+    @Override
+    public RecycleVerifyCodeVO getVerifyCode(Long id, Long userId) {
+        if (id == null || userId == null) {
+            throw new ServiceException(GzRecycleErrorCode.APPOINTMENT_NOT_FOUND_MSG, GzRecycleErrorCode.APPOINTMENT_NOT_FOUND);
+        }
+        GzRecycleAppointment appt = baseMapper.selectById(id);
+        if (appt == null || !userId.equals(appt.getUserId())) {
+            // 不存在 / 非本人统一按不存在处理（不泄露他人单存在性）
+            throw new ServiceException(GzRecycleErrorCode.APPOINTMENT_NOT_FOUND_MSG, GzRecycleErrorCode.APPOINTMENT_NOT_FOUND);
+        }
+        if (!STATUS_SUBMITTED.equals(appt.getStatus()) && !STATUS_CONFIRMED_ONSITE.equals(appt.getStatus())) {
+            throw new ServiceException(GzRecycleErrorCode.QR_NOT_AVAILABLE_MSG, GzRecycleErrorCode.QR_NOT_AVAILABLE);
+        }
+        long expireEpochSec = Instant.now().getEpochSecond() + qrSigner.getTtlSeconds();
+        String verifyCode = qrSigner.signRecycle(appt.getAppointmentNo(), appt.getId(), expireEpochSec);
+        RecycleVerifyCodeVO vo = new RecycleVerifyCodeVO();
+        vo.setQrPayload(qrSigner.buildRecyclePayload(appt.getAppointmentNo(), appt.getId(), expireEpochSec, verifyCode));
+        vo.setExpireEpochSec(expireEpochSec);
+        log.info("[gz-recycle] verify-code issued appointment_no={} expireEpochSec={}", appt.getAppointmentNo(), expireEpochSec);
+        return vo;
+    }
+
+    @Override
+    public GzRecycleAppointmentAdminVO verifyScan(GzRecycleVerifyScanBo bo) {
+        String payload = bo.getQrPayload() == null ? "" : bo.getQrPayload().trim();
+        // 拆 RC|no|id|exp|code
+        String[] seg = payload.split("\\|", -1);
+        if (seg.length != RecycleQrSigner.PAYLOAD_SEGMENTS || !RecycleQrSigner.PAYLOAD_PREFIX.equals(seg[0])) {
+            throw new ServiceException(GzRecycleErrorCode.QR_PAYLOAD_MALFORMED_MSG, GzRecycleErrorCode.QR_PAYLOAD_MALFORMED);
+        }
+        String appointmentNo = seg[1];
+        long appointmentId;
+        long expireEpochSec;
+        try {
+            appointmentId = Long.parseLong(seg[2]);
+            expireEpochSec = Long.parseLong(seg[3]);
+        } catch (NumberFormatException ex) {
+            throw new ServiceException(GzRecycleErrorCode.QR_PAYLOAD_MALFORMED_MSG, GzRecycleErrorCode.QR_PAYLOAD_MALFORMED);
+        }
+        String verifyCode = seg[4];
+        // 过期校验（token 自带过期，比 now）
+        if (expireEpochSec < Instant.now().getEpochSecond()) {
+            throw new ServiceException(GzRecycleErrorCode.QR_EXPIRED_MSG, GzRecycleErrorCode.QR_EXPIRED);
+        }
+        // 校签
+        if (!qrSigner.verifyRecycle(appointmentNo, appointmentId, expireEpochSec, verifyCode)) {
+            throw new ServiceException(GzRecycleErrorCode.QR_SIGNATURE_INVALID_MSG, GzRecycleErrorCode.QR_SIGNATURE_INVALID);
+        }
+        // 取单（核销不限本店，无门店隔离）
+        GzRecycleAppointment appt = baseMapper.selectById(appointmentId);
+        if (appt == null || !appointmentNo.equals(appt.getAppointmentNo())) {
+            throw new ServiceException(GzRecycleErrorCode.APPOINTMENT_NOT_FOUND_MSG, GzRecycleErrorCode.APPOINTMENT_NOT_FOUND);
+        }
+        log.info("[gz-recycle] verify-scan located appointment_no={} status={}", appt.getAppointmentNo(), appt.getStatus());
+        return toAdminVO(appt);
+    }
+
     /* ---------------- 内部辅助 ---------------- */
 
     private GzRecycleAppointmentAdminVO toAdminVO(GzRecycleAppointment e) {
@@ -438,14 +497,16 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         vo.setAppointmentNo(e.getAppointmentNo());
         vo.setUserId(e.getUserId());
         vo.setStoreId(e.getStoreId());
-        vo.setProducts(parseProducts(e.getProductSnapshotJson()));
+        vo.setStoreName(resolveStoreName(e.getStoreId()));
+        vo.setProduct(parseProducts(e.getProductSnapshotJson()));
         vo.setTotalQty(e.getTotalQty());
         vo.setMatchedDurationMinutes(e.getMatchedDurationMinutes());
         vo.setEstimatedAmountCent(e.getEstimatedAmountCent());
+        vo.setArrivalSlot(deriveArrivalSlot(e.getSlotStart()));
         vo.setApptDate(e.getApptDate());
         vo.setSlotStart(e.getSlotStart());
         vo.setSlotEnd(e.getSlotEnd());
-        vo.setSubmitImageIds(parseImageIds(e.getSubmitImageIds()));
+        vo.setImageIds(parseImageIds(e.getSubmitImageIds()));
         vo.setVerifyImageIds(parseImageIds(e.getVerifyImageIds()));
         vo.setFinalAmountCent(e.getFinalAmountCent());
         vo.setVerifiedBy(e.getVerifiedBy());
@@ -456,6 +517,8 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         vo.setStatus(e.getStatus());
         vo.setCreateTime(e.getCreateTime());
         vo.setRemark(e.getRemark());
+        // 转账段：用 out_payout_no 拉真实到账态（全量含 failReason）
+        fillPayoutSegmentAdmin(vo, e.getOutPayoutNo());
         return vo;
     }
 
@@ -465,45 +528,126 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         vo.setAppointmentNo(e.getAppointmentNo());
         vo.setUserId(e.getUserId());
         vo.setStoreId(e.getStoreId());
-        vo.setProducts(parseProducts(e.getProductSnapshotJson()));
-        vo.setTotalQty(e.getTotalQty());
+        vo.setStoreName(resolveStoreName(e.getStoreId()));
+        vo.setProduct(parseProducts(e.getProductSnapshotJson()));
         vo.setMatchedDurationMinutes(e.getMatchedDurationMinutes());
-        vo.setEstimatedAmountCent(e.getEstimatedAmountCent());
+        vo.setArrivalSlot(deriveArrivalSlot(e.getSlotStart()));
         vo.setApptDate(e.getApptDate());
         vo.setSlotStart(e.getSlotStart());
         vo.setSlotEnd(e.getSlotEnd());
-        vo.setSubmitImageIds(parseImageIds(e.getSubmitImageIds()));
+        vo.setImageIds(parseImageIds(e.getSubmitImageIds()));
         vo.setFinalAmountCent(e.getFinalAmountCent());
+        vo.setVerifyTime(e.getVerifyTime());
         vo.setStatus(e.getStatus());
         vo.setCreateTime(e.getCreateTime());
         vo.setRemark(e.getRemark());
+        // 转账段：顾客窄段（payoutStatus/transferredTime/payoutAmountCent，不露 outPayoutNo/failReason）
+        fillPayoutSegmentCustomer(vo, e.getOutPayoutNo());
         return vo;
     }
 
-    /** 序列化 product_snapshot_json（category/qty/ip/remark 全字段透传，与 SubmitBo.ProductLine 同构）。 */
-    private String writeProductJson(List<GzRecycleAppointmentSubmitBo.ProductLine> products) {
-        try {
-            return objectMapper.writeValueAsString(products);
+    /** 顾客窄转账段：拉 payout 真实到账态（不露内部单号 / 失败原因）。 */
+    private void fillPayoutSegmentCustomer(GzRecycleAppointmentVO vo, String outPayoutNo) {
+        if (StrUtil.isBlank(outPayoutNo)) {
+            return;
         }
-        catch (Exception ex) {
+        GzPayPayoutTransaction payout = payoutMapper.selectByOutPayoutNo(outPayoutNo);
+        if (payout == null) {
+            return;
+        }
+        vo.setPayoutStatus(payout.getStatus());
+        vo.setTransferredTime(payout.getTransferredTime());
+        vo.setPayoutAmountCent(payout.getAmountCent());
+    }
+
+    /** admin 全量转账段：拉 payout 真实到账态（含 failReason）。 */
+    private void fillPayoutSegmentAdmin(GzRecycleAppointmentAdminVO vo, String outPayoutNo) {
+        if (StrUtil.isBlank(outPayoutNo)) {
+            return;
+        }
+        GzPayPayoutTransaction payout = payoutMapper.selectByOutPayoutNo(outPayoutNo);
+        if (payout == null) {
+            return;
+        }
+        vo.setPayoutStatus(payout.getStatus());
+        vo.setTransferredTime(payout.getTransferredTime());
+        vo.setPayoutAmountCent(payout.getAmountCent());
+        vo.setFailReason(payout.getFailReason());
+    }
+
+    /** 查门店名（轻量原生 SQL，recycle 不依赖 gz-bean 实体；查不到返 null 不抛）。 */
+    private String resolveStoreName(Long storeId) {
+        if (storeId == null) {
+            return null;
+        }
+        try {
+            return baseMapper.selectStoreNameById(storeId);
+        } catch (Exception ex) {
+            log.warn("[gz-recycle] resolveStoreName 失败 storeId={}: {}", storeId, ex.getMessage());
+            return null;
+        }
+    }
+
+    /** 序列化 product_snapshot_json（单对象形态，ADR-0012 §2）。 */
+    private String writeProductJson(GzRecycleProductVO snapshot) {
+        try {
+            return objectMapper.writeValueAsString(snapshot);
+        } catch (Exception ex) {
             throw new ServiceException("回收物品序列化失败");
         }
     }
 
-    private List<GzRecycleAppointmentVO.ProductLineVO> parseProducts(String json) {
+    /**
+     * 反序列化 product_snapshot_json（ADR-0012 §2，<b>探测根节点</b>兼容旧数组数据，防线上历史详情崩）。
+     *
+     * <p>根是<b>对象</b> {@code {...}} → 新数据：直接反序列化为 {@link GzRecycleProductVO}。<br/>
+     * 根是<b>数组</b> {@code [...]} → 旧数据（V1.1 多明细 {@code [{category,qty,ip,remark}]}）：投影为单对象
+     * —— categories=去重各行 category / customIps=去重各行非空 ip（旧 IP 纯文本入自定义）/ qtyBucketCode/Label=null。<br/>
+     * 解析异常<b>不抛</b>（catch → 返回空对象 + log.warn）。</p>
+     */
+    private GzRecycleProductVO parseProducts(String json) {
         if (StrUtil.isBlank(json)) {
-            return List.of();
+            return new GzRecycleProductVO();
         }
         try {
-            List<GzRecycleAppointmentVO.ProductLineVO> list = objectMapper.readValue(
-                json, new TypeReference<List<GzRecycleAppointmentVO.ProductLineVO>>() {
-                });
-            return list == null ? List.of() : list;
-        }
-        catch (Exception ex) {
+            JsonNode root = objectMapper.readTree(json);
+            if (root.isObject()) {
+                GzRecycleProductVO vo = objectMapper.convertValue(root, GzRecycleProductVO.class);
+                return vo == null ? new GzRecycleProductVO() : vo;
+            }
+            if (root.isArray()) {
+                return projectLegacyArray(root);
+            }
+            log.warn("[gz-recycle] product_snapshot_json 根节点非对象/数组 json={}", json);
+            return new GzRecycleProductVO();
+        } catch (Exception ex) {
             log.warn("[gz-recycle] product_snapshot_json parse failed json={}", json, ex);
-            return List.of();
+            return new GzRecycleProductVO();
         }
+    }
+
+    /** 旧 JSON 数组（V1.1 多明细）投影为单对象 VO（categories/customIps 去重；桶字段留空）。 */
+    private GzRecycleProductVO projectLegacyArray(JsonNode arrayRoot) {
+        LinkedHashSet<String> categories = new LinkedHashSet<>();
+        LinkedHashSet<String> customIps = new LinkedHashSet<>();
+        for (JsonNode line : arrayRoot) {
+            JsonNode cat = line.get("category");
+            if (cat != null && !cat.isNull() && StrUtil.isNotBlank(cat.asText())) {
+                categories.add(cat.asText().trim());
+            }
+            JsonNode ip = line.get("ip");
+            if (ip != null && !ip.isNull() && StrUtil.isNotBlank(ip.asText())) {
+                customIps.add(ip.asText().trim());
+            }
+        }
+        GzRecycleProductVO vo = new GzRecycleProductVO();
+        vo.setCategories(new ArrayList<>(categories));
+        vo.setIpIds(List.of());
+        vo.setIpNames(List.of());
+        vo.setCustomIps(new ArrayList<>(customIps));
+        vo.setQtyBucketCode(null);
+        vo.setQtyBucketLabel(null);
+        return vo;
     }
 
     private List<Long> parseImageIds(String csv) {

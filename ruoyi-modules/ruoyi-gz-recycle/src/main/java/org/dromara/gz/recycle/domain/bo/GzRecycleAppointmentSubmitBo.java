@@ -1,7 +1,6 @@
 package org.dromara.gz.recycle.domain.bo;
 
 import jakarta.validation.Valid;
-import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
@@ -12,19 +11,25 @@ import org.springframework.format.annotation.DateTimeFormat;
 import java.io.Serial;
 import java.io.Serializable;
 import java.time.LocalDate;
-import java.time.LocalTime;
 import java.util.List;
 
 /**
- * mp 端回收预约提交参数（GZ-RECYCLE-002，doc/10 §13.N5 / doc/11 §12.2）。
+ * mp 端回收预约提交参数（ADR-0012 §2 / 契约 15a §B.1，去估价 + 单份多选）。
  *
  * <p>对应 {@code POST /app/gz/recycle/appointment/submit}。{@code userId} / openid / mobile / wechatId
- * 由 sa-token 拿当前用户后端快照，<b>不接受前端传入</b>（防伪造）。估价 / total_qty / matched_duration
- * 由后端按 {@code products} 各品类命中价目表区间累加冻结（前端实时估价仅展示，不信任前端传的金额）。</p>
+ * 由 sa-token 拿当前用户后端快照，<b>不接受前端传入</b>（防伪造）。</p>
  *
- * <p><b>AC3 钉死</b>：{@code submitImageIds} {@code @NotEmpty} — 用户提交时必须已上传实物照（与前端无照禁提交双重校验）。</p>
+ * <p><b>V1.2 模型变更</b>（ADR-0012）：</p>
+ * <ul>
+ *   <li>一次预约 = <b>单个物品对象</b> {@link ProductBo}（品类多选 + IP 多选 + 自定义 IP + 数量桶单选），取代旧
+ *       {@code List<ProductLine> products} 多明细。</li>
+ *   <li><b>去估价</b>：不传金额、后端不算金额；{@code estimated_amount_cent} 落 NULL，实际金额到店核对定。</li>
+ *   <li>数量桶 {@code product.qtyBucketCode} 单选驱动「预计回收时长」（命中 {@code gz_recycle_qty_range.duration_minutes}）。</li>
+ *   <li>到店档 {@code arrivalSlot}（morning/afternoon）service 内映射 slot_start/slot_end（前端不传时间）。</li>
+ *   <li>{@code imageIds}（旧 submitImageIds 改名）service 兜底必填（抛 4101）。</li>
+ * </ul>
  *
- * @author kevin-coder (sensenran-guzi · GZ-RECYCLE-002)
+ * @author kevin-coder (sensenran-guzi · GZ-RECYCLE-004/T4)
  */
 @Data
 public class GzRecycleAppointmentSubmitBo implements Serializable {
@@ -32,71 +37,70 @@ public class GzRecycleAppointmentSubmitBo implements Serializable {
     @Serial
     private static final long serialVersionUID = 1L;
 
-    /** 门店 ID（到店核对门店；V1.2 沿用拼豆口径仅成都一店） */
+    /** 门店 ID（到店核对门店；V1.2 多店放开，核销不限本店） */
     @NotNull(message = "门店不能为空")
     private Long storeId;
 
-    /** 回收物品清单（≥ 1 条，每条 品类×数量×可选备注） */
-    @NotEmpty(message = "请至少填写一项回收物品")
-    @Size(max = 20, message = "回收物品最多 20 项")
+    /** 单个回收物品对象（品类多选 + IP 多选 + 自定义 IP + 数量桶单选） */
+    @NotNull(message = "请填写回收物品信息")
     @Valid
-    private List<ProductLine> products;
+    private ProductBo product;
+
+    /** 整单备注（从旧 ProductLine 上提到单级，可空 ≤ 200） */
+    @Size(max = 200, message = "备注长度不能超过 200")
+    private String remark;
+
+    /**
+     * 用户提交时拍的实物照 file id 列表（FK gz_file_object，usage_type=recycle_submit_image）。
+     *
+     * <p><b>必填</b>（拍照前置声明 §5）：空/缺省由 service 层校验抛业务码 4101（{@code SUBMIT_IMAGE_REQUIRED}），
+     * 不在 BO 用 {@code @NotEmpty}（那会走全局校验返 code 500、与契约声明的 4101 分叉）。落库逗号分隔，不存裸 url（强约束 #5）。</p>
+     */
+    @Size(max = 6, message = "实物照最多 6 张")
+    private List<Long> imageIds;
 
     /** 预约到店日期（yyyy-MM-dd） */
     @NotNull(message = "请选择到店日期")
     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)
     private LocalDate apptDate;
 
-    /** 到店时段开始（HH:mm 或 HH:mm:ss） */
-    @NotNull(message = "请选择到店时段")
-    @DateTimeFormat(pattern = "HH:mm:ss")
-    private LocalTime slotStart;
-
-    /** 到店时段结束 */
-    @NotNull(message = "请选择到店时段")
-    @DateTimeFormat(pattern = "HH:mm:ss")
-    private LocalTime slotEnd;
-
     /**
-     * 用户提交时拍的实物照 file id 列表（FK gz_file_object，usage_type=recycle_submit_image）。
+     * 到店档（取代旧 slotStart/slotEnd 直传）：morning / afternoon。
      *
-     * <p><b>必填</b>（AC3 / doc/10 §13.N2.5/E7）：空/缺省由 service 层校验抛业务码 4101
-     * （{@code SUBMIT_IMAGE_REQUIRED}，与 api 契约一致），不在 BO 用 {@code @NotEmpty}（那会走全局校验返 code 500、
-     * 与契约声明的 4101 分叉，T3-001）。前端 form.vue 亦有 hasImages 前置 gate。落库逗号分隔，不存裸 url（强约束 #5）。</p>
+     * <p>service 内固定映射 slot_start/slot_end（morning 10:00-13:00 / afternoon 13:00-17:00），前端不传时间。
+     * 非法取值由 service 抛业务异常。</p>
      */
-    @Size(max = 6, message = "实物照最多 6 张")
-    private List<Long> submitImageIds;
+    @NotBlank(message = "请选择到店时段")
+    private String arrivalSlot;
+
+    /** 去重 token（可选） */
+    private String dedupClientToken;
 
     /**
-     * 回收物品行项（品类 + 数量 + 可选备注），序列化进 product_snapshot_json。
+     * 单个回收物品对象（去估价 + 多选；序列化进 product_snapshot_json 对象形态）。
      */
     @Data
-    public static class ProductLine implements Serializable {
+    public static class ProductBo implements Serializable {
 
         @Serial
         private static final long serialVersionUID = 1L;
 
-        /** 回收品类（字典 gz_recycle_category 值；估价命中价目表 category 维度） */
-        @NotBlank(message = "请选择回收品类")
-        @Size(max = 32, message = "品类长度不能超过 32")
-        private String category;
+        /** 回收品类<b>多选</b>（字典 gz_recycle_category value，≥ 1 项） */
+        @NotEmpty(message = "请至少选择一个回收品类")
+        @Size(max = 10, message = "回收品类最多 10 项")
+        private List<@Size(max = 32, message = "品类长度不能超过 32") String> categories;
 
-        /** 数量（≥ 1） */
-        @NotNull(message = "请填写数量")
-        @Min(value = 1, message = "数量至少为 1")
-        private Integer qty;
+        /** 选中的主数据 IP id（gz_recycle_ip.id，可空，与 customIps 并存） */
+        @Size(max = 20, message = "IP 最多选 20 个")
+        private List<Long> ipIds;
 
-        /**
-         * IP / 系列（可空，如 火影 / 海贼王）。前端文本输入或预设建议块选择，自由填写。
-         *
-         * <p>本轮纯透传：随 {@code products} 序列化进 product_snapshot_json 落库（store/admin 端可读）；
-         * 不建字典、不参与估价命中（估价仍只按 category 维度）。可空，长度 ≤ 32。</p>
-         */
-        @Size(max = 32, message = "IP 长度不能超过 32")
-        private String ip;
+        /** 用户自定义 IP 自由文本（不在列表的，可空，与 ipIds 并存） */
+        @Size(max = 10, message = "自定义 IP 最多 10 个")
+        private List<@Size(max = 32, message = "自定义 IP 长度不能超过 32") String> customIps;
 
-        /** 备注 / 描述（可空，≤ 200） */
-        @Size(max = 200, message = "备注长度不能超过 200")
-        private String remark;
+        /** 数量桶 code（gz_recycle_qty_range.code，单选，驱动预计回收时长） */
+        @NotBlank(message = "请选择数量区间")
+        @Size(max = 32, message = "数量桶编码长度不能超过 32")
+        private String qtyBucketCode;
     }
 }

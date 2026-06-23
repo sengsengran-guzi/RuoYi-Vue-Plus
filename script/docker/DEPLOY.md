@@ -30,6 +30,15 @@ openssl rand -base64 24    # 复制输出填入 REDIS_PASSWORD
 vim .env                   # 把 __CHANGE_ME__ 全部替换
 chmod 600 .env             # 限权限
 
+# 2.5) 微信支付 real 凭证（prod 必做，否则 ProdSecretGuard 拒绝启动）
+#   a. 在 .env 里把「微信支付 real 凭证」段填成本机 secrets/wechat-pay/gz-pay.env 的真实值
+#      （WECHAT_PAY_CLIENT_MODE=real + api-v3-key / public-key-id / notify-url 等；去掉 export 前缀）
+#   b. pem 文件不入 git，从本机 scp 整个目录到服务器 $REPO_DIR/secrets/wechat-pay/：
+#        scp -r secrets/wechat-pay root@<server>:/www/wwwroot/api.sensenran-guzi.com/secrets/
+#      （含 1731037015_*_cert/apiclient_key.pem、apiclient_cert.pem、pub_key.pem）
+#   c. 权限收紧：chmod 600 secrets/wechat-pay/**/*.pem
+#   注：pem 在容器内路径由 compose 写死（/app/secrets/wechat-pay/...），不在 .env 配；secrets/ 被 gitignore，git reset --hard 不会删它
+
 # 3) 构建并启动（首次 ≈ 5-10 分钟，下依赖 + 编译）
 docker compose --env-file .env -f script/docker/docker-compose.deploy.yml up -d --build
 
@@ -176,6 +185,7 @@ docker compose --env-file .env -f script/docker/docker-compose.deploy.yml up -d 
 
 ## 7. 不在此处的事
 
-- 微信支付 / 微信小程序登录 → admin 配 `sys_config`
+- 微信支付 real 凭证 / 微信小程序 AppID·Secret → 走 `.env` 环境变量（见 §1 步骤 2.5 / .env.example），**不在** admin `sys_config`
+- 业务侧支付开关 / 文案类 → admin 配 `sys_config`
 - 客服配置 → admin 配 customer-service-config（GZ-SYS-004）
 - 短信网关 → 业务代码后续扩展

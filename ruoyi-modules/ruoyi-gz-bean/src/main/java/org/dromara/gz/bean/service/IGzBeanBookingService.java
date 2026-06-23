@@ -3,25 +3,22 @@ package org.dromara.gz.bean.service;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingQueryBo;
-import org.dromara.gz.bean.domain.bo.GzBeanBookingSubmitBo;
 import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
-import org.dromara.gz.bean.domain.vo.GzBeanBookingMpSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
 import org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanStaffOverviewVO;
 import org.dromara.gz.bean.domain.vo.GzBeanTypeSlotAvailabilityVO;
 
 import java.time.LocalDate;
-import java.time.LocalTime;
 import java.util.List;
 
 /**
- * 拼豆预约服务（GZ-BEAN-004）。
+ * 拼豆预约服务（GZ-BEAN-004 / GZ-BEAN-017）。
  *
  * <p>核心方法：</p>
  * <ul>
- *   <li>{@link #submit} — mp 端提交预约（三层防并发 + 核销码生成）</li>
- *   <li>{@link #selectOccupiedSeatIds} — mp /availability 端点查占用座位（接力 BEAN-003 留位）</li>
+ *   <li>{@link #submitPaid} — mp 端付费区间预约下单（逐格防超卖 + 计费 + 建支付单，GZ-BEAN-017）</li>
+ *   <li>{@link #selectTypeSlotAvailability} — mp 选座余量（按 1h 整点格，只给 full 不给数字）</li>
  *   <li>{@link #verify} — admin 核销（status pending → used）</li>
  *   <li>{@link #cancel} — 取消预约（mp 用户 / admin 代操作）</li>
  *   <li>{@link #selectMyMpList} — mp 端"我的预约"列表</li>
@@ -30,7 +27,7 @@ import java.util.List;
  *   <li>{@link #markNoShowBatch} — 凌晨 2 点 cron 批量标 no_show（GZ-BEAN-009）</li>
  * </ul>
  *
- * @author kevin-coder (sensenran-guzi · GZ-BEAN-004 / GZ-BEAN-009)
+ * @author kevin-coder (sensenran-guzi · GZ-BEAN-004 / GZ-BEAN-009 / GZ-BEAN-017)
  */
 public interface IGzBeanBookingService {
 
@@ -66,36 +63,6 @@ public interface IGzBeanBookingService {
      */
     record NoShowMarkResult(int scanned, int marked, int skipped, int failed) {
     }
-
-    /**
-     * mp 端提交预约（doc/10 §3.N7）。
-     *
-     * <p>三层防并发：</p>
-     * <ol>
-     *   <li>Redis 锁 1：{@code bean_user_submit:{userId}}（TTL 5s）— 防同用户连点</li>
-     *   <li>Redis 锁 2：{@code bean_seat:{storeId}:{seatId}:{sessDate}:{slotStart}}（TTL 5s）— 防同座位抢占</li>
-     *   <li>DB UNIQUE：{@code uk_dedup_tenant_store_dedup} — 兜底</li>
-     * </ol>
-     *
-     * <p>校验顺序：</p>
-     * <ol>
-     *   <li>用户手机号已绑定（gz_user.mobile 非空，未绑 → NeedPhoneException）</li>
-     *   <li>应用层：同用户同时段同店无其他 pending 预约</li>
-     *   <li>INSERT booking with status='pending'（撞 UNIQUE → SeatTakenException）</li>
-     *   <li>生成 verifyCode + qrPayload</li>
-     *   <li>INSERT booking_log</li>
-     * </ol>
-     *
-     * @param bo     提交参数
-     * @param userId 当前登录 user_id（sa-token 拿）
-     * @return 提交成功 VO（含 verifyCode + qrPayload）
-     */
-    GzBeanBookingMpSubmitVO submit(GzBeanBookingSubmitBo bo, Long userId);
-
-    /**
-     * 查指定门店 × 日期 × 时段已占用的 seat_id 列表（mp /availability 端点）。
-     */
-    List<Long> selectOccupiedSeatIds(Long storeId, LocalDate sessDate, LocalTime slotStart);
 
     /**
      * admin 手动核销预约（status pending → used，doc/10 §3.N11）。
@@ -181,40 +148,42 @@ public interface IGzBeanBookingService {
     TableDataInfo<GzBeanBookingVO> selectPageList(GzBeanBookingQueryBo query, PageQuery pageQuery);
 
     // ============================================================
-    //  GZ-BEAN-014 V1.2 付费模型（ADR-0007 / ADR-0008 / doc/10 §11 / doc/11 §3.5-3.8）
+    //  GZ-BEAN-017 V1.2 付费区间模型（ADR-0011 / doc/15a §A，取代 ADR-0007/0008 单笔单时段）
     // ============================================================
 
     /**
-     * mp 端付费预约下单事务（GZ-BEAN-014 AC 2/3/5，doc/10 §11.N7）。
+     * mp 端付费<b>区间</b>预约下单事务（GZ-BEAN-017，ADR-0011 / doc/15a §A.2）。
      *
-     * <p><b>单笔单时段</b>：建<b>一行</b> booking = 1 用户 × 1 门店 × 1 座位类型 × 1 时段。
-     * {@code amount_cent} = 该座位类型单价 snapshot（无累加无子表）。</p>
+     * <p><b>1h 区间连续多选</b>：建<b>一行</b> booking = 1 用户 × 1 门店 × 1 座位类型 × 1 个连续 1h 区间
+     * （{@code slotStart..slotEnd} 跨 N 连续 1h 格）。{@code amount_cent} = 单价 × N（连续小时数，ADR-0011 §4）。</p>
      *
-     * <p><b>下单事务（防超卖 + 付费前置）</b>：</p>
+     * <p><b>下单事务（连续性 + 逐格防超卖 + 付费前置）</b>：</p>
      * <ol>
      *   <li>校验手机号 + 微信号已采集（doc/10 §11.N6）</li>
      *   <li>校验座位类型配置存在 + 启用（拿单价 + quantity）</li>
-     *   <li>幂等：同用户同 (类型,日期,时段) 已有活跃 booking → 返回原单（doc/10 §11 Q11.3）</li>
-     *   <li><b>配额 COUNT(活跃) FOR UPDATE</b> 比对 quantity，满则拒单回滚（AC 3）</li>
-     *   <li>INSERT 一行 booking（status=pending）：实付&gt;0 → pay_status=paying + 建 pindou 支付单；
-     *       免费单（单价=0 无券）→ pay_status=paid + 生成 verify_code（兜底，ADR-0007 §1.4）</li>
+     *   <li><b>区间连续性校验</b>：区间内每格整点 + 落在启用窗口、物理相邻、午休 gap 不可跨窗口 → 否则 SLOT_RANGE_INVALID（ADR-0011 §5）</li>
+     *   <li>幂等：同用户同 (类型,日期) 已有与本区间重叠的活跃 booking → 拒单（doc/10 §11 Q11.3）</li>
+     *   <li><b>逐格 COUNT(覆盖该格的活跃) FOR UPDATE</b> 比对 quantity（每格独立占 1 配额，按格升序加锁防死锁），任一格满整笔回滚（ADR-0011 §3）</li>
+     *   <li>INSERT 一行区间 booking（status=pending）：实付&gt;0 → pay_status=paying + 建 pindou 支付单；
+     *       免费单（单价×N − 券 ≤ 0）→ pay_status=paid + 生成 verify_code（兜底，ADR-0007 §1.4）</li>
      * </ol>
      *
-     * @param bo     付费下单参数（storeId / seatType / sessDate / slot / couponId?）
+     * @param bo     付费下单参数（storeId / seatType / sessDate / slotStart..slotEnd 区间 / couponId?）
      * @param userId 当前登录 user_id（sa-token 拿）
-     * @return 提交结果（含实付 + 支付五参 / 免费单标记）
+     * @return 提交结果（含实付 = 单价×N − 券 + 支付五参 / 免费单标记）
      */
     GzBeanPaidSubmitVO submitPaid(GzBeanPaidBookingSubmitBo bo, Long userId);
 
     /**
-     * mp 选座余量查询（GZ-BEAN-014 AC 4，doc/10 §11.N3/N4 + doc/11 §3.6）。
+     * mp 选座余量查询（GZ-BEAN-017，ADR-0011 / doc/15a §A.1）。
      *
-     * <p>对某门店某日各 {@code (启用座位类型 × 启用时段)} 组合返回余量 =
-     * {@code quantity − 活跃 booking 计数}（N&gt;0 还剩 N / N≤0 已满）。供 mp 选座实时显余量。</p>
+     * <p>把该日各启用营业窗口按 1h 切成整点格，对某门店某日各 {@code (启用座位类型 × 1h 格)} 返回是否已满
+     * （内部 {@code quantity − 覆盖该格的活跃计数 ≤ 0} → full）。<b>不向 mp 暴露余量数字</b>，只给 {@code full}
+     * 布尔（doc/15a §A.1 铁律）。午休那格不生成。</p>
      *
      * @param storeId  门店 ID
      * @param sessDate 预约日期
-     * @return 各 (类型,时段) 余量列表（按 sortNo / slot 升序）
+     * @return 各 (类型, 1h 格) 可约状态列表（按 sortNo / 格起整点 升序）
      */
     List<GzBeanTypeSlotAvailabilityVO> selectTypeSlotAvailability(Long storeId, LocalDate sessDate);
 

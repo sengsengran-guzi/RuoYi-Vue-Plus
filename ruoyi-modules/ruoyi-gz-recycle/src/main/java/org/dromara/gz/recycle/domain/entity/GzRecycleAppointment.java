@@ -63,16 +63,19 @@ public class GzRecycleAppointment extends TenantEntity {
     /** FK → gz_bean_store.id（到店核对门店；V1.2 沿用拼豆口径仅成都一店） */
     private Long storeId;
 
-    /** 用户填的回收物品快照 JSON（[{category, qty, remark?}, ...]）；JSON 列不散列 */
+    /**
+     * 用户填的回收物品快照 JSON（ADR-0012 §2 <b>单对象</b> {categories,ipIds,ipNames,customIps,qtyBucketCode,qtyBucketLabel}）；
+     * JSON 列不散列。旧 V1.1 数据为数组 [{category,qty,ip,remark}]，parseProducts 探测根节点兼容读。
+     */
     private String productSnapshotJson;
 
-    /** 总件数 = Σ 各品类数量（估价命中价目表区间维度） */
+    /** 总件数：旧单 = Σ 各品类数量；新单 null（ADR-0012 §3 数量桶无精确件数） */
     private Integer totalQty;
 
-    /** 提交冻结的匹配时长（分钟）= Σ 各品类命中 duration_minutes（多品类核对累计时长口径，见 service estimateAll） */
+    /** 预计回收时长（分钟）：新单 = 命中数量桶 duration_minutes；旧单 = Σ 历史命中时长（ADR-0012 §3） */
     private Integer matchedDurationMinutes;
 
-    /** 自动估价金额（分）= Σ 各品类(命中 unit_price_cent × 该品类数量)；提交时冻结 */
+    /** 自动估价金额（分）：旧单历史值；新单 null（ADR-0012 §1 去估价） */
     private Long estimatedAmountCent;
 
     /** 预约到店日期 */

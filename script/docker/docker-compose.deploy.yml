@@ -107,8 +107,26 @@ services:
       # 拼豆核销码 HMAC 签名密钥（GZ-BEAN-004）— prod 必填，否则 ProdSecretGuard fail-fast 拒绝启动。
       # 生成：openssl rand -base64 32
       GZ_BEAN_QR_SECRET: ${GZ_BEAN_QR_SECRET:?GZ_BEAN_QR_SECRET is required（核销码 HMAC 密钥，≥32 随机字符，生成 openssl rand -base64 32）}
+      # 微信支付 real 凭证（GZ-PAY-001）— prod 必须 real，否则 ProdSecretGuard + WechatPayV3ClientImpl 双重 fail-fast。
+      # 机密值从部署机 $REPO_DIR/.env 注入（compose --env-file .env 读取，见 .env.example 微信支付段）。
+      # pem 文件不入 git，需手动放到 $REPO_DIR/secrets/wechat-pay/（见下方只读卷）。
+      # ⚠️ 不要让 WECHAT_PAY_CLIENT_MODE 落回 mock —— prod 下零验签回调可被伪造刷单。
+      WECHAT_PAY_CLIENT_MODE: ${WECHAT_PAY_CLIENT_MODE:-mock}
+      WECHAT_PAY_APPID: ${WECHAT_PAY_APPID:-}
+      WECHAT_PAY_MCH_ID: ${WECHAT_PAY_MCH_ID:-}
+      WECHAT_PAY_API_V3_KEY: ${WECHAT_PAY_API_V3_KEY:-}
+      WECHAT_PAY_CERT_SERIAL: ${WECHAT_PAY_CERT_SERIAL:-}
+      WECHAT_PAY_PUBLIC_KEY_ID: ${WECHAT_PAY_PUBLIC_KEY_ID:-}
+      WECHAT_PAY_NOTIFY_URL: ${WECHAT_PAY_NOTIFY_URL:-}
+      WECHAT_PAY_REFUND_NOTIFY_URL: ${WECHAT_PAY_REFUND_NOTIFY_URL:-}
+      # pem 路径固定为容器内挂载点（覆盖 gz-pay.env 里的 macOS host 绝对路径）；对应下方只读卷。
+      WECHAT_PAY_PRIVATE_KEY_PATH: /app/secrets/wechat-pay/1731037015_20260622_cert/apiclient_key.pem
+      WECHAT_PAY_CERT_PATH: /app/secrets/wechat-pay/1731037015_20260622_cert/apiclient_cert.pem
+      WECHAT_PAY_PUBLIC_KEY_PATH: /app/secrets/wechat-pay/pub_key.pem
     volumes:
       - ../../logs:/app/logs
+      # 微信支付 pem 证书（apiclient_key/cert + 微信支付公钥）只读挂载；部署机需把 secrets/wechat-pay/ 同布局放到仓库根下。
+      - ../../secrets/wechat-pay:/app/secrets/wechat-pay:ro
     healthcheck:
       # liveness probe（只检查进程存活，不连下游服务，比 /actuator/health 健壮）
       # Spring Boot 3.x 默认开启 liveness/readiness probe

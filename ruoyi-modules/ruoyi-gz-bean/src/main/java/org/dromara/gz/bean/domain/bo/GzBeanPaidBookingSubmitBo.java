@@ -11,14 +11,16 @@ import java.time.LocalDate;
 import java.time.LocalTime;
 
 /**
- * mp 端付费预约提交参数（GZ-BEAN-014，V1.2 单笔单时段）。
+ * mp 端付费预约提交参数（GZ-BEAN-017，V1.2 1h 区间连续多选）。
  *
- * <p>对应 {@code POST /app/gz/bean/booking/paid-submit}。一笔 = 1 座位类型 + 1 时段（无 units 数组，
- * 无累加）。{@code userId} / {@code openid} 由 sa-token 拿，不接受前端传入。</p>
+ * <p>对应 {@code POST /app/gz/bean/booking/paid-submit}。一笔 = 1 座位类型 + 1 个连续 1h 区间
+ * （{@code slotStart..slotEnd} 跨 N = (slotEnd − slotStart) 小时 个连续 1h 格，如 10:00..13:00 = 3 格）。
+ * 字段名 / 数量不变（仍是单 {@code slotStart}/{@code slotEnd}），仅语义从「1 个命名时段」变为「N 连续 1h 格区间」。
+ * {@code userId} / {@code openid} 由 sa-token 拿，不接受前端传入。</p>
  *
- * <p>权威：doc/10 §11.N7 / doc/11 §3.5 / ADR-0007 / ADR-0008。</p>
+ * <p>权威：doc/15a §A.2 / ADR-0011（取代 ADR-0007/0008 的单笔单时段口径）。</p>
  *
- * @author kevin-coder (sensenran-guzi · GZ-BEAN-014)
+ * @author kevin-coder (sensenran-guzi · GZ-BEAN-017)
  */
 @Data
 public class GzBeanPaidBookingSubmitBo implements Serializable {
@@ -39,12 +41,12 @@ public class GzBeanPaidBookingSubmitBo implements Serializable {
     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)
     private LocalDate sessDate;
 
-    /** 时段开始时间（HH:mm 或 HH:mm:ss） */
+    /** 区间起（整点，含；HH:mm 或 HH:mm:ss） */
     @NotNull
     @DateTimeFormat(pattern = "HH:mm:ss")
     private LocalTime slotStart;
 
-    /** 时段结束时间 */
+    /** 区间止（整点，不含；= 最后一个 1h 格的 end） */
     @NotNull
     @DateTimeFormat(pattern = "HH:mm:ss")
     private LocalTime slotEnd;

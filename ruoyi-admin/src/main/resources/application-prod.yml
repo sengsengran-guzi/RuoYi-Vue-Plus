@@ -273,7 +273,7 @@ justauth:
 --- # 微信小程序登录配置（GZ-SYS-002）— prod 由 env var 注入真实 AppID/Secret
 wx:
   miniapp:
-    appid: ${WX_MA_APPID:wxMOCK}          # prod 部署前由甲方提供，CI/CD env var 注入；缺省 wxMOCK 不报错
+    appid: ${WX_MA_APPID:wx2f8b93e09703f07d}   # 谷子宇宙小程序 AppID（非机密，已绑商户 1731037015）；env var 可覆盖
     secret: ${WX_MA_SECRET:}
     session-key-ttl-seconds: ${WX_MA_SESSION_KEY_TTL:86400}
     # 业务 token TTL（秒），30 天（ADR-0009 登录态长效；失效由 mp 静默 wx.login 续期）
@@ -284,16 +284,19 @@ gz:
   bean:
     qr:
       signing-secret: ${GZ_BEAN_QR_SECRET:CHANGE_ME_BEFORE_PROD_DEPLOY}
-  # 微信支付通道（GZ-PAY-001）— 商户号下证前先保持 mock；下证 + Kevin 核对主体后改 client-mode=real。
-  # 强约束 #4：apiV3Key / 商户私钥不入 git，全部走 env var；空缺时 real profile @PostConstruct fail-fast。
+  # 微信支付通道（GZ-PAY-001）— 商户 1731037015 为「微信支付公钥」模式（RSAPublicKeyConfig）。
+  # 非机密（appid / mch-id / serial / public-key-id）可入 git；机密（api-v3-key / 私钥）只走 env var，空缺时 real fail-fast（强约束 #4）。
   pay:
     client-mode: ${WECHAT_PAY_CLIENT_MODE:mock}
-    appid: ${WECHAT_PAY_APPID:CHANGE_ME_BEFORE_PROD_DEPLOY}
-    mch-id: ${WECHAT_PAY_MCH_ID:1731037015}   # 成都谷子宇宙贸易有限公司 · 谷子宇宙；非机密可入 git，仍允许 env var 覆盖
+    appid: ${WECHAT_PAY_APPID:wx2f8b93e09703f07d}
+    mch-id: ${WECHAT_PAY_MCH_ID:1731037015}   # 成都谷子宇宙贸易有限公司 · 谷子宇宙
     api-v3-key: ${WECHAT_PAY_API_V3_KEY:}
-    mch-cert-serial: ${WECHAT_PAY_CERT_SERIAL:}
+    mch-cert-serial: ${WECHAT_PAY_CERT_SERIAL:7226DDBCDF20307DC285256E52370A855C89C0AD}
     private-key-path: ${WECHAT_PAY_PRIVATE_KEY_PATH:}
     cert-path: ${WECHAT_PAY_CERT_PATH:}
+    public-key-path: ${WECHAT_PAY_PUBLIC_KEY_PATH:}   # 微信支付公钥 pem，甲方商户平台-API安全下载
+    public-key-id: ${WECHAT_PAY_PUBLIC_KEY_ID:}       # PUB_KEY_ID_xxxxx，同页可见
     notify-url: ${WECHAT_PAY_NOTIFY_URL:}
+    refund-notify-url: ${WECHAT_PAY_REFUND_NOTIFY_URL:}
     test:
       amount-cent: 1

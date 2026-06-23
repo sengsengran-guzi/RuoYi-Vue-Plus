@@ -5,45 +5,36 @@ import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleAppointmentQueryBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleAppointmentSubmitBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyBo;
+import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyScanBo;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentAdminVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentVO;
-import org.dromara.gz.recycle.domain.vo.GzRecycleEstimateAllVO;
+import org.dromara.gz.recycle.domain.vo.RecycleVerifyCodeVO;
 
 import java.util.List;
 
 /**
- * 回收预约单服务（GZ-RECYCLE-002，doc/10 §13 / doc/11 §12.2）。
+ * 回收预约单服务（ADR-0012，去估价 + 单份多选 + 桶→时长 + 核销码 + 聚合详情）。
  *
- * <p>本卡 mp 端能力：① 多品类实时累加估价（试算，不落库）；② 提交回收预约（落 status=submitted，
- * 估价 / 时长 / 快照冻结）；③ 我的回收记录列表 / 详情（只读壳）。confirmed_onsite 起的店员核对 +
- * 触发反向打款在 GZ-RECYCLE-003。</p>
+ * <p>mp 端能力：① 提交回收预约（单份多选，落 status=submitted，去估价，桶→预计时长）；② 我的回收记录列表 /
+ * 详情（顾客窄 VO 三段，含真实到账态）；③ 到店核销码取码（顾客）/ 扫码核对（店员）。confirmed_onsite 起的
+ * 店员核对 + 触发反向打款保留（GZ-RECYCLE-003）。</p>
  *
- * @author kevin-coder (sensenran-guzi · GZ-RECYCLE-002)
+ * @author kevin-coder (sensenran-guzi · GZ-RECYCLE-004)
  */
 public interface IGzRecycleAppointmentService {
 
     /**
-     * 多品类累加估价试算（doc/11 F12.1，mp 填单实时展示，不落库）。
+     * 提交回收预约（ADR-0012 §2，去估价 + 单份多选，落 status=submitted）。
      *
-     * <p>对每条 {@code (category, qty)} 调价目表单品类 estimate 后累加：
-     * {@code estimatedAmountCent = Σ}、{@code totalQty = Σ qty}、{@code matchedDurationMinutes = Σ 命中时长}。
-     * 某品类未命中区间（E1）→ 该行 priced=false 不阻断其余；hasUnpriced=true 时整单不可提交。</p>
-     *
-     * @param products 物品清单（品类 + 数量）
-     * @return 累加估价结果 + 逐品类明细
-     */
-    GzRecycleEstimateAllVO estimateAll(List<GzRecycleAppointmentSubmitBo.ProductLine> products);
-
-    /**
-     * 提交回收预约（doc/10 §13.N5，落 status=submitted）。
-     *
-     * <p>事务内：① 校验用户存在 + receiver_openid（E5）；② 后端重算估价 + 时长 + total_qty 冻结（不信前端金额）；
-     * ③ 含未估价品类（E1）拒收；④ submit_image_ids 必填二次校验（AC3，E7）；⑤ snapshot openid/mobile/wechatId；
-     * ⑥ 生成 appointment_no（RCY-）+ INSERT。</p>
+     * <p>事务内：① imageIds 必填二次校验（抛 4101）；② categories 非空（抛 4108）；③ 校验用户存在 +
+     * receiver_openid（E5，抛 4103）；④ qtyBucketCode 命中启用桶（抛 4107）→ 取 durationMinutes 落
+     * matched_duration_minutes，label 进 snapshot；⑤ ipIds → join 取 ipNames 快照（+ customIps 并存）；
+     * ⑥ arrivalSlot → slot_start/slot_end 映射；⑦ product_snapshot_json 落<b>对象</b>；
+     * ⑧ estimated_amount_cent/total_qty 置 null（去估价/无精确件数）；⑨ 生成 appointment_no（RCY-）+ INSERT。</p>
      *
      * @param bo     提交参数
      * @param userId 当前登录用户 id（sa-token 拿，不接受前端传）
-     * @return 提交结果 VO（含 appointmentNo + 冻结估价）
+     * @return 提交结果顾客窄 VO（含 appointmentNo / status=submitted，无金额估价）
      */
     GzRecycleAppointmentVO submit(GzRecycleAppointmentSubmitBo bo, Long userId);
 
@@ -133,4 +124,29 @@ public interface IGzRecycleAppointmentService {
      * @return 本轮标记 no_show 的单数
      */
     int markExpiredNoShow();
+
+    /* ===================== T6 到店核销码（契约 15a §F） ===================== */
+
+    /**
+     * 取到店核销码（GZ-RECYCLE-004/T6，契约 §F.2，仅本人）。
+     *
+     * <p>校验本人 + status ∈ {submitted, confirmed_onsite}（否则抛 4109 QR_NOT_AVAILABLE）→ 即时签发
+     * （expireEpochSec = now + TTL，不持久化）→ 返 qrPayload + expireEpochSec。</p>
+     *
+     * @param id     预约单主键
+     * @param userId 当前登录用户 id（越权校验，非本人 → 4104）
+     * @return 核销码 VO
+     */
+    RecycleVerifyCodeVO getVerifyCode(Long id, Long userId);
+
+    /**
+     * 店员扫码核对定位（GZ-RECYCLE-004/T6，契约 §F.3，核销不限本店）。
+     *
+     * <p>拆 {@code RC|no|id|exp|code} → 格式校验（4110）→ 过期校验（4111）→ 校签（4112）→ 取单（4104）→ 返全量
+     * AdminVO（店员据此进 staff-verify 核对，无门店隔离）。</p>
+     *
+     * @param bo 扫码参数（qrPayload）
+     * @return 定位到的全量 AdminVO
+     */
+    GzRecycleAppointmentAdminVO verifyScan(GzRecycleVerifyScanBo bo);
 }

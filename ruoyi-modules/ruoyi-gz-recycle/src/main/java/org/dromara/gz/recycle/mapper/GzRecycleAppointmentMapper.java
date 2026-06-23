@@ -38,6 +38,18 @@ public interface GzRecycleAppointmentMapper extends BaseMapperPlus<GzRecycleAppo
     long selectMaxDailySeq(@Param("prefixDate") String prefixDate);
 
     /**
+     * 按门店 id 查门店名（详情 VO 顾客可见门店名，契约 15a §E.1）。
+     *
+     * <p>跨表轻量查 {@code gz_bean_store.name}（recycle 模块不依赖 gz-bean 实体 → 走原生 SQL 仅取名字段，
+     * 避免引入跨模块依赖）。tenant_id 由 {@code TenantLineInnerInterceptor} 自动 append；门店不存在返 null。</p>
+     *
+     * @param storeId 门店 id
+     * @return 门店名（无则 null）
+     */
+    @Select("SELECT name FROM gz_bean_store WHERE id = #{storeId} AND del_flag = '0' LIMIT 1")
+    String selectStoreNameById(@Param("storeId") Long storeId);
+
+    /**
      * 店员核对确认：submitted → confirmed_onsite（GZ-RECYCLE-003 AC1，doc/10 §13.N8）。
      *
      * <p>原子写入核对留痕（verify_image_ids / final_amount_cent / verified_by / verify_time）+ 推进状态 + version+1。

@@ -12,6 +12,7 @@ import org.dromara.common.satoken.utils.LoginHelper;
 import org.dromara.gz.common.domain.dto.MpStaffPermission;
 import org.dromara.gz.common.service.IMpStaffPermissionService;
 import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyBo;
+import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyScanBo;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentAdminVO;
 import org.dromara.gz.recycle.service.IGzRecycleAppointmentService;
 import org.springframework.validation.annotation.Validated;
@@ -91,6 +92,33 @@ public class GzRecycleStaffMpController {
             bo.getAppointmentId(), bo.getFinalAmountCent(), verifiedBy,
             bo.getVerifyImageIds() == null ? 0 : bo.getVerifyImageIds().size());
         return R.ok(appointmentService.verifyAndPayout(bo, verifiedBy));
+    }
+
+    /**
+     * 店员扫核销码定位预约（契约 §F.3，核销不限本店）。
+     *
+     * <pre>
+     * POST /app/gz/recycle/staff/verify-scan
+     * Body: { qrPayload:"RC|RCY-...|123|1750...|abcd..." }
+     * 200 OK { code:200, data: { appointmentNo, status, product, ... } }  // 全量 AdminVO，店员据此进核对
+     *
+     * 业务错误（R.code）：
+     *   4110 QR_PAYLOAD_MALFORMED   → 「核销码格式无法识别」
+     *   4111 QR_EXPIRED             → 「核销码已过期」
+     *   4112 QR_SIGNATURE_INVALID   → 「核销码无效或已被篡改」
+     *   4104 APPOINTMENT_NOT_FOUND  → 「回收预约单不存在」
+     * </pre>
+     */
+    @SaCheckPermission("gz:recycle:appointment:verify")
+    @Log(title = "回收核销扫码定位(mp店员)", businessType = BusinessType.OTHER)
+    @PostMapping("/verify-scan")
+    public R<GzRecycleAppointmentAdminVO> verifyScan(@Valid @RequestBody GzRecycleVerifyScanBo bo) {
+        Long userId = LoginHelper.getUserId();
+        if (userId == null) {
+            return R.fail(401, "未登录");
+        }
+        log.info("[recycle-staff] verify-scan userId={}", userId);
+        return R.ok(appointmentService.verifyScan(bo));
     }
 
     /** 取核对店员显示名（绑定 sys_user nick_name；兜底 mp username）。 */

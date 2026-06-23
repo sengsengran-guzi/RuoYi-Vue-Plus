@@ -10,13 +10,16 @@ import org.dromara.gz.common.pay.enums.PayoutStatus;
 import org.dromara.gz.common.pay.mapper.GzPayPayoutTransactionMapper;
 import org.dromara.gz.common.pay.service.IGzPayPayoutService;
 import org.dromara.gz.common.pay.service.IGzPayPayoutService.InitiateBo;
+import org.dromara.gz.recycle.config.GzRecycleQrProperties;
 import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyBo;
 import org.dromara.gz.recycle.domain.entity.GzRecycleAppointment;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentAdminVO;
 import org.dromara.gz.recycle.exception.GzRecycleErrorCode;
 import org.dromara.gz.recycle.mapper.GzRecycleAppointmentMapper;
-import org.dromara.gz.recycle.service.IGzRecyclePriceRuleService;
+import org.dromara.gz.recycle.service.IGzRecycleIpService;
+import org.dromara.gz.recycle.service.IGzRecycleQtyRangeService;
 import org.dromara.gz.recycle.service.internal.RecycleApptNoGenerator;
+import org.dromara.gz.recycle.service.internal.RecycleQrSigner;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -69,11 +72,13 @@ class GzRecycleVerifyPayoutTest {
     @Mock
     private GzRecycleAppointmentMapper baseMapper;
     @Mock
-    private IGzRecyclePriceRuleService priceRuleService;
-    @Mock
     private GzUserMapper gzUserMapper;
     @Mock
     private RecycleApptNoGenerator apptNoGenerator;
+    @Mock
+    private IGzRecycleQtyRangeService qtyRangeService;
+    @Mock
+    private IGzRecycleIpService ipService;
     @Mock
     private IGzPayPayoutService payoutService;
     @Mock
@@ -85,10 +90,10 @@ class GzRecycleVerifyPayoutTest {
 
     @BeforeEach
     void setUp() {
-        // configService 未 stub → getConfigValue 返 null → final_amount 校验走默认（×3 / ¥1000），
-        // 现有 verifyAndPayout 测试金额（≤ 估价 5000×3）均放行。
+        // configService 未 stub → getConfigValue 返 null → final_amount 校验走默认绝对硬上限 ¥1000（ADR-0012 去估价×倍数档）。
         service = new GzRecycleAppointmentServiceImpl(
-            baseMapper, priceRuleService, gzUserMapper, apptNoGenerator, new ObjectMapper(),
+            baseMapper, gzUserMapper, apptNoGenerator, qtyRangeService, ipService,
+            new RecycleQrSigner(new GzRecycleQrProperties()), new ObjectMapper(),
             payoutService, payoutMapper, configService);
     }
 
@@ -181,17 +186,38 @@ class GzRecycleVerifyPayoutTest {
     }
 
     @Test
-    @DisplayName("D16 P5 final_amount 超估价×3 上限 → FINAL_AMOUNT_EXCEEDS_LIMIT 拦截、不核对不打款")
-    void verify_finalAmountExceedsLimit_rejected() {
-        GzRecycleAppointment appt = submittedAppt(7009L, 0); // estimated=5000 → 软上限 15000
+    @DisplayName("ADR-0012 final_amount 超绝对硬上限(¥1000) → FINAL_AMOUNT_EXCEEDS_LIMIT 拦截、不核对不打款（去估价×倍数档）")
+    void verify_finalAmountExceedsAbsoluteCap_rejected() {
+        GzRecycleAppointment appt = submittedAppt(7009L, 0);
         when(baseMapper.selectById(7009L)).thenReturn(appt);
 
+        // 默认绝对上限 100000 分（¥1000）；店员手输多打一位 200000 > 100000 → 拦截（不再看估价×倍数）
         ServiceException ex = assertThrows(ServiceException.class,
-            () -> service.verifyAndPayout(verifyBo(7009L, 20000L, 91L), "店员A")); // 多打一位 20000 > 15000
+            () -> service.verifyAndPayout(verifyBo(7009L, 200000L, 91L), "店员A"));
         assertEquals(GzRecycleErrorCode.FINAL_AMOUNT_EXCEEDS_LIMIT, ex.getCode());
         // 资金安全：超限即拦截，不核对、不触发真打款
         verify(baseMapper, never()).markConfirmedOnsite(anyLong(), anyInt(), anyString(), anyLong(), anyString(), any());
         verify(payoutService, never()).initiatePayout(any(InitiateBo.class));
+    }
+
+    @Test
+    @DisplayName("ADR-0012 去估价×倍数档：final_amount 远超旧『估价×3』(15000) 但 ≤ 绝对上限 → 放行（不再因倍数拦截）")
+    void verify_finalAmountAboveOldRatioCapButUnderAbsolute_passes() {
+        GzRecycleAppointment appt = submittedAppt(7012L, 0); // estimated=5000，旧倍数档=15000
+        when(baseMapper.selectById(7012L)).thenReturn(appt);
+        when(baseMapper.markConfirmedOnsite(eq(7012L), eq(0), anyString(), eq(30000L), anyString(), any()))
+            .thenReturn(1);
+        when(payoutService.initiatePayout(any(InitiateBo.class)))
+            .thenReturn(payoutVo("PAYOUT-20260623-000012", PayoutStatus.PROCESSING));
+        lenient().when(baseMapper.markPaying(anyLong(), anyInt(), anyString())).thenReturn(1);
+        GzRecycleAppointment after = submittedAppt(7012L, 2);
+        after.setStatus("paying");
+        when(baseMapper.selectById(7012L)).thenReturn(appt, after);
+
+        // 30000（¥300）> 旧倍数档 15000，但 ≤ 绝对上限 100000 → 放行（去估价后倍数档已删）
+        service.verifyAndPayout(verifyBo(7012L, 30000L, 91L), "店员A");
+        verify(baseMapper).markConfirmedOnsite(eq(7012L), eq(0), anyString(), eq(30000L), anyString(), any());
+        verify(payoutService).initiatePayout(any(InitiateBo.class));
     }
 
     @Test

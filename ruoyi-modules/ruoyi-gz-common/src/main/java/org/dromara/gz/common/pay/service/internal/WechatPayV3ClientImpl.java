@@ -1,7 +1,7 @@
 package org.dromara.gz.common.pay.service.internal;
 
 import com.wechat.pay.java.core.Config;
-import com.wechat.pay.java.core.RSAAutoCertificateConfig;
+import com.wechat.pay.java.core.RSAPublicKeyConfig;
 import com.wechat.pay.java.core.exception.ValidationException;
 import com.wechat.pay.java.core.notification.NotificationConfig;
 import com.wechat.pay.java.core.notification.NotificationParser;
@@ -32,13 +32,13 @@ import java.time.LocalDate;
 /**
  * 微信支付 V3 通道真实实现（GZ-PAY-001 AC 9，官方 SDK wechatpay-java，决策 D1）。
  *
- * <p><b>何时生效</b>：{@code gz.pay.client.mode=real}（商户号下证后 staging/prod）。
- * dev / 单测走 {@link MockWechatPayClient}，本类不被实例化 —— 故 SDK 真实证书未配时不会启动报错。</p>
+ * <p><b>何时生效</b>：{@code gz.pay.client.mode=real}（staging/prod）。
+ * dev / 单测走 {@link MockWechatPayClient}，本类不被实例化 —— 故真实凭证未配时不会启动报错。</p>
  *
- * <p><b>降级现状（2026-06-01）</b>：商户号申请中（5/29 启动，5-10 工作日），未下证 →
- * 本类已实现但<b>未做真实端到端联调</b>。真实 0.01 元单在 buffer 期补打（ADR-0003）。
- * staging/prod 切 real profile 前需注入 env var（WECHAT_PAY_MCH_ID / API_V3_KEY / PRIVATE_KEY_PATH /
- * CERT_SERIAL / NOTIFY_URL）。</p>
+ * <p><b>加密模式</b>：商户（1731037015 成都谷子宇宙贸易有限公司）为微信支付<b>公钥模式</b>，
+ * 用 {@link RSAPublicKeyConfig}（非平台证书自动下载模式）。需注入 6 项：mchId / apiV3Key /
+ * privateKeyPath / mchCertSerial / publicKeyPath（微信支付公钥 pem）/ publicKeyId（PUB_KEY_ID_*）。
+ * 机密项（apiV3Key / 私钥）走 env var 不入 git（强约束 #4）。</p>
  *
  * <p><b>验签</b>（AC 6）：{@link NotificationParser#parse} 验 Wechatpay-Signature 头 + AES-GCM
  * 解密，失败 throw SDK {@link ValidationException} → 本类转 {@link WechatPayVerifyException}
@@ -60,20 +60,24 @@ public class WechatPayV3ClientImpl implements IWechatPayClient {
     private NotificationParser notificationParser;
 
     /**
-     * 初始化 SDK（用 RSAAutoCertificateConfig 自动下载/轮换微信平台证书）。
+     * 初始化 SDK（用 {@link RSAPublicKeyConfig} 微信支付公钥模式：响应验签用微信支付公钥，不下载平台证书）。
      *
      * <p>real profile 启动时构建；缺失关键配置直接 fail-fast（避免 prod 半初始化裸奔）。</p>
      */
     @PostConstruct
     public void init() {
-        if (props.getMchId() == null || props.getApiV3Key() == null || props.getPrivateKeyPath() == null) {
+        if (props.getMchId() == null || props.getApiV3Key() == null || props.getPrivateKeyPath() == null
+            || props.getPublicKeyPath() == null || props.getPublicKeyId() == null) {
             throw new IllegalStateException(
-                "gz.pay.client-mode=real 但商户配置不全（mchId / apiV3Key / privateKeyPath），" +
-                "请注入 env var（WECHAT_PAY_MCH_ID / WECHAT_PAY_API_V3_KEY / WECHAT_PAY_PRIVATE_KEY_PATH）");
+                "gz.pay.client-mode=real 但商户配置不全（mchId / apiV3Key / privateKeyPath / publicKeyPath / publicKeyId），" +
+                "请注入 env var（WECHAT_PAY_MCH_ID / WECHAT_PAY_API_V3_KEY / WECHAT_PAY_PRIVATE_KEY_PATH / " +
+                "WECHAT_PAY_PUBLIC_KEY_PATH / WECHAT_PAY_PUBLIC_KEY_ID）");
         }
-        this.config = new RSAAutoCertificateConfig.Builder()
+        this.config = new RSAPublicKeyConfig.Builder()
             .merchantId(props.getMchId())
             .privateKeyFromPath(props.getPrivateKeyPath())
+            .publicKeyFromPath(props.getPublicKeyPath())
+            .publicKeyId(props.getPublicKeyId())
             .merchantSerialNumber(props.getMchCertSerial())
             .apiV3Key(props.getApiV3Key())
             .build();
