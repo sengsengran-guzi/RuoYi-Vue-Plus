@@ -65,12 +65,12 @@ public class GzGachaMachineMpController {
     }
 
     /**
-     * 单机详情 + 概率公示（GZ-GACHA-103 AC1，doc/10 §8.N2/N3）。
+     * 单机详情 — 产品列表（GZ-GACHA-103 AC1，doc/10 §8.N2，ADR-0013 去概率）。
      *
      * <pre>
      * GET /app/gz/gacha/machine/{id}/detail
-     *   返回机器主体 + 该机器全部奖品（含售罄 / disabled，决策 D2 不后端过滤）+ 每条 normalizedProbability
-     *   （service 层算并返回，前端不重算；与开盒事务 GACHA-104 同口径 — ProbabilityNormalizer 同 Bean）。
+     *   返回机器主体 + 该机器全部奖品（含售罄 / disabled，决策 D2 不后端过滤）。
+     *   <b>ADR-0013（甲方拍板）：不展示任何概率百分比</b> —— 奖品名/图/参考价取产品库（join），稀有度取投放线。
      *   不限机器 status（详情可看非在售机器）；机器不存在 → R.fail(MACHINE_NOT_FOUND)。匿名可读（@SaIgnore）。
      *
      * 200 OK
@@ -81,9 +81,8 @@ public class GzGachaMachineMpController {
      *     "tenPackPriceCent":9000,"status":"on_shelf","stockRemainSum":42,
      *     "prizes":[
      *       { "id":"2001","name":"SSR 限定","imageUrl":"https://...","rarity":"SSR",
-     *         "normalizedProbability":12.34,"stockRemain":5,"referenceValueCent":29900,"enabled":1 },
-     *       { "id":"2002","name":"已抽完款","rarity":"R","normalizedProbability":null,
-     *         "stockRemain":0,"enabled":1 }
+     *         "stockRemain":5,"referenceValueCent":29900,"enabled":1 },
+     *       { "id":"2002","name":"已抽完款","rarity":"R","stockRemain":0,"enabled":1 }
      *     ]
      *   }
      * }
@@ -92,7 +91,7 @@ public class GzGachaMachineMpController {
      * <p>路由 {@code id} 是 string 机器主键（跨层契约 #1，非 machine_no）；Spring 自动 parse Long。</p>
      *
      * @param id 机器主键（路由 path）
-     * @return 机器详情 + 奖品池 + 实时归一化概率
+     * @return 机器详情 + 产品列表（无概率字段）
      */
     @GetMapping("/{id}/detail")
     public R<GzGachaMachineDetailVo> getDetail(@PathVariable("id") Long id) {

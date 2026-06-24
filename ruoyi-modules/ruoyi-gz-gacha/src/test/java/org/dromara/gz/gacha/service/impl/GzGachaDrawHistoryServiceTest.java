@@ -18,6 +18,7 @@ import org.dromara.gz.gacha.mapper.GzGachaMachineMapper;
 import org.dromara.gz.gacha.mapper.GzGachaOrderMapper;
 import org.dromara.gz.gacha.mapper.GzGachaPrizeMapper;
 import org.dromara.gz.gacha.mapper.GzUserGachaCollectionMapper;
+import org.dromara.gz.gacha.service.IGzGachaProductService;
 import org.dromara.gz.gacha.service.internal.GachaDrawIntentStore;
 import org.dromara.gz.gacha.service.internal.GachaMachineAutoOffService;
 import org.dromara.gz.gacha.service.internal.ProbabilityNormalizer;
@@ -78,6 +79,7 @@ class GzGachaDrawHistoryServiceTest {
     @Mock private IGzPayTransactionService payTransactionService;
     @Mock private IGzUserService userService;
     @Mock private IGzFileService fileService;
+    @Mock private IGzGachaProductService productService;
     @Mock private GachaMachineAutoOffService autoOffService;
     @Mock private GachaDrawIntentStore drawIntentStore;
 
@@ -92,7 +94,7 @@ class GzGachaDrawHistoryServiceTest {
         service = new GzGachaDrawServiceImpl(
             machineMapper, prizeMapper, drawMapper, orderMapper, collectionMapper,
             new ProbabilityNormalizer(), new SecureRandomDrawer(),
-            payTransactionService, userService, fileService, autoOffService, drawIntentStore,
+            payTransactionService, userService, fileService, productService, autoOffService, drawIntentStore,
             new ObjectMapper(), null);
     }
 

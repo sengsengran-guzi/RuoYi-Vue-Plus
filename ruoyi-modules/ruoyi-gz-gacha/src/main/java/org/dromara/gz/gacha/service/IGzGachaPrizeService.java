@@ -58,13 +58,14 @@ public interface IGzGachaPrizeService {
     long countByMachineId(Long machineId);
 
     /**
-     * 某机器全部奖品 entity（GZ-GACHA-103 mp 详情概率公示）。
+     * 某机器全部奖品 entity（mp 详情产品列表 + 抽奖归一化用）。
      *
      * <p>口径：该机器全部未软删奖品（<b>含售罄 / disabled</b>，决策 D2 不后端过滤 —— 前端灰显「已抽完」/
      * 「不参与」）。返回 entity（含 weight / stockRemain / enabled，供 {@code ProbabilityNormalizer.normalizeToPercent}
-     * 按入池子集归一化）。排序 {@code create_time ASC, id ASC}（稳定顺序，前端再按概率降序展示）。</p>
+     * 按入池子集归一化，仅后台抽奖事务用，不对 C 端公示概率 —— ADR-0013）。排序 {@code create_time ASC, id ASC}
+     * （稳定顺序，mp 端再按稀有度档位展示）。</p>
      *
-     * <p><b>只读</b>（非 FOR UPDATE）：概率公示是展示场景，与开盒事务的 {@code selectInPoolForUpdate} 锁行无关；
+     * <p><b>只读</b>（非 FOR UPDATE）：展示场景，与开盒事务的 {@code selectInPoolForUpdate} 锁行无关；
      * 但入池判定共用 {@code ProbabilityNormalizer.isInPool} 同谓词，口径一致。</p>
      *
      * @param machineId 机器主键

@@ -64,6 +64,14 @@ public final class GzGachaErrorCode {
     public static final int DRAW_FORBIDDEN = 8011;
     public static final String DRAW_FORBIDDEN_MSG = "无权查看该开盒记录";
 
+    /** 投放产品非法（ADR-0013）：产品不存在 / 已停用 / 跨租户 → 拒绝投放。 */
+    public static final int PRODUCT_INVALID = 8012;
+    public static final String PRODUCT_INVALID_MSG = "投放产品无效或已停用";
+
+    /** 同机同产品重复投放（ADR-0013 uk_gacha_prize_machine_product）：该产品已在本机奖品池。 */
+    public static final int PRODUCT_ALREADY_IN_MACHINE = 8013;
+    public static final String PRODUCT_ALREADY_IN_MACHINE_MSG = "该产品已在本机奖品池，请直接编辑已有投放线";
+
     private GzGachaErrorCode() {
     }
 }

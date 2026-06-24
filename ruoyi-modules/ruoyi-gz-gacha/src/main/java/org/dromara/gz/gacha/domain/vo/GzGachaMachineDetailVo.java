@@ -13,7 +13,8 @@ import java.util.List;
  * mp 单机详情展示对象（GZ-GACHA-103 AC1）。
  *
  * <p>字段口径权威：doc/11 §7.1（机器主体）+ §7.2（奖品池）。机器主体 + 全部奖品（含售罄 / disabled，
- * 决策 D2 不后端过滤）+ 每条 {@code normalizedProbability}（service 层算并返回，前端不重算）。</p>
+ * 决策 D2 不后端过滤）。<b>ADR-0013 去概率</b>：mp 详情不展示任何概率百分比（甲方拍板），奖品名/图/参考价
+ * 取产品库（join），稀有度取投放线。</p>
  *
  * <p>跨层契约（CLAUDE.md #1）：{@code id} 用 {@link ToStringSerializer} 转 string；金额 {@code *_cent}
  * 分单位（前端 /100 显示元）。<b>不暴露 machine_no / version / del_flag</b> 等内部字段。封面不暴露裸
@@ -64,8 +65,8 @@ public class GzGachaMachineDetailVo implements Serializable {
     private Long stockRemainSum;
 
     /**
-     * 全部奖品（含售罄 / disabled，决策 D2）。每条含 {@code normalizedProbability}
-     * （入池实时归一化百分比 / 不在池为 null）。前端按概率降序 + 售罄排末尾展示。
+     * 全部奖品（含售罄 / disabled，决策 D2）。<b>ADR-0013 去概率</b>：每条 = 产品图/名/参考价 + 投放线稀有度，
+     * 无概率字段。后端按稀有度档位（SSR&gt;SR&gt;R&gt;N）+ create_time 排序，前端直接渲染。
      */
     private List<GzGachaPrizeDetailVo> prizes;
 }

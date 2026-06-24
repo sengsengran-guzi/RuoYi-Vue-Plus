@@ -13,12 +13,14 @@ import org.dromara.gz.gacha.domain.entity.GzGachaDraw;
 import org.dromara.gz.gacha.domain.entity.GzGachaMachine;
 import org.dromara.gz.gacha.domain.entity.GzGachaOrder;
 import org.dromara.gz.gacha.domain.entity.GzGachaPrize;
+import org.dromara.gz.gacha.domain.entity.GzGachaProduct;
 import org.dromara.gz.gacha.exception.GzGachaErrorCode;
 import org.dromara.gz.gacha.mapper.GzGachaDrawMapper;
 import org.dromara.gz.gacha.mapper.GzGachaMachineMapper;
 import org.dromara.gz.gacha.mapper.GzGachaOrderMapper;
 import org.dromara.gz.gacha.mapper.GzGachaPrizeMapper;
 import org.dromara.gz.gacha.mapper.GzUserGachaCollectionMapper;
+import org.dromara.gz.gacha.service.IGzGachaProductService;
 import org.dromara.gz.gacha.service.internal.GachaDrawIntentStore;
 import org.dromara.gz.gacha.service.internal.GachaMachineAutoOffService;
 import org.dromara.gz.gacha.service.internal.ProbabilityNormalizer;
@@ -81,6 +83,7 @@ class GzGachaDrawServiceImplTest {
     @Mock private IGzPayTransactionService payTransactionService;
     @Mock private IGzUserService userService;
     @Mock private IGzFileService fileService;
+    @Mock private IGzGachaProductService productService;
     @Mock private GachaMachineAutoOffService autoOffService;
     @Mock private GachaDrawIntentStore drawIntentStore;
 
@@ -98,7 +101,8 @@ class GzGachaDrawServiceImplTest {
         // selfProvider 单测不用（直接调 runDrawTransaction 同步事务核心，绕过 @Async 派发壳）→ 传 null
         service = new GzGachaDrawServiceImpl(
             machineMapper, prizeMapper, drawMapper, orderMapper, collectionMapper,
-            normalizer, drawer, payTransactionService, userService, fileService, autoOffService, drawIntentStore,
+            normalizer, drawer, payTransactionService, userService, fileService, productService,
+            autoOffService, drawIntentStore,
             new ObjectMapper(), null);
     }
 
@@ -155,6 +159,7 @@ class GzGachaDrawServiceImplTest {
     @DisplayName("happy path：出 1 件 → stock-1+version+1 + draw 落 + collection +1 + order pending_ship，4 表一致")
     void executeDraw_happyPath_fourTablesConsistent() {
         stubContext();
+        stubProductForAnyWon();
         GzGachaPrize p1 = prize(11L, "N", 70, 5, 0, "1001");
         GzGachaPrize p2 = prize(12L, "SSR", 1, 1, 0, "1001");
         when(prizeMapper.selectInPoolForUpdate(MACHINE_ID)).thenReturn(List.of(p1, p2));
@@ -198,6 +203,7 @@ class GzGachaDrawServiceImplTest {
     @DisplayName("并发扣减失败 → 重抽改派：第 1 件 affected=0、第 2 件 affected=1 → 出另一件 + draw/order 正常 + 无退款")
     void executeDraw_deductFailThenReroll_noRefund() {
         stubContext();
+        stubProductForAnyWon();
         // 候选 2 件；先抽到的那件扣减失败，移出后抽到另一件成功
         GzGachaPrize p1 = prize(11L, "SSR", 1, 1, 7, "1001");
         GzGachaPrize p2 = prize(12L, "N", 1, 9, 3, "1001");
@@ -225,6 +231,7 @@ class GzGachaDrawServiceImplTest {
     @DisplayName("乐观锁竞争边界：候选 2 件，确定性抽中第 1 件 affected=0 移出 → 第 2 件 affected=1 出第 2 件")
     void executeDraw_optimisticBoundary_secondPrizeWins() {
         stubContext();
+        stubProductForAnyWon();
         GzGachaPrize p1 = prize(11L, "SSR", 100, 1, 0, "1001"); // 权重 100，首抽几乎必中
         GzGachaPrize p2 = prize(12L, "N", 1, 9, 0, "1001");
         when(prizeMapper.selectInPoolForUpdate(MACHINE_ID)).thenReturn(List.of(p1, p2));
@@ -383,21 +390,40 @@ class GzGachaDrawServiceImplTest {
         return m;
     }
 
+    /**
+     * 投放线 fixture（ADR-0013：名/图/参考价在产品库；线只存 productId/rarity/weight/库存）。
+     * productId 约定 = 3000 + id；refValueCent 落在对应产品（由 stubProduct 造）。
+     */
     private GzGachaPrize prize(Long id, String rarity, int weight, int stockRemain, long refValueCent, String tenantId) {
         GzGachaPrize p = new GzGachaPrize();
         p.setId(id);
         p.setMachineId(MACHINE_ID);
+        p.setProductId(3000L + id);
         p.setPrizeNo("PRZ-20260617-" + String.format("%06d", id));
-        p.setName("奖品" + id);
         p.setRarity(rarity);
         p.setWeight(weight);
         p.setStockRemain(stockRemain);
         p.setVersion(0);
         p.setEnabled(1);
-        p.setReferenceValueCent(refValueCent > 0 ? refValueCent : null);
-        p.setImageId(8000L + id);
         p.setTenantId(tenantId);
         return p;
+    }
+
+    /**
+     * 桩产品库：任意 productId（3000+prizeId）→ 产品（名「产品」+ productId，图 8000+productId，参考价 12900）。
+     * 快照 name/image/refValue 取产品（ADR-0013）。
+     */
+    private void stubProductForAnyWon() {
+        lenient().when(productService.getById(anyLong())).thenAnswer(inv -> {
+            Long pid = inv.getArgument(0);
+            GzGachaProduct product = new GzGachaProduct();
+            product.setId(pid);
+            product.setName("产品" + pid);
+            product.setImageId(8000L + pid);
+            product.setReferenceValueCent(12900L);
+            product.setEnabled(1);
+            return product;
+        });
     }
 
     /**

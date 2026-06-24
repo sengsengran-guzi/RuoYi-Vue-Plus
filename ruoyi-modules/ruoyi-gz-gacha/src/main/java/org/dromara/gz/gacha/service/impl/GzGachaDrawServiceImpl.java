@@ -23,6 +23,7 @@ import org.dromara.gz.gacha.domain.entity.GzGachaDraw;
 import org.dromara.gz.gacha.domain.entity.GzGachaMachine;
 import org.dromara.gz.gacha.domain.entity.GzGachaOrder;
 import org.dromara.gz.gacha.domain.entity.GzGachaPrize;
+import org.dromara.gz.gacha.domain.entity.GzGachaProduct;
 import org.dromara.gz.gacha.domain.vo.GachaStartDrawVo;
 import org.dromara.gz.gacha.domain.vo.GzGachaDrawHistoryVo;
 import org.dromara.gz.gacha.domain.vo.GzGachaDrawMachineFilterVo;
@@ -36,6 +37,7 @@ import org.dromara.gz.gacha.mapper.GzGachaOrderMapper;
 import org.dromara.gz.gacha.mapper.GzGachaPrizeMapper;
 import org.dromara.gz.gacha.mapper.GzUserGachaCollectionMapper;
 import org.dromara.gz.gacha.service.IGzGachaDrawService;
+import org.dromara.gz.gacha.service.IGzGachaProductService;
 import org.dromara.gz.gacha.service.internal.ProbabilityNormalizer;
 import org.dromara.gz.gacha.service.internal.ProbabilityNormalizer.NormalizeResult;
 import org.dromara.gz.gacha.service.internal.SecureRandomDrawer;
@@ -86,6 +88,8 @@ public class GzGachaDrawServiceImpl implements IGzGachaDrawService {
     private final IGzUserService userService;
     /** 揭晓图片签名 URL 解析（GACHA-105：snapshot.imageId → 可访问 URL；NULL / 失败 → 占位，同 gz-ord 口径） */
     private final IGzFileService fileService;
+    /** 产品库（ADR-0013：快照名/图/参考价取产品，rarity 取投放线） */
+    private final IGzGachaProductService productService;
     /** 整机售罄 auto_off（独立 Bean，after-commit 跨 Bean 调用使 REQUIRES_NEW 真生效，AC7） */
     private final org.dromara.gz.gacha.service.internal.GachaMachineAutoOffService autoOffService;
     /** 开盒意图存储（封 RedisUtils 静态，便于单测 mock；out_trade_no → machineId，TTL 30min） */
@@ -218,8 +222,10 @@ public class GzGachaDrawServiceImpl implements IGzGachaDrawService {
 
         // 加载机器（snapshot 用）
         GzGachaMachine machine = machineMapper.selectById(ctx.machineId());
+        // 加载获得物产品（ADR-0013：快照名/图/参考价取产品；产品被删/取不到 → 字段留空，rarity 仍取线）
+        GzGachaProduct wonProduct = productService.getById(won.getProductId());
         String machineSnapshot = writeJson(buildMachineSnapshot(machine));
-        String prizeSnapshot = writeJson(buildPrizeSnapshot(won));
+        String prizeSnapshot = writeJson(buildPrizeSnapshot(won, wonProduct));
         LocalDateTime drawnTime = ctx.paidTime() != null ? ctx.paidTime() : LocalDateTime.now();
 
         // 步骤 4 — INSERT gz_gacha_draw（draw_no + 获得物 + snapshot + 幂等 pay_transaction_id）
@@ -494,14 +500,19 @@ public class GzGachaDrawServiceImpl implements IGzGachaDrawService {
             .build();
     }
 
-    private GachaSnapshot.Prize buildPrizeSnapshot(GzGachaPrize p) {
+    /**
+     * 获得物快照（ADR-0013）：name / imageId / referenceValueCent 取产品库（固有属性），rarity 取投放线
+     * （按机器可调）。产品被删 / 取不到（理论：开盒瞬间产品仍在）→ 名/图/参考价留空，rarity 仍落 —— 快照隔离
+     * 历史，落库后不再受改表影响。
+     */
+    private GachaSnapshot.Prize buildPrizeSnapshot(GzGachaPrize p, GzGachaProduct product) {
         return GachaSnapshot.Prize.builder()
             .prizeId(String.valueOf(p.getId()))
             .prizeNo(p.getPrizeNo())
-            .name(p.getName())
-            .imageId(p.getImageId() == null ? null : String.valueOf(p.getImageId()))
+            .name(product == null ? null : product.getName())
+            .imageId(product == null || product.getImageId() == null ? null : String.valueOf(product.getImageId()))
             .rarity(p.getRarity())
-            .referenceValueCent(p.getReferenceValueCent())
+            .referenceValueCent(product == null ? null : product.getReferenceValueCent())
             .build();
     }
 

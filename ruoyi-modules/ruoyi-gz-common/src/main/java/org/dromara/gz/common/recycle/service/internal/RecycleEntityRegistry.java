@@ -13,7 +13,7 @@ import java.util.Map;
  *   <li>news        → gz_news_article(title)</li>
  *   <li>ord_product → gz_ord_product(name)</li>
  *   <li>ord_sku     → gz_ord_sku(spec_name)</li>
- *   <li>gacha_prize → gz_gacha_prize(name)</li>
+ *   <li>gacha_prize → gz_gacha_prize(prize_no)（name 已被 GZ-GACHA-112/ADR-0013 删列，展示用业务码 prize_no）</li>
  *   <li>gacha_machine → gz_gacha_machine(name)</li>
  *   <li>bean_store  → gz_bean_store(name)</li>
  * </ul>
@@ -46,7 +46,7 @@ public final class RecycleEntityRegistry {
         register(new Def("news", "gz_news_article", "title", "资讯文章"));
         register(new Def("ord_product", "gz_ord_product", "name", "预购商品"));
         register(new Def("ord_sku", "gz_ord_sku", "spec_name", "预购 SKU"));
-        register(new Def("gacha_prize", "gz_gacha_prize", "name", "扭蛋奖品"));
+        register(new Def("gacha_prize", "gz_gacha_prize", "prize_no", "扭蛋奖品"));
         register(new Def("gacha_machine", "gz_gacha_machine", "name", "扭蛋机"));
         register(new Def("bean_store", "gz_bean_store", "name", "拼豆门店"));
     }

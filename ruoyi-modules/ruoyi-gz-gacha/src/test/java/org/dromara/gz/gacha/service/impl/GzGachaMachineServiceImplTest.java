@@ -9,6 +9,7 @@ import org.dromara.gz.common.service.IGzFileService;
 import org.dromara.gz.gacha.domain.bo.GzGachaMachineBo;
 import org.dromara.gz.gacha.domain.entity.GzGachaMachine;
 import org.dromara.gz.gacha.domain.entity.GzGachaPrize;
+import org.dromara.gz.gacha.domain.entity.GzGachaProduct;
 import org.dromara.gz.gacha.domain.vo.GzGachaMachineDetailVo;
 import org.dromara.gz.gacha.domain.vo.GzGachaMachineMpVo;
 import org.dromara.gz.gacha.domain.vo.GzGachaPrizeDetailVo;
@@ -16,6 +17,7 @@ import org.dromara.gz.gacha.enums.GachaMachineStatusEnum;
 import org.dromara.gz.gacha.exception.GzGachaErrorCode;
 import org.dromara.gz.gacha.mapper.GzGachaMachineMapper;
 import org.dromara.gz.gacha.service.IGzGachaPrizeService;
+import org.dromara.gz.gacha.service.IGzGachaProductService;
 import org.dromara.gz.gacha.service.internal.ProbabilityNormalizer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -57,13 +59,16 @@ class GzGachaMachineServiceImplTest {
     private IGzGachaPrizeService prizeService;
     @Mock
     private IGzFileService fileService;
+    @Mock
+    private IGzGachaProductService productService;
 
     private GzGachaMachineServiceImpl service;
 
     @BeforeEach
     void setUp() {
-        // ProbabilityNormalizer 是无状态纯组件 → 用真实实例（实际跑同口径归一化代码，与开盒事务一致）
-        service = new GzGachaMachineServiceImpl(machineMapper, prizeService, fileService, new ProbabilityNormalizer());
+        // ProbabilityNormalizer 是无状态纯组件 → 用真实实例（仍供 isInPool 算 stockRemainSum，与开盒事务一致）
+        service = new GzGachaMachineServiceImpl(
+            machineMapper, prizeService, fileService, productService, new ProbabilityNormalizer());
     }
 
     private GzGachaMachineBo baseBo() {
@@ -257,16 +262,26 @@ class GzGachaMachineServiceImplTest {
     //  GZ-GACHA-103 — mp 详情 + 概率公示（实时归一化 + stockRemainSum + 售罄/disabled 灰显）
     // ============================================================
 
-    private GzGachaPrize prize(long id, String name, String rarity, int weight, int remain, int enabled, Long imageId) {
+    /** 投放线 fixture（ADR-0013：名/图在产品库，线只存 productId/rarity/weight/库存/enabled）。 */
+    private GzGachaPrize prize(long id, long productId, String rarity, int weight, int remain, int enabled) {
         GzGachaPrize p = new GzGachaPrize();
         p.setId(id);
-        p.setName(name);
+        p.setProductId(productId);
         p.setRarity(rarity);
         p.setWeight(weight);
         p.setStockRemain(remain);
         p.setEnabled(enabled);
-        p.setImageId(imageId);
         p.setVersion(0);
+        return p;
+    }
+
+    /** 产品 fixture。 */
+    private GzGachaProduct product(long id, String name, Long imageId, Long refValueCent) {
+        GzGachaProduct p = new GzGachaProduct();
+        p.setId(id);
+        p.setName(name);
+        p.setImageId(imageId);
+        p.setReferenceValueCent(refValueCent);
         return p;
     }
 
@@ -280,58 +295,64 @@ class GzGachaMachineServiceImplTest {
     }
 
     @Test
-    @DisplayName("mp 详情：机器主体 + 奖品池 + 实时归一化（售罄/disabled → null 灰显 + 不计 stockRemainSum）")
-    void getDetailForMpReturnsNormalizedProbability() {
+    @DisplayName("mp 详情（ADR-0013 去概率）：机器主体 + 投放线 join 产品（名/图/参考价取产品，rarity 取线）+ stockRemainSum")
+    void getDetailForMpJoinsProductNoProbability() {
         GzGachaMachine m = onShelfMachine(1001L, "CHIIKAWA 扭蛋机", 1000L, null);
         m.setSalesCount(123L);
         when(machineMapper.selectById(1001L)).thenReturn(m);
-        // 奖品池：SSR(weight70,remain5,enabled1) / SR(weight20,remain3,enabled1) /
-        //        R(weight10,remain0 售罄) / N(weight50,remain8,disabled)
+        // 投放线：产品 3001(SSR,remain5,enabled1) / 3002(SR,remain3,enabled1) /
+        //        3003(R,remain0 售罄) / 3004(N,remain8,disabled)
         List<GzGachaPrize> prizes = List.of(
-            prize(2001L, "SSR 限定", "SSR", 70, 5, 1, null),
-            prize(2002L, "SR 常驻", "SR", 20, 3, 1, null),
-            prize(2003L, "R 已抽完", "R", 10, 0, 1, null),
-            prize(2004L, "N 临停", "N", 50, 8, 0, null));
+            prize(2001L, 3001L, "SSR", 70, 5, 1),
+            prize(2002L, 3002L, "SR", 20, 3, 1),
+            prize(2003L, 3003L, "R", 10, 0, 1),
+            prize(2004L, 3004L, "N", 50, 8, 0));
         when(prizeService.listByMachineId(1001L)).thenReturn(prizes);
+        when(productService.mapByIds(any())).thenReturn(Map.of(
+            3001L, product(3001L, "SSR 限定", null, 29900L),
+            3002L, product(3002L, "SR 常驻", null, null),
+            3003L, product(3003L, "R 已抽完", null, null),
+            3004L, product(3004L, "N 临停", null, null)));
 
         GzGachaMachineDetailVo vo = service.getDetailForMp(1001L);
 
         // 机器主体
         assertEquals(1001L, vo.getId());
         assertEquals("CHIIKAWA 扭蛋机", vo.getName());
-        assertEquals(1000L, vo.getSinglePriceCent());
         assertEquals(123L, vo.getSalesCount());
-        // 入池子集 = SSR(70) + SR(20) = 90（R 售罄 / N disabled 不入池）
         // stockRemainSum = 5 + 3 = 8（售罄/disabled 不计）
         assertEquals(8L, vo.getStockRemainSum());
 
         Map<Long, GzGachaPrizeDetailVo> byId = vo.getPrizes().stream()
             .collect(java.util.stream.Collectors.toMap(GzGachaPrizeDetailVo::getId, p -> p));
-        // SSR = 70/90 × 100 = 77.78（HALF_UP）；SR = 20/90 × 100 = 22.22
-        assertEquals(new java.math.BigDecimal("77.78"), byId.get(2001L).getNormalizedProbability());
-        assertEquals(new java.math.BigDecimal("22.22"), byId.get(2002L).getNormalizedProbability());
-        // 售罄 / disabled → normalizedProbability null（前端展示 "—"）
-        org.junit.jupiter.api.Assertions.assertNull(byId.get(2003L).getNormalizedProbability(), "售罄 → null");
-        org.junit.jupiter.api.Assertions.assertNull(byId.get(2004L).getNormalizedProbability(), "disabled → null");
-        // 售罄奖品仍返回（决策 D2 不后端过滤）+ 稀有度透传
-        assertEquals(0, byId.get(2003L).getStockRemain());
+        // 名取产品、rarity 取线、参考价取产品
+        assertEquals("SSR 限定", byId.get(2001L).getName());
         assertEquals("SSR", byId.get(2001L).getRarity());
+        assertEquals(29900L, byId.get(2001L).getReferenceValueCent());
+        // 售罄投放线仍返回（决策 D2 不后端过滤）
+        assertEquals(0, byId.get(2003L).getStockRemain());
+        // 全部 prizeVo 无 normalizedProbability 字段（编译期已删 — 此处验排序 + 渲染齐全）
+        assertEquals(4, vo.getPrizes().size());
+        // 稀有度档位排序：第一条应为 SSR
+        assertEquals("SSR", vo.getPrizes().get(0).getRarity());
     }
 
     @Test
-    @DisplayName("mp 详情：全部售罄 → 全 null + stockRemainSum=0（前端 CTA 应置灰）")
+    @DisplayName("mp 详情：全部售罄 → stockRemainSum=0（前端 CTA 应置灰）")
     void getDetailForMpAllEmpty() {
         GzGachaMachine m = onShelfMachine(1001L, "扭蛋机", 1000L, null);
         when(machineMapper.selectById(1001L)).thenReturn(m);
         List<GzGachaPrize> prizes = List.of(
-            prize(2001L, "A", "SSR", 70, 0, 1, null),
-            prize(2002L, "B", "R", 30, 0, 1, null));
+            prize(2001L, 3001L, "SSR", 70, 0, 1),
+            prize(2002L, 3002L, "R", 30, 0, 1));
         when(prizeService.listByMachineId(1001L)).thenReturn(prizes);
+        when(productService.mapByIds(any())).thenReturn(Map.of(
+            3001L, product(3001L, "A", null, null),
+            3002L, product(3002L, "B", null, null)));
 
         GzGachaMachineDetailVo vo = service.getDetailForMp(1001L);
 
         assertEquals(0L, vo.getStockRemainSum());
-        vo.getPrizes().forEach(p ->
-            org.junit.jupiter.api.Assertions.assertNull(p.getNormalizedProbability(), "全售罄 → 全 null"));
+        assertEquals(2, vo.getPrizes().size());
     }
 }

@@ -72,22 +72,21 @@ public interface IGzGachaMachineService {
     TableDataInfo<GzGachaMachineMpVo> listOnShelfForMp(PageQuery pageQuery);
 
     // ============================================================
-    //  GZ-GACHA-103 — mp 单机详情 + 概率公示（实时归一化）
+    //  GZ-GACHA-103 — mp 单机详情（ADR-0013 去概率，产品列表）
     // ============================================================
 
     /**
-     * mp 单机详情 + 概率公示（GZ-GACHA-103 AC1，doc/10 §8.N2/N3）。
+     * mp 单机详情 — 产品列表（GZ-GACHA-103 AC1，doc/10 §8.N2，ADR-0013 去概率）。
      *
-     * <p>返回机器主体 + 该机器<b>全部</b>奖品（含售罄 / disabled，决策 D2 不后端过滤）+ 每条
-     * {@code normalizedProbability}（service 层算并返回，前端不重算）。归一化复用
-     * {@code ProbabilityNormalizer.normalizeToPercent}（与开盒事务 GACHA-104 同口径，强约束 #2/#3）：
-     * 入池子集 {@code enabled=1 AND stock_remain>0} 的 weight 归一化；不在池 → {@code null}（前端 "—"）。</p>
+     * <p>返回机器主体 + 该机器<b>全部</b>奖品（含售罄 / disabled，决策 D2 不后端过滤）。<b>ADR-0013
+     * （甲方拍板）：不返回任何概率字段</b> —— 每条奖品名/图/参考价取产品库（join，禁 N+1），稀有度取投放线；
+     * weight 仅后台驱动抽奖，不对 C 端展示。后端按稀有度档位（SSR&gt;SR&gt;R&gt;N）+ create_time 排序。</p>
      *
      * <p><b>不限机器状态</b>：详情页对 off_shelf / auto_off 机器也可查看（列表只展示 on_shelf，但直链 /
      * 收藏可达非在售机器）；前端按 status + 入池为空判定置灰 CTA。机器不存在 → 抛 MACHINE_NOT_FOUND。</p>
      *
      * @param machineId 机器主键（路由 string，controller parse Long）
-     * @return 机器详情 + 奖品池 + 实时归一化概率
+     * @return 机器详情 + 产品列表（无概率字段）
      */
     GzGachaMachineDetailVo getDetailForMp(Long machineId);
 }

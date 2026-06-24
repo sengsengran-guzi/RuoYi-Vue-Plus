@@ -7,18 +7,21 @@ import lombok.extern.slf4j.Slf4j;
 import org.dromara.gz.common.service.IGzFileService;
 import org.dromara.gz.gacha.domain.entity.GzGachaMachine;
 import org.dromara.gz.gacha.domain.entity.GzGachaPrize;
+import org.dromara.gz.gacha.domain.entity.GzGachaProduct;
 import org.dromara.gz.gacha.domain.entity.GzUserGachaCollection;
 import org.dromara.gz.gacha.domain.vo.GzGachaCollectionVo;
 import org.dromara.gz.gacha.mapper.GzGachaMachineMapper;
 import org.dromara.gz.gacha.mapper.GzGachaPrizeMapper;
 import org.dromara.gz.gacha.mapper.GzUserGachaCollectionMapper;
 import org.dromara.gz.gacha.service.IGzGachaCollectionService;
+import org.dromara.gz.gacha.service.IGzGachaProductService;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * mp「我的图鉴」服务实现（GZ-GACHA-107，doc/12 §MP-ME-COLLECTION）。
@@ -48,6 +51,8 @@ public class GzGachaCollectionServiceImpl implements IGzGachaCollectionService {
     private final GzUserGachaCollectionMapper collectionMapper;
     private final GzGachaPrizeMapper prizeMapper;
     private final GzGachaMachineMapper machineMapper;
+    /** 产品库（ADR-0013：图鉴 cell 名/图取产品，rarity 取投放线） */
+    private final IGzGachaProductService productService;
     /** 封面 / 奖品图签名 URL 解析（image_id → 可访问 URL；NULL / 失败 → 占位，同 gz-gacha 揭晓口径） */
     private final IGzFileService fileService;
 
@@ -100,7 +105,7 @@ public class GzGachaCollectionServiceImpl implements IGzGachaCollectionService {
             return null;
         }
 
-        // ② 该机器奖品全集（del_flag=0 由 @TableLogic 自动过滤，含 stock_remain=0 / enabled=0；决策 D3）
+        // ② 该机器投放线全集（del_flag=0 由 @TableLogic 自动过滤，含 stock_remain=0 / enabled=0；决策 D3）
         List<GzGachaPrize> prizes = prizeMapper.selectList(Wrappers.<GzGachaPrize>lambdaQuery()
             .eq(GzGachaPrize::getMachineId, mid)
             .orderByAsc(GzGachaPrize::getId));
@@ -108,6 +113,10 @@ public class GzGachaCollectionServiceImpl implements IGzGachaCollectionService {
             // 全集为空（运营把奖品全删了）→ totalCount=0，不算集齐（AC2 totalCount>0 前提）；仍展示空机器卡无意义 → 跳过
             return null;
         }
+
+        // ② b. 批量 join 产品（ADR-0013：cell 名/图取产品；禁 N+1）
+        Map<Long, GzGachaProduct> productMap = productService.mapByIds(
+            prizes.stream().map(GzGachaPrize::getProductId).filter(Objects::nonNull).toList());
 
         // ③ 用户该机器 collection 行（prize_id → drawn_count / first_drawn_time）
         List<GzUserGachaCollection> owned = collectionMapper.selectList(Wrappers.<GzUserGachaCollection>lambdaQuery()
@@ -118,13 +127,14 @@ public class GzGachaCollectionServiceImpl implements IGzGachaCollectionService {
             ownedMap.put(c.getPrizeId(), c);
         }
 
-        // ④ 纯装配（owned / count / isCompleteSet）
-        GzGachaCollectionVo.MachineGroup group = assembleGroup(machine, prizes, ownedMap);
-        // 图片解析（IO；纯装配产出占位 prizeId/imageId，此处替换可访问 URL）
+        // ④ 纯装配（owned / count / isCompleteSet；名取产品）
+        GzGachaCollectionVo.MachineGroup group = assembleGroup(machine, prizes, productMap, ownedMap);
+        // 图片解析（IO；纯装配产出占位 prizeId/imageId，此处替换可访问 URL —— 图取产品 image_id）
         group.setCoverImageUrl(resolveImageUrl(machine.getCoverImageId()));
         for (int i = 0; i < group.getPrizes().size(); i++) {
             GzGachaCollectionVo.PrizeCell cell = group.getPrizes().get(i);
-            cell.setImageUrl(resolveImageUrl(prizes.get(i).getImageId()));
+            GzGachaProduct product = productMap.get(prizes.get(i).getProductId());
+            cell.setImageUrl(resolveImageUrl(product == null ? null : product.getImageId()));
         }
         return group;
     }
@@ -137,13 +147,15 @@ public class GzGachaCollectionServiceImpl implements IGzGachaCollectionService {
      * 不计入 totalCount 也不计入 ownedCount，集齐判定一致）；
      * {@code isCompleteSet = ownedCount == totalCount && totalCount > 0}。</p>
      *
-     * @param machine  机器主体（取 id / name）
-     * @param prizes   该机器奖品全集（del_flag=0，含已抽空 / 临停；调用方已按 id 升序）
-     * @param ownedMap 用户该机器 collection（prize_id → 行）
+     * @param machine    机器主体（取 id / name）
+     * @param prizes     该机器投放线全集（del_flag=0，含已抽空 / 临停；调用方已按 id 升序）
+     * @param productMap 产品库 join（productId → 产品；cell 名取产品，ADR-0013）
+     * @param ownedMap   用户该机器 collection（prize_id → 行）
      * @return 分组 VO（coverImageUrl / 各 cell imageUrl 留空，由调用方 IO 填）
      */
     GzGachaCollectionVo.MachineGroup assembleGroup(GzGachaMachine machine,
                                                    List<GzGachaPrize> prizes,
+                                                   Map<Long, GzGachaProduct> productMap,
                                                    Map<Long, GzUserGachaCollection> ownedMap) {
         GzGachaCollectionVo.MachineGroup group = new GzGachaCollectionVo.MachineGroup();
         group.setMachineId(machine.getId());
@@ -154,7 +166,9 @@ public class GzGachaCollectionServiceImpl implements IGzGachaCollectionService {
         for (GzGachaPrize p : prizes) {
             GzGachaCollectionVo.PrizeCell cell = new GzGachaCollectionVo.PrizeCell();
             cell.setPrizeId(p.getId());
-            cell.setName(p.getName());
+            GzGachaProduct product = productMap == null ? null : productMap.get(p.getProductId());
+            cell.setName(product == null ? null : product.getName());
+            // rarity 取投放线（按机器可调，ADR-0013）
             cell.setRarity(p.getRarity());
             GzUserGachaCollection c = ownedMap.get(p.getId());
             if (c != null) {

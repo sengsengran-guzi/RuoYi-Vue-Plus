@@ -15,23 +15,26 @@ import org.dromara.gz.gacha.domain.bo.GzGachaMachineBo;
 import org.dromara.gz.gacha.domain.bo.GzGachaMachineQueryBo;
 import org.dromara.gz.gacha.domain.entity.GzGachaMachine;
 import org.dromara.gz.gacha.domain.entity.GzGachaPrize;
+import org.dromara.gz.gacha.domain.entity.GzGachaProduct;
 import org.dromara.gz.gacha.domain.vo.GzGachaMachineDetailVo;
 import org.dromara.gz.gacha.domain.vo.GzGachaMachineMpVo;
 import org.dromara.gz.gacha.domain.vo.GzGachaMachineVo;
 import org.dromara.gz.gacha.domain.vo.GzGachaPrizeDetailVo;
 import org.dromara.gz.gacha.enums.GachaMachineStatusEnum;
+import org.dromara.gz.gacha.enums.GachaRarityEnum;
 import org.dromara.gz.gacha.exception.GzGachaErrorCode;
 import org.dromara.gz.gacha.mapper.GzGachaMachineMapper;
 import org.dromara.gz.gacha.service.IGzGachaMachineService;
 import org.dromara.gz.gacha.service.IGzGachaPrizeService;
+import org.dromara.gz.gacha.service.IGzGachaProductService;
 import org.dromara.gz.gacha.service.internal.ProbabilityNormalizer;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
@@ -63,7 +66,12 @@ public class GzGachaMachineServiceImpl implements IGzGachaMachineService {
     private final GzGachaMachineMapper baseMapper;
     private final IGzGachaPrizeService prizeService;
     private final IGzFileService fileService;
-    /** 概率归一化（GZ-GACHA-103 公示 + GACHA-104 开盒同一 Bean 同口径，强约束 #2/#3） */
+    /** 产品库（ADR-0013：mp 详情 join 产品取名/图/参考价，rarity 取投放线） */
+    private final IGzGachaProductService productService;
+    /**
+     * 概率归一化（仅用 {@link ProbabilityNormalizer#isInPool} 算 stockRemainSum 在池库存合计；
+     * <b>ADR-0013 去概率</b>：mp 详情不再算/不返回归一化概率，但抽奖事务 GACHA-104 仍用本 Bean，保留注入）。
+     */
     private final ProbabilityNormalizer probabilityNormalizer;
 
     // ============================================================
@@ -246,7 +254,7 @@ public class GzGachaMachineServiceImpl implements IGzGachaMachineService {
     }
 
     // ============================================================
-    //  GZ-GACHA-103 — mp 单机详情 + 概率公示（实时归一化）
+    //  GZ-GACHA-103 — mp 单机详情（ADR-0013 去概率，产品列表 join 产品库）
     // ============================================================
 
     @Override
@@ -257,12 +265,11 @@ public class GzGachaMachineServiceImpl implements IGzGachaMachineService {
             throw new ServiceException(GzGachaErrorCode.MACHINE_NOT_FOUND_MSG, GzGachaErrorCode.MACHINE_NOT_FOUND);
         }
 
-        // 全部奖品（含售罄 / disabled，决策 D2）；空机器 → 空列表
+        // 全部投放线（含售罄 / disabled，决策 D2）；空机器 → 空列表
         List<GzGachaPrize> prizes = prizeService.listByMachineId(machineId);
-
-        // ★ 实时归一化（与开盒事务 GACHA-104 同一 Bean 同口径，强约束 #2/#3）：
-        //   入池子集 enabled=1 AND stock_remain>0 的 weight 归一化 → 每条百分比；不在池为 null。
-        Map<Long, BigDecimal> probMap = probabilityNormalizer.normalizeToPercent(prizes);
+        // 批量 join 产品（禁 N+1）：投放线的 productId 集合 → mapByIds
+        Map<Long, GzGachaProduct> productMap = productService.mapByIds(
+            prizes.stream().map(GzGachaPrize::getProductId).filter(java.util.Objects::nonNull).toList());
 
         GzGachaMachineDetailVo vo = new GzGachaMachineDetailVo();
         vo.setId(machine.getId());
@@ -279,32 +286,54 @@ public class GzGachaMachineServiceImpl implements IGzGachaMachineService {
         long stockRemainSum = 0L;
         List<GzGachaPrizeDetailVo> prizeVos = new ArrayList<>(prizes.size());
         for (GzGachaPrize p : prizes) {
-            prizeVos.add(toPrizeDetailVo(p, probMap.get(p.getId())));
+            prizeVos.add(toPrizeDetailVo(p, productMap.get(p.getProductId())));
             // 在池库存合计（口径同列表 stockRemainSum：enabled=1 才计；售罄/disabled 不计）
             if (ProbabilityNormalizer.isInPool(p)) {
                 stockRemainSum += p.getStockRemain();
             }
         }
+        // 排序：稀有度档位（SSR>SR>R>N）优先 —— prizes 已按 create_time/id 升序，稀有度档位稳定排序保留次序
+        prizeVos.sort(Comparator.comparingInt(v -> rarityRank(v.getRarity())));
         vo.setStockRemainSum(stockRemainSum);
         vo.setPrizes(prizeVos);
         return vo;
     }
 
     /**
-     * 奖品 entity → mp 详情 VO（不暴露 weight 裸值，只暴露后端算好的 normalizedProbability）。
-     * 奖品图解析签名 URL（image_id NULL / 失败 → 占位图）。
+     * 投放线 entity + 产品（join）→ mp 详情 VO（ADR-0013：名/图/参考价取产品，rarity 取线；无概率字段）。
+     * 产品图解析签名 URL（image_id NULL / 失败 → 占位图）；产品被删/取不到 → 名/图/参考价留空，占位图兜底。
      */
-    private GzGachaPrizeDetailVo toPrizeDetailVo(GzGachaPrize p, BigDecimal normalizedProbability) {
+    private GzGachaPrizeDetailVo toPrizeDetailVo(GzGachaPrize p, GzGachaProduct product) {
         GzGachaPrizeDetailVo vo = new GzGachaPrizeDetailVo();
         vo.setId(p.getId());
-        vo.setName(p.getName());
-        vo.setImageUrl(resolveImageUrl(p.getImageId()));
         vo.setRarity(p.getRarity());
-        vo.setNormalizedProbability(normalizedProbability);
         vo.setStockRemain(p.getStockRemain());
-        vo.setReferenceValueCent(p.getReferenceValueCent());
         vo.setEnabled(p.getEnabled());
+        if (product != null) {
+            vo.setName(product.getName());
+            vo.setImageUrl(resolveImageUrl(product.getImageId()));
+            vo.setReferenceValueCent(product.getReferenceValueCent());
+        } else {
+            vo.setImageUrl(PLACEHOLDER_IMAGE_URL);
+        }
         return vo;
+    }
+
+    /** 稀有度展示排序档位（SSR>SR>R>N；未知排末尾）。 */
+    private int rarityRank(String rarity) {
+        if (GachaRarityEnum.SSR.getCode().equals(rarity)) {
+            return 0;
+        }
+        if (GachaRarityEnum.SR.getCode().equals(rarity)) {
+            return 1;
+        }
+        if (GachaRarityEnum.R.getCode().equals(rarity)) {
+            return 2;
+        }
+        if (GachaRarityEnum.N.getCode().equals(rarity)) {
+            return 3;
+        }
+        return 4;
     }
 
     // ============================================================

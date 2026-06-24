@@ -4,11 +4,13 @@ import org.dromara.gz.common.domain.vo.GzFileObjectVO;
 import org.dromara.gz.common.service.IGzFileService;
 import org.dromara.gz.gacha.domain.entity.GzGachaMachine;
 import org.dromara.gz.gacha.domain.entity.GzGachaPrize;
+import org.dromara.gz.gacha.domain.entity.GzGachaProduct;
 import org.dromara.gz.gacha.domain.entity.GzUserGachaCollection;
 import org.dromara.gz.gacha.domain.vo.GzGachaCollectionVo;
 import org.dromara.gz.gacha.mapper.GzGachaMachineMapper;
 import org.dromara.gz.gacha.mapper.GzGachaPrizeMapper;
 import org.dromara.gz.gacha.mapper.GzUserGachaCollectionMapper;
+import org.dromara.gz.gacha.service.IGzGachaProductService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -60,6 +62,8 @@ class GzGachaCollectionServiceImplTest {
     @Mock
     private GzGachaMachineMapper machineMapper;
     @Mock
+    private IGzGachaProductService productService;
+    @Mock
     private IGzFileService fileService;
 
     private GzGachaCollectionServiceImpl service;
@@ -69,12 +73,25 @@ class GzGachaCollectionServiceImplTest {
 
     @BeforeEach
     void setUp() {
-        service = new GzGachaCollectionServiceImpl(collectionMapper, prizeMapper, machineMapper, fileService);
+        service = new GzGachaCollectionServiceImpl(collectionMapper, prizeMapper, machineMapper, productService, fileService);
         // 图片解析：默认返回一个可访问 URL（非占位）；prizeId 解析失败也回退占位，不抛
         lenient().when(fileService.getPresignedUrl(anyLong())).thenAnswer(inv -> {
             GzFileObjectVO vo = new GzFileObjectVO();
             vo.setUrl("https://cos.example/img/" + inv.getArgument(0));
             return vo;
+        });
+        // 产品 join：默认 mapByIds 按入参 id 造同 id 产品（名 = "产品" + id，图 = 8000 + id），cell 名/图取产品
+        lenient().when(productService.mapByIds(any())).thenAnswer(inv -> {
+            java.util.Collection<Long> ids = inv.getArgument(0);
+            java.util.Map<Long, GzGachaProduct> map = new HashMap<>();
+            for (Long id : ids) {
+                GzGachaProduct p = new GzGachaProduct();
+                p.setId(id);
+                p.setName("产品" + id);
+                p.setImageId(8000L + id);
+                map.put(id, p);
+            }
+            return map;
         });
     }
 
@@ -88,13 +105,13 @@ class GzGachaCollectionServiceImplTest {
         return m;
     }
 
+    /** 投放线 fixture（ADR-0013：名/图在产品库；productId = id 便于默认 mapByIds 造同 id 产品）。 */
     private GzGachaPrize prize(long id, String name, String rarity, int stockRemain, int enabled) {
         GzGachaPrize p = new GzGachaPrize();
         p.setId(id);
         p.setMachineId(MACHINE_ID);
-        p.setName(name);
+        p.setProductId(id);
         p.setRarity(rarity);
-        p.setImageId(8000L + id);
         p.setStockRemain(stockRemain);
         p.setEnabled(enabled);
         return p;
@@ -228,21 +245,35 @@ class GzGachaCollectionServiceImplTest {
     // ---------- 纯装配单测（不走 mapper，直接验证集齐口径）----------
 
     @Test
-    @DisplayName("纯装配 assembleGroup：ownedCount/totalCount/isCompleteSet 口径")
+    @DisplayName("纯装配 assembleGroup：ownedCount/totalCount/isCompleteSet 口径 + cell 名取产品")
     void assembleGroup_corePure() {
         Map<Long, GzUserGachaCollection> ownedMap = new HashMap<>();
         LocalDateTime t = LocalDateTime.of(2026, 6, 18, 20, 0, 0);
         ownedMap.put(2001L, coll(2001, 2, t));
+        // 产品 join：productId = prizeId（fixture 约定）
+        Map<Long, GzGachaProduct> productMap = new HashMap<>();
+        productMap.put(2001L, productOf(2001L, "应援款"));
+        productMap.put(2002L, productOf(2002L, "普通款"));
         // totalCount=2，拥有 1 → 未集齐
         GzGachaCollectionVo.MachineGroup g = service.assembleGroup(
             machine(),
             List.of(prize(2001, "a", "SSR", 1, 1), prize(2002, "b", "N", 1, 1)),
+            productMap,
             ownedMap);
         assertEquals(2, g.getTotalCount());
         assertEquals(1, g.getOwnedCount());
         assertFalse(g.getIsCompleteSet());
         assertEquals(2, cellOf(g, 2001).getDrawnCount());
         assertFalse(cellOf(g, 2002).getOwned());
+        // cell 名取产品（ADR-0013）
+        assertEquals("应援款", cellOf(g, 2001).getName());
+    }
+
+    private GzGachaProduct productOf(long id, String name) {
+        GzGachaProduct p = new GzGachaProduct();
+        p.setId(id);
+        p.setName(name);
+        return p;
     }
 
     @Test
