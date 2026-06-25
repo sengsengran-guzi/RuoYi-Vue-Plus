@@ -78,6 +78,8 @@ class GzRecycleVerifyPayoutTest {
     @Mock
     private IGzRecycleQtyRangeService qtyRangeService;
     @Mock
+    private org.dromara.gz.recycle.service.IGzRecycleTimeSlotService timeSlotService;
+    @Mock
     private IGzRecycleIpService ipService;
     @Mock
     private IGzPayPayoutService payoutService;
@@ -92,7 +94,7 @@ class GzRecycleVerifyPayoutTest {
     void setUp() {
         // configService 未 stub → getConfigValue 返 null → final_amount 校验走默认绝对硬上限 ¥1000（ADR-0012 去估价×倍数档）。
         service = new GzRecycleAppointmentServiceImpl(
-            baseMapper, gzUserMapper, apptNoGenerator, qtyRangeService, ipService,
+            baseMapper, gzUserMapper, apptNoGenerator, qtyRangeService, timeSlotService, ipService,
             new RecycleQrSigner(new GzRecycleQrProperties()), new ObjectMapper(),
             payoutService, payoutMapper, configService);
     }

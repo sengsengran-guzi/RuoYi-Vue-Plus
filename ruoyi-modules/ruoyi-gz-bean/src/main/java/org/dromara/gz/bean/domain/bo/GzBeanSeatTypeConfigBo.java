@@ -46,14 +46,24 @@ public class GzBeanSeatTypeConfigBo extends BaseEntity {
     @NotNull(message = "门店 ID 不能为空", groups = AddGroup.class)
     private Long storeId;
 
-    /** 座位类型（新增必填；编辑忽略 — 唯一键组成不可改）；必属字典 gz_bean_seat_type */
-    @NotBlank(message = "座位类型不能为空", groups = AddGroup.class)
-    @Pattern(regexp = "^(single|double|quad)$",
-        message = "座位类型无效（应为 single/double/quad 之一）",
-        groups = {AddGroup.class, EditGroup.class})
-    private String seatType;
+    /** 自定义显示名（取代字典；新增/编辑必填；同店不重名 — service + DB uk 兜底）。ADR-0014 §1 去字典化 */
+    @NotBlank(message = "类型名称不能为空", groups = {AddGroup.class, EditGroup.class})
+    @Size(max = 32, message = "类型名称长度不能超过 32", groups = {AddGroup.class, EditGroup.class})
+    private String name;
 
-    /** 数量（配额上限 = 余量基础），≥ 0 */
+    /** 订法 whole=整桌 / seat=按座（必填）。ADR-0014 §2 */
+    @NotBlank(message = "订法不能为空", groups = {AddGroup.class, EditGroup.class})
+    @Pattern(regexp = "^(whole|seat)$",
+        message = "订法无效（应为 whole 整桌 / seat 按座 之一）",
+        groups = {AddGroup.class, EditGroup.class})
+    private String bookMode;
+
+    /** 每桌座位数（≥1；seat 模式 quantity*capacity = 每格总座数） */
+    @NotNull(message = "每桌座位数不能为空", groups = {AddGroup.class, EditGroup.class})
+    @Min(value = 1, message = "每桌座位数不能小于 1", groups = {AddGroup.class, EditGroup.class})
+    private Integer capacity;
+
+    /** 数量（每格物理单位数 = 桌/单位数），≥ 0 */
     @NotNull(message = "数量不能为空", groups = {AddGroup.class, EditGroup.class})
     @Min(value = 0, message = "数量不能小于 0", groups = {AddGroup.class, EditGroup.class})
     private Integer quantity;

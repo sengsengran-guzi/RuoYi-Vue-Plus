@@ -108,6 +108,17 @@ public interface IGzUserCouponService {
      */
     void unlock(Long couponId);
 
+    /**
+     * 退款回退已用券（拼豆已付款单取消 / 退款成功，{@code used → unused}，甲方口径「退款=退实付+退券恢复可用」）。
+     *
+     * <p>清空 {@code used_time} + {@code related_pay_out_trade_no}，券回到可用（未过期前可再用，过期由
+     * {@link #expireBatch} 兜底翻 expired）。WHERE {@code status='used'} 守卫 → 幂等（重复回调跳过）、
+     * 且只回退「已核销」券，不误伤 locked/unused。affected=0 仅记日志不抛异常（不阻塞退款主流程）。</p>
+     *
+     * @param couponId 用户券主键（= booking.coupon_id；NULL 跳过）
+     */
+    void returnUsed(Long couponId);
+
     /** 券过期扫描统计（SnailJob 回传给执行器记日志）。 */
     record CouponExpireResult(int scanned, int expired) {
     }

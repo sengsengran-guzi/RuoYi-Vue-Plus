@@ -35,6 +35,7 @@ import org.dromara.gz.recycle.mapper.GzRecycleAppointmentMapper;
 import org.dromara.gz.recycle.service.IGzRecycleAppointmentService;
 import org.dromara.gz.recycle.service.IGzRecycleIpService;
 import org.dromara.gz.recycle.service.IGzRecycleQtyRangeService;
+import org.dromara.gz.recycle.service.IGzRecycleTimeSlotService;
 import org.dromara.gz.recycle.service.internal.RecycleApptNoGenerator;
 import org.dromara.gz.recycle.service.internal.RecycleQrSigner;
 import org.springframework.stereotype.Service;
@@ -76,19 +77,19 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
     /** 钩子 / no_show 单轮扫描上限（防雪崩，与 PAY-105 SCAN_LIMIT 同口径） */
     private static final int SCAN_LIMIT = 100;
 
-    /** 到店档：早晨 10:00-13:00 */
+    // 旧到店档常量（GZ-RECYCLE-006 起到店时段改 admin 按门店可配；下列仅 deriveArrivalSlot 用于
+    // 回显历史单的 morning/afternoon 标签，提交链路已改走 timeSlotService）。
     private static final String ARRIVAL_MORNING = "morning";
     private static final LocalTime MORNING_START = LocalTime.of(10, 0);
-    private static final LocalTime MORNING_END = LocalTime.of(13, 0);
-    /** 到店档：下午 13:00-17:00 */
     private static final String ARRIVAL_AFTERNOON = "afternoon";
     private static final LocalTime AFTERNOON_START = LocalTime.of(13, 0);
-    private static final LocalTime AFTERNOON_END = LocalTime.of(17, 0);
 
     private final GzRecycleAppointmentMapper baseMapper;
     private final GzUserMapper gzUserMapper;
     private final RecycleApptNoGenerator apptNoGenerator;
     private final IGzRecycleQtyRangeService qtyRangeService;
+    /** 到店时段服务（GZ-RECYCLE-006，按门店可配；提交按 timeSlotId 取起止落预约单 slot_start/slot_end） */
+    private final IGzRecycleTimeSlotService timeSlotService;
     private final IGzRecycleIpService ipService;
     private final RecycleQrSigner qrSigner;
     /** 全局 Jackson ObjectMapper（spring 注入；product_snapshot_json 序列化/反序列化，可单测注入真实实例） */
@@ -129,8 +130,8 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             throw new ServiceException(GzRecycleErrorCode.QTY_BUCKET_INVALID_MSG, GzRecycleErrorCode.QTY_BUCKET_INVALID);
         }
 
-        // ④ 到店档 → slot_start/slot_end 映射（service 内固定，前端不传时间）
-        LocalTime[] slot = resolveArrivalSlot(bo.getArrivalSlot());
+        // ④ 到店时段 → slot_start/slot_end（GZ-RECYCLE-006，按门店可配；校验属本店 + 启用，取起止快照）
+        LocalTime[] slot = resolveTimeSlot(bo.getTimeSlotId(), bo.getStoreId());
 
         // ⑤ 用户存在 + receiver_openid（E5，反向打款必需）+ 快照
         GzUser user = gzUserMapper.selectById(userId);
@@ -189,15 +190,13 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         return toVO(entity);
     }
 
-    /** 到店档 → [slot_start, slot_end] 映射（契约 §B.1，非法取值抛 4107 桶/档无效语义）。 */
-    private LocalTime[] resolveArrivalSlot(String arrivalSlot) {
-        if (ARRIVAL_MORNING.equals(arrivalSlot)) {
-            return new LocalTime[]{MORNING_START, MORNING_END};
+    /** 到店时段 id → [slot_start, slot_end]（GZ-RECYCLE-006，按门店可配）；非法 / 跨店 / 已停用抛业务异常。 */
+    private LocalTime[] resolveTimeSlot(Long timeSlotId, Long storeId) {
+        LocalTime[] slot = timeSlotService.resolveEnabledSlot(timeSlotId, storeId);
+        if (slot == null) {
+            throw new ServiceException("到店时段无效或已停用，请重新选择");
         }
-        if (ARRIVAL_AFTERNOON.equals(arrivalSlot)) {
-            return new LocalTime[]{AFTERNOON_START, AFTERNOON_END};
-        }
-        throw new ServiceException("到店时段无效，请选择早晨或下午");
+        return slot;
     }
 
     /** 由 slot_start 反推到店档（详情 VO 回显；旧单非 10:00/13:00 起 → null）。 */

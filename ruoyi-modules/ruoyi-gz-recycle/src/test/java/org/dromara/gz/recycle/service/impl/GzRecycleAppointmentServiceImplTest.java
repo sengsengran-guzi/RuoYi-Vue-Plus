@@ -64,6 +64,8 @@ class GzRecycleAppointmentServiceImplTest {
     @Mock
     private IGzRecycleQtyRangeService qtyRangeService;
     @Mock
+    private org.dromara.gz.recycle.service.IGzRecycleTimeSlotService timeSlotService;
+    @Mock
     private IGzRecycleIpService ipService;
     @Mock
     private org.dromara.gz.common.pay.service.IGzPayPayoutService payoutService;
@@ -80,8 +82,8 @@ class GzRecycleAppointmentServiceImplTest {
     @BeforeEach
     void setUp() {
         service = new GzRecycleAppointmentServiceImpl(
-            baseMapper, gzUserMapper, apptNoGenerator, qtyRangeService, ipService, qrSigner, objectMapper,
-            payoutService, payoutMapper, configService);
+            baseMapper, gzUserMapper, apptNoGenerator, qtyRangeService, timeSlotService, ipService, qrSigner,
+            objectMapper, payoutService, payoutMapper, configService);
     }
 
     private GzRecycleQtyRangeVO bucket(String code, String label, int duration) {
@@ -115,12 +117,12 @@ class GzRecycleAppointmentServiceImplTest {
     }
 
     private GzRecycleAppointmentSubmitBo submitBo(GzRecycleAppointmentSubmitBo.ProductBo product,
-                                                  List<Long> imageIds, String arrivalSlot) {
+                                                  List<Long> imageIds, Long timeSlotId) {
         GzRecycleAppointmentSubmitBo bo = new GzRecycleAppointmentSubmitBo();
         bo.setStoreId(1L);
         bo.setProduct(product);
         bo.setApptDate(LocalDate.of(2026, 6, 22));
-        bo.setArrivalSlot(arrivalSlot);
+        bo.setTimeSlotId(timeSlotId);
         bo.setImageIds(imageIds);
         bo.setRemark("旧物清仓");
         return bo;
@@ -132,6 +134,8 @@ class GzRecycleAppointmentServiceImplTest {
     @DisplayName("happy：单份多选 → 桶→时长落 matched_duration / 无金额 / ipNames 快照 / morning→10:00-13:00 / image_id 逗号入库")
     void submit_happyPath_singleForm() {
         when(qtyRangeService.getEnabledByCode("25-50")).thenReturn(bucket("25-50", "25-50 件", 60));
+        when(timeSlotService.resolveEnabledSlot(5L, 1L))
+            .thenReturn(new LocalTime[]{LocalTime.of(10, 0), LocalTime.of(13, 0)});
         when(ipService.listNamesByIds(List.of(3L, 7L))).thenReturn(List.of("火影", "海贼王"));
         when(gzUserMapper.selectById(1001L)).thenReturn(userWithOpenid("o_wx_abc123"));
         when(apptNoGenerator.generate()).thenReturn("RCY-20260622-000001");
@@ -139,7 +143,7 @@ class GzRecycleAppointmentServiceImplTest {
 
         GzRecycleAppointmentSubmitBo bo = submitBo(
             product(List.of("card", "goods"), List.of(3L, 7L), List.of("我推的孩子"), "25-50"),
-            List.of(11L, 12L), "morning");
+            List.of(11L, 12L), 5L);
 
         GzRecycleAppointmentVO vo = service.submit(bo, 1001L);
 
@@ -175,12 +179,14 @@ class GzRecycleAppointmentServiceImplTest {
     @DisplayName("happy：afternoon → 13:00-17:00 映射")
     void submit_afternoonSlotMapping() {
         when(qtyRangeService.getEnabledByCode("1-25")).thenReturn(bucket("1-25", "1-25 件", 30));
+        when(timeSlotService.resolveEnabledSlot(6L, 1L))
+            .thenReturn(new LocalTime[]{LocalTime.of(13, 0), LocalTime.of(17, 0)});
         when(ipService.listNamesByIds(any())).thenReturn(List.of());
         when(gzUserMapper.selectById(1001L)).thenReturn(userWithOpenid("o_wx"));
         when(apptNoGenerator.generate()).thenReturn("RCY-20260622-000002");
         when(baseMapper.insert(any(GzRecycleAppointment.class))).thenReturn(1);
 
-        service.submit(submitBo(product(List.of("card"), null, null, "1-25"), List.of(11L), "afternoon"), 1001L);
+        service.submit(submitBo(product(List.of("card"), null, null, "1-25"), List.of(11L), 6L), 1001L);
 
         org.mockito.ArgumentCaptor<GzRecycleAppointment> captor =
             org.mockito.ArgumentCaptor.forClass(GzRecycleAppointment.class);
@@ -195,7 +201,7 @@ class GzRecycleAppointmentServiceImplTest {
     @DisplayName("imageIds 空 → 拒收 4101，不查桶/不查用户/不 INSERT")
     void submit_rejectEmptyImages() {
         GzRecycleAppointmentSubmitBo bo = submitBo(
-            product(List.of("card"), null, null, "1-25"), new ArrayList<>(), "morning");
+            product(List.of("card"), null, null, "1-25"), new ArrayList<>(), 5L);
 
         ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
         assertEquals(GzRecycleErrorCode.SUBMIT_IMAGE_REQUIRED, ex.getCode());
@@ -207,7 +213,7 @@ class GzRecycleAppointmentServiceImplTest {
     @DisplayName("imageIds 含 null → 拒收 4101")
     void submit_rejectImagesWithNull() {
         GzRecycleAppointmentSubmitBo bo = submitBo(
-            product(List.of("card"), null, null, "1-25"), Arrays.asList(9L, null), "morning");
+            product(List.of("card"), null, null, "1-25"), Arrays.asList(9L, null), 5L);
 
         ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
         assertEquals(GzRecycleErrorCode.SUBMIT_IMAGE_REQUIRED, ex.getCode());
@@ -218,7 +224,7 @@ class GzRecycleAppointmentServiceImplTest {
     @DisplayName("categories 空 → 拒收 4108，不 INSERT")
     void submit_rejectEmptyCategories() {
         GzRecycleAppointmentSubmitBo bo = submitBo(
-            product(new ArrayList<>(), null, null, "1-25"), List.of(11L), "morning");
+            product(new ArrayList<>(), null, null, "1-25"), List.of(11L), 5L);
 
         ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
         assertEquals(GzRecycleErrorCode.CATEGORY_REQUIRED, ex.getCode());
@@ -230,7 +236,7 @@ class GzRecycleAppointmentServiceImplTest {
     void submit_rejectInvalidBucket() {
         when(qtyRangeService.getEnabledByCode("99-100")).thenReturn(null);
         GzRecycleAppointmentSubmitBo bo = submitBo(
-            product(List.of("card"), null, null, "99-100"), List.of(11L), "morning");
+            product(List.of("card"), null, null, "99-100"), List.of(11L), 5L);
 
         ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
         assertEquals(GzRecycleErrorCode.QTY_BUCKET_INVALID, ex.getCode());
@@ -241,11 +247,13 @@ class GzRecycleAppointmentServiceImplTest {
     @DisplayName("receiver_openid 缺失 → 拦截 4103，不 INSERT")
     void submit_rejectMissingOpenid() {
         when(qtyRangeService.getEnabledByCode("1-25")).thenReturn(bucket("1-25", "1-25 件", 30));
+        when(timeSlotService.resolveEnabledSlot(5L, 1L))
+            .thenReturn(new LocalTime[]{LocalTime.of(10, 0), LocalTime.of(13, 0)});
         when(gzUserMapper.selectById(1001L)).thenReturn(userWithOpenid(""));
         lenient().when(ipService.listNamesByIds(any())).thenReturn(List.of());
 
         GzRecycleAppointmentSubmitBo bo = submitBo(
-            product(List.of("card"), null, null, "1-25"), List.of(11L), "morning");
+            product(List.of("card"), null, null, "1-25"), List.of(11L), 5L);
 
         ServiceException ex = assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
         assertEquals(GzRecycleErrorCode.OPENID_REQUIRED, ex.getCode());
@@ -253,11 +261,12 @@ class GzRecycleAppointmentServiceImplTest {
     }
 
     @Test
-    @DisplayName("arrivalSlot 非法 → 拒收（不映射时间）")
-    void submit_rejectInvalidArrivalSlot() {
+    @DisplayName("timeSlot 无效/停用/跨店 → 拒收（resolveEnabledSlot 返 null，不 INSERT）")
+    void submit_rejectInvalidTimeSlot() {
         when(qtyRangeService.getEnabledByCode("1-25")).thenReturn(bucket("1-25", "1-25 件", 30));
+        when(timeSlotService.resolveEnabledSlot(999L, 1L)).thenReturn(null);
         GzRecycleAppointmentSubmitBo bo = submitBo(
-            product(List.of("card"), null, null, "1-25"), List.of(11L), "midnight");
+            product(List.of("card"), null, null, "1-25"), List.of(11L), 999L);
 
         assertThrows(ServiceException.class, () -> service.submit(bo, 1001L));
         verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));

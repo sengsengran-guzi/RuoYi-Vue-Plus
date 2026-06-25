@@ -37,10 +37,19 @@ public class GzBeanSeatTypeConfigVO implements Serializable {
     @JsonSerialize(using = ToStringSerializer.class)
     private Long storeId;
 
-    /** 座位类型（字典 gz_bean_seat_type 的 value：single/double/quad；中文名由前端 dict-tag 翻译，VO 不带 name 字段，同 booking status） */
+    /** 门店内稳定 code（去字典后仅展示/兼容用；admin 不编辑，新行后端自动生成） */
     private String seatType;
 
-    /** 数量（配额上限 = 余量基础） */
+    /** 自定义显示名（取代字典 label；admin 列表 + 表单主字段） */
+    private String name;
+
+    /** 订法 whole=整桌 / seat=按座 */
+    private String bookMode;
+
+    /** 每桌座位数 */
+    private Integer capacity;
+
+    /** 数量（每格物理单位数 = 桌/单位数） */
     private Integer quantity;
 
     /** 单价（分；前端 /100 显示元） */

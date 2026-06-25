@@ -74,6 +74,12 @@ public class GzBeanBooking extends TenantEntity {
     /** V1.2 座位类型中文名快照（防字典改名后历史单丢信息） */
     private String seatTypeSnapshot;
 
+    /** V1.2.x FK → gz_bean_seat_type_config.id（逐格防超卖计数维度；分母/容量/价从该 config 行取，ADR-0014 §5） */
+    private Long seatTypeConfigId;
+
+    /** V1.2.x 下单时订法快照 whole=整桌/seat=按座（防 config 后续改模式丢历史信息） */
+    private String bookModeSnapshot;
+
     /** 预约日期 */
     private LocalDate sessDate;
 

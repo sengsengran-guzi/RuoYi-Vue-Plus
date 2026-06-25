@@ -12,17 +12,20 @@ import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleCategoryVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleIpVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleQtyRangeVO;
+import org.dromara.gz.recycle.domain.vo.GzRecycleTimeSlotVO;
 import org.dromara.gz.recycle.domain.vo.RecycleVerifyCodeVO;
 import org.dromara.gz.recycle.service.IGzRecycleAppointmentService;
 import org.dromara.gz.recycle.service.IGzRecycleIpService;
 import org.dromara.gz.recycle.service.IGzRecyclePriceRuleService;
 import org.dromara.gz.recycle.service.IGzRecycleQtyRangeService;
+import org.dromara.gz.recycle.service.IGzRecycleTimeSlotService;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
@@ -36,6 +39,7 @@ import java.util.List;
  * <ul>
  *   <li>{@code GET  /ips} — 启用 IP 多选源（契约 §C.2）</li>
  *   <li>{@code GET  /qty-ranges} — 启用数量桶单选源（契约 §C.2，带 durationMinutes）</li>
+ *   <li>{@code GET  /time-slots?storeId} — 某门店启用到店时段单选源（GZ-RECYCLE-006，按门店可配）</li>
  *   <li>{@code GET  /categories} — 可回收品类下拉</li>
  *   <li>{@code POST /submit} — 提交回收预约（单份多选，去估价，落 submitted）</li>
  *   <li>{@code GET  /my} — 我的回收记录列表（顾客窄 VO 三段）</li>
@@ -58,6 +62,7 @@ public class GzRecycleAppointmentMpController {
     private final IGzRecyclePriceRuleService priceRuleService;
     private final IGzRecycleIpService ipService;
     private final IGzRecycleQtyRangeService qtyRangeService;
+    private final IGzRecycleTimeSlotService timeSlotService;
 
     /**
      * 启用 IP 列表（mp 填单多选源，契约 15a §C.2 / ADR-0012 §4）。
@@ -89,6 +94,23 @@ public class GzRecycleAppointmentMpController {
     @GetMapping("/qty-ranges")
     public R<List<GzRecycleQtyRangeVO>> qtyRanges() {
         return R.ok(qtyRangeService.listEnabled());
+    }
+
+    /**
+     * 某门店启用到店时段列表（mp 填单单选源，GZ-RECYCLE-006，按门店可配，取代写死的上午/下午两档）。
+     *
+     * <pre>
+     * GET /app/gz/recycle/appointment/time-slots?storeId=1
+     * 200 OK { "code":200, "data": [ {"id":"5","label":"上午","startTime":"10:00:00","endTime":"13:00:00",...} ] }
+     * </pre>
+     *
+     * <p>仅返该门店 {@code enabled=1} 时段，按 sort_no/start_time/id 升序；登录态即可（无新权限）。
+     * 用户单选时段 → 提交 timeSlotId；后端按 id 取起止时间落预约单 slot_start/slot_end。
+     * storeId 缺省返空列表（前端先选门店再拉时段）。</p>
+     */
+    @GetMapping("/time-slots")
+    public R<List<GzRecycleTimeSlotVO>> timeSlots(@RequestParam(required = false) Long storeId) {
+        return R.ok(timeSlotService.listEnabledByStore(storeId));
     }
 
     /**

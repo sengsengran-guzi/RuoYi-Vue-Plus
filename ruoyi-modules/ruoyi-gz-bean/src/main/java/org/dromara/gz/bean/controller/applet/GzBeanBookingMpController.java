@@ -90,8 +90,8 @@ public class GzBeanBookingMpController {
         if (userId == null) {
             return R.fail(401, "未登录");
         }
-        log.info("[bean-booking-mp] paid-submit userId={} storeId={} seatType={} sessDate={} slotStart={} couponId={}",
-            userId, bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), bo.getSlotStart(), bo.getCouponId());
+        log.info("[bean-booking-mp] paid-submit userId={} storeId={} seatTypeConfigId={} sessDate={} slotStart={} couponId={}",
+            userId, bo.getStoreId(), bo.getSeatTypeConfigId(), bo.getSessDate(), bo.getSlotStart(), bo.getCouponId());
         return R.ok(bookingService.submitPaid(bo, userId));
     }
 

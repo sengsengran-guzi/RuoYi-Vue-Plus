@@ -26,13 +26,19 @@ public class GzBeanTypeSlotAvailabilityVO implements Serializable {
     @Serial
     private static final long serialVersionUID = 1L;
 
-    /** 座位类型 value（single/double/quad，提交时回传后端） */
+    /** 座位类型 config id（mp 提交时回传后端作 seatTypeConfigId，ADR-0014 §5） */
+    private Long seatTypeConfigId;
+
+    /** 座位类型 code（兼容/调试用；mp 不依赖） */
     private String seatType;
 
-    /** 座位类型中文名（字典 gz_bean_seat_type 翻译；mp 契约字段名 name） */
+    /** 座位类型自定义显示名（取 config.name；mp 类型卡标题） */
     private String name;
 
-    /** 该类型单价（分/小时）；mp / 100 显示元/时 */
+    /** 订法 whole=整桌 / seat=按座（mp 据此显示「整桌 / 拼桌·按座」标签，ADR-0014 §6） */
+    private String bookMode;
+
+    /** 该类型单价（分/小时）；已按 sessDate 星期取生效价（覆盖价命中则用，否则基础价）；mp / 100 显示元/时 */
     private Long unitPriceCent;
 
     /** 1h 格起（整点） */

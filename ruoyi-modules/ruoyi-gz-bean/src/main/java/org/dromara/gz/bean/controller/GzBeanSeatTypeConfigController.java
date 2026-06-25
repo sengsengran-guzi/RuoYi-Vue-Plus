@@ -16,7 +16,9 @@ import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.web.core.BaseController;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigQueryBo;
+import org.dromara.gz.bean.domain.bo.GzBeanSeatTypePriceBo;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypeConfigVO;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatTypePriceVO;
 import org.dromara.gz.bean.service.IGzBeanSeatTypeConfigService;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -114,5 +116,21 @@ public class GzBeanSeatTypeConfigController extends BaseController {
     @DeleteMapping("/{ids}")
     public R<Void> remove(@NotEmpty @PathVariable Long[] ids) {
         return toAjax(seatTypeConfigService.removeByIds(List.of(ids)) ? 1 : 0);
+    }
+
+    /** 读某类型的按星期价格覆盖（GZ-BEAN-018，ADR-0014 §3）。未覆盖的星期不在列表（回退基础价） */
+    @SaCheckPermission("gz:bean:seatTypeConfig:list")
+    @GetMapping("/{id}/weekday-prices")
+    public R<List<GzBeanSeatTypePriceVO>> weekdayPrices(@NotNull @PathVariable Long id) {
+        return R.ok(seatTypeConfigService.selectWeekdayPrices(id));
+    }
+
+    /** 覆盖式批量存某类型的按星期价格（属编辑权限；未传 weekday 删除其覆盖回退基础价，ADR-0014 §3） */
+    @SaCheckPermission("gz:bean:seatTypeConfig:edit")
+    @Log(title = "拼豆座位类型按星期价格", businessType = BusinessType.UPDATE)
+    @PutMapping("/{id}/weekday-prices")
+    public R<Void> saveWeekdayPrices(@NotNull @PathVariable Long id,
+                                     @Validated @RequestBody GzBeanSeatTypePriceBo bo) {
+        return toAjax(seatTypeConfigService.saveWeekdayPrices(id, bo) ? 1 : 0);
     }
 }

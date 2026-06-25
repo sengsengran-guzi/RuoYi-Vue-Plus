@@ -21,8 +21,9 @@ import org.springframework.stereotype.Component;
  * 退款单 + 交易行已置 refunded。本 handler 委托 {@link IGzBeanBookingService#onPindouRefunded}：
  * {@code pay_status paid → refunded}，未核销单 {@code status → cancelled} 释放配额；同事务，抛异常整笔回滚。</p>
  *
- * <p><b>券口径（保守默认）</b>：退款只退实付（= 单笔金额 − 券面额），已 used 的券<b>不退还</b>
- * （券让利已消费，退钱又退券 = 双重让利）。如甲方要退券，在 {@code onPindouRefunded} 内加券回退一行。</p>
+ * <p><b>券口径（甲方拍板：退款 = 退实付 + 退券恢复可用）</b>：退实付（= 单笔金额 − 券面额）后，
+ * 未核销消费单的已 used 券回退为 unused（可再用）；已核销消费单（status=used）不退券（服务已享用）。
+ * 券回退在 {@link IGzBeanBookingService#onPindouRefunded} 内随退款确认一并完成。</p>
  *
  * @author kevin-coder (sensenran-guzi · D16 P2)
  */
@@ -42,7 +43,7 @@ public class PindouRefundCallbackHandler implements IRefundCallbackHandler {
     public void onRefunded(GzPayRefund refund, GzPayTransaction txn) {
         // business_order_no = gz_bean_booking.booking_no（submitPaid 建支付单时传入）
         String bookingNo = txn.getBusinessOrderNo();
-        log.info("[pindou-refund] 收到拼豆退款回调 refund_no={} bookingNo={} amount={}（释放配额，已用券不退还）",
+        log.info("[pindou-refund] 收到拼豆退款回调 refund_no={} bookingNo={} amount={}（释放配额，未核销单退券恢复可用）",
             refund.getRefundNo(), bookingNo, refund.getRefundAmountCent());
         bookingService.onPindouRefunded(bookingNo);
     }

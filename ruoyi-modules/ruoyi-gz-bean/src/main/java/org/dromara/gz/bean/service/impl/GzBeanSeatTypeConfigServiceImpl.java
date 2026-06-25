@@ -1,6 +1,7 @@
 package org.dromara.gz.bean.service.impl;
 
 import cn.hutool.core.util.ObjectUtil;
+import cn.hutool.core.util.RandomUtil;
 import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
@@ -12,34 +13,40 @@ import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigQueryBo;
+import org.dromara.gz.bean.domain.bo.GzBeanSeatTypePriceBo;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
+import org.dromara.gz.bean.domain.entity.GzBeanSeatTypePrice;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypeConfigVO;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatTypePriceVO;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper;
+import org.dromara.gz.bean.mapper.GzBeanSeatTypePriceMapper;
 import org.dromara.gz.bean.service.IGzBeanSeatTypeConfigService;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 
 /**
- * gz_bean_seat_type_config 服务实现（GZ-BEAN-013）。
+ * gz_bean_seat_type_config 服务实现（GZ-BEAN-013 → GZ-BEAN-018 升级）。
  *
- * <p>字段口径权威：doc/11 §3.4。模型背景见 ADR-0008。</p>
+ * <p>字段口径权威：doc/11 §3.4。模型背景见 ADR-0008（座位类型配额）+ ADR-0014（去字典自定义类型 +
+ * 整桌/按座双模式 + 按星期价格覆盖）。</p>
  *
- * <p><b>关键决策</b>：</p>
+ * <p><b>V1.2.x 关键变化（ADR-0014）</b>：</p>
  * <ul>
- *   <li>insert / update 手写 toEntity（同 GzBeanSeatServiceImpl D1，不依赖 MapstructUtils 反向）</li>
- *   <li>编辑禁改 storeId / seatType（UNIQUE 键组成稳定），toEntity(skipKey=true) 显式跳过</li>
- *   <li>insert 前校验 seatType ∈ {single,double,quad}（Bo @Pattern 正则 + 本 Set 双层兜底）+ UNIQUE 唯一性</li>
- *   <li>VO 回填 seatTypeName（DictService 翻译）+ priceYuan（priceCent / 100）</li>
- *   <li>enabled / sortNo 缺省兜底（1 / 0）</li>
+ *   <li>去字典：类型不再走 sys_dict gz_bean_seat_type，admin 自由新增（name 自定义 + book_mode + capacity）</li>
+ *   <li>seat_type 列降级为门店内稳定 code，新增时后端自动生成（{@code st<id>}），admin 不填</li>
+ *   <li>name 同店唯一（service + DB uk_gz_bean_stc_name 兜底）</li>
+ *   <li>按星期价格覆盖（{@link GzBeanSeatTypePrice}）：读 / 覆盖式批量存</li>
  * </ul>
  *
- * @author kevin-coder (sensenran-guzi · GZ-BEAN-013)
+ * @author kevin-coder (sensenran-guzi · GZ-BEAN-013 / GZ-BEAN-018)
  */
 @Slf4j
 @Service
@@ -48,16 +55,12 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
 
     private static final int ENABLED_ON = 1;
     private static final int ENABLED_OFF = 0;
-    /**
-     * 合法座位类型（= 字典 gz_bean_seat_type 的 value）。后端兜底校验用硬编码 Set，不走 dictService.getDictLabel
-     * —— 后者在业务租户（1001）上下文查不到系统级字典（seed tenant_id='000000'，缓存按租户隔离）。
-     * 字典权威仍在 sys_dict（前端 dict-tag / useDict select 走字典）；扩展类型时同步加此 Set + Bo @Pattern 正则 + 迁移字典项。
-     * 同 {@code GzNewsArticleServiceImpl.VALID_CATEGORY_CODES} 先例。
-     */
-    private static final Set<String> VALID_SEAT_TYPES = Set.of("single", "double", "quad");
+    /** 合法订法（ADR-0014 §2）：whole=整桌 / seat=按座。Bo @Pattern 已校验，service Set 双层兜底。 */
+    private static final Set<String> VALID_BOOK_MODES = Set.of("whole", "seat");
     private static final BigDecimal CENT_PER_YUAN = new BigDecimal("100");
 
     private final GzBeanSeatTypeConfigMapper baseMapper;
+    private final GzBeanSeatTypePriceMapper seatTypePriceMapper;
 
     @Override
     public TableDataInfo<GzBeanSeatTypeConfigVO> selectPageList(GzBeanSeatTypeConfigQueryBo query, PageQuery pageQuery) {
@@ -87,9 +90,9 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
     @Override
     @Transactional(rollbackFor = Exception.class)
     public boolean insertByBo(GzBeanSeatTypeConfigBo bo) {
-        validateSeatType(bo.getSeatType());
-        if (!checkSeatTypeUnique(bo)) {
-            throw new ServiceException("该门店已配置座位类型：" + bo.getSeatType());
+        validateBookMode(bo.getBookMode());
+        if (!checkNameUnique(bo)) {
+            throw new ServiceException("该门店已存在同名座位类型：" + bo.getName());
         }
         GzBeanSeatTypeConfig add = toEntity(bo, false);
         if (add.getEnabled() == null) {
@@ -98,13 +101,19 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         if (add.getSortNo() == null) {
             add.setSortNo(0);
         }
-        boolean flag = baseMapper.insert(add) > 0;
-        if (flag) {
-            bo.setId(add.getId());
-            log.info("[gz-bean-seat-type-config] INSERT id={} storeId={} seatType={} quantity={} priceCent={}",
-                add.getId(), add.getStoreId(), add.getSeatType(), add.getQuantity(), add.getPriceCent());
+        // seat_type 门店内稳定 code：先填临时唯一值过 NOT NULL + uk，insert 拿 id 后回写 st<id>（ADR-0014 §1）
+        add.setSeatType("tmp" + RandomUtil.randomNumbers(8));
+        if (baseMapper.insert(add) <= 0) {
+            return false;
         }
-        return flag;
+        GzBeanSeatTypeConfig codePatch = new GzBeanSeatTypeConfig();
+        codePatch.setId(add.getId());
+        codePatch.setSeatType("st" + add.getId());
+        baseMapper.updateById(codePatch);
+        bo.setId(add.getId());
+        log.info("[gz-bean-seat-type-config] INSERT id={} storeId={} name={} bookMode={} capacity={} quantity={} priceCent={}",
+            add.getId(), add.getStoreId(), add.getName(), add.getBookMode(), add.getCapacity(), add.getQuantity(), add.getPriceCent());
+        return true;
     }
 
     @Override
@@ -113,12 +122,17 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         if (bo.getId() == null) {
             throw new ServiceException("配置 ID 不能为空");
         }
-        // storeId / seatType 不可改：编辑路径 skipKey=true
+        validateBookMode(bo.getBookMode());
+        if (!checkNameUnique(bo)) {
+            throw new ServiceException("该门店已存在同名座位类型：" + bo.getName());
+        }
+        // storeId / seatType(code) 不可改：编辑路径 skipKey=true
         GzBeanSeatTypeConfig update = toEntity(bo, true);
         boolean flag = baseMapper.updateById(update) > 0;
         if (flag) {
-            log.info("[gz-bean-seat-type-config] UPDATE id={} quantity={} priceCent={} enabled={} sortNo={}",
-                update.getId(), update.getQuantity(), update.getPriceCent(), update.getEnabled(), update.getSortNo());
+            log.info("[gz-bean-seat-type-config] UPDATE id={} name={} bookMode={} capacity={} quantity={} priceCent={} enabled={} sortNo={}",
+                update.getId(), update.getName(), update.getBookMode(), update.getCapacity(),
+                update.getQuantity(), update.getPriceCent(), update.getEnabled(), update.getSortNo());
         }
         return flag;
     }
@@ -130,6 +144,11 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
             return false;
         }
         int affected = baseMapper.deleteByIds(ids);
+        // 级联软删该类型的按星期覆盖价（ADR-0014 §3；价随类型走）
+        for (Long id : ids) {
+            seatTypePriceMapper.delete(Wrappers.<GzBeanSeatTypePrice>lambdaQuery()
+                .eq(GzBeanSeatTypePrice::getSeatTypeConfigId, id));
+        }
         log.info("[gz-bean-seat-type-config] DELETE ids={} affected={}", ids, affected);
         return affected > 0;
     }
@@ -153,18 +172,72 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         return flag;
     }
 
+    @Override
+    public List<GzBeanSeatTypePriceVO> selectWeekdayPrices(Long configId) {
+        if (configId == null) {
+            return List.of();
+        }
+        List<GzBeanSeatTypePrice> rows = seatTypePriceMapper.selectByConfig(configId);
+        List<GzBeanSeatTypePriceVO> vos = new ArrayList<>(rows.size());
+        for (GzBeanSeatTypePrice p : rows) {
+            vos.add(GzBeanSeatTypePriceVO.builder()
+                .weekday(p.getWeekday())
+                .priceCent(p.getPriceCent())
+                .priceYuan(p.getPriceCent() == null ? null
+                    : new BigDecimal(p.getPriceCent()).divide(CENT_PER_YUAN, 2, RoundingMode.HALF_UP))
+                .build());
+        }
+        vos.sort(Comparator.comparing(GzBeanSeatTypePriceVO::getWeekday));
+        return vos;
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public boolean saveWeekdayPrices(Long configId, GzBeanSeatTypePriceBo bo) {
+        if (configId == null) {
+            throw new ServiceException("配置 ID 不能为空");
+        }
+        GzBeanSeatTypeConfig config = baseMapper.selectById(configId);
+        if (config == null) {
+            throw new ServiceException("座位类型配置不存在：" + configId);
+        }
+        // 覆盖式：先清掉该 config 全部周覆盖，再插入传入项（未传 weekday = 删除其覆盖 → 回退基础价，ADR-0014 §3）
+        seatTypePriceMapper.delete(Wrappers.<GzBeanSeatTypePrice>lambdaQuery()
+            .eq(GzBeanSeatTypePrice::getSeatTypeConfigId, configId));
+        int inserted = 0;
+        if (bo != null && bo.getItems() != null) {
+            for (GzBeanSeatTypePriceBo.Item item : bo.getItems()) {
+                if (item.getWeekday() == null || item.getPriceCent() == null) {
+                    continue;
+                }
+                seatTypePriceMapper.insert(GzBeanSeatTypePrice.builder()
+                    .seatTypeConfigId(configId)
+                    .weekday(item.getWeekday())
+                    .priceCent(item.getPriceCent())
+                    .delFlag("0")
+                    .build());
+                inserted++;
+            }
+        }
+        log.info("[gz-bean-seat-type-config] SAVE weekday-prices configId={} inserted={}", configId, inserted);
+        return true;
+    }
+
     /**
      * BO → Entity 手写拷贝。
      *
-     * @param skipKey true=编辑（不拷贝 storeId / seatType — UNIQUE 键组成不可改）
+     * @param skipKey true=编辑（不拷贝 storeId / seatType — UNIQUE 键组成不可改；seatType code 编辑期稳定）
      */
     private GzBeanSeatTypeConfig toEntity(GzBeanSeatTypeConfigBo bo, boolean skipKey) {
         GzBeanSeatTypeConfig e = new GzBeanSeatTypeConfig();
         e.setId(bo.getId());
         if (!skipKey) {
             e.setStoreId(bo.getStoreId());
-            e.setSeatType(bo.getSeatType());
+            // seatType(code) 在 insertByBo 内两步生成，不从 bo 拷
         }
+        e.setName(bo.getName());
+        e.setBookMode(bo.getBookMode());
+        e.setCapacity(bo.getCapacity());
         e.setQuantity(bo.getQuantity());
         e.setPriceCent(bo.getPriceCent());
         e.setEnabled(bo.getEnabled());
@@ -173,33 +246,37 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         return e;
     }
 
-    /** seat_type 必属 single/double/quad 的兜底校验（防绕过 Bo @Pattern；用 {@link #VALID_SEAT_TYPES} 硬编码 Set，原因见其注释）。 */
-    private void validateSeatType(String seatType) {
-        if (StrUtil.isBlank(seatType)) {
-            throw new ServiceException("座位类型不能为空");
-        }
-        if (!VALID_SEAT_TYPES.contains(seatType)) {
-            throw new ServiceException("座位类型无效（应为 single/double/quad 之一）：" + seatType);
+    /** book_mode 必属 whole/seat 的兜底校验（防绕过 Bo @Pattern）。 */
+    private void validateBookMode(String bookMode) {
+        if (StrUtil.isBlank(bookMode) || !VALID_BOOK_MODES.contains(bookMode)) {
+            throw new ServiceException("订法无效（应为 whole 整桌 / seat 按座 之一）：" + bookMode);
         }
     }
 
-    /** UNIQUE(tenant_id, store_id, seat_type) 唯一性（true=唯一可用 / false=已存在） */
-    private boolean checkSeatTypeUnique(GzBeanSeatTypeConfigBo bo) {
-        if (StrUtil.isBlank(bo.getSeatType()) || bo.getStoreId() == null) {
+    /** UNIQUE(tenant_id, store_id, name) 同店不重名（true=唯一可用 / false=已存在）。编辑时排除自身。 */
+    private boolean checkNameUnique(GzBeanSeatTypeConfigBo bo) {
+        if (StrUtil.isBlank(bo.getName())) {
+            return true;
+        }
+        // 编辑时 storeId 可能未传（不可改），用库内现有行的 storeId 校验
+        Long storeId = bo.getStoreId();
+        if (storeId == null && bo.getId() != null) {
+            GzBeanSeatTypeConfig exist = baseMapper.selectById(bo.getId());
+            if (exist != null) {
+                storeId = exist.getStoreId();
+            }
+        }
+        if (storeId == null) {
             return true;
         }
         boolean exist = baseMapper.exists(Wrappers.<GzBeanSeatTypeConfig>lambdaQuery()
-            .eq(GzBeanSeatTypeConfig::getStoreId, bo.getStoreId())
-            .eq(GzBeanSeatTypeConfig::getSeatType, bo.getSeatType())
+            .eq(GzBeanSeatTypeConfig::getStoreId, storeId)
+            .eq(GzBeanSeatTypeConfig::getName, bo.getName())
             .ne(ObjectUtil.isNotNull(bo.getId()), GzBeanSeatTypeConfig::getId, bo.getId()));
         return !exist;
     }
 
-    /**
-     * VO 派生字段回填：priceYuan（分 → 元）。
-     * <p>seatTypeName 不在后端回填 —— 由前端 dict-tag(gz_bean_seat_type) 翻译（同 booking 页 status）；
-     * dictService.getDictLabel 在业务租户上下文查不到系统级字典 000000，故不依赖。</p>
-     */
+    /** VO 派生字段回填：priceYuan（分 → 元）。name/bookMode/capacity 由 AutoMapper 直接映射。 */
     private void fillDerived(GzBeanSeatTypeConfigVO vo) {
         if (vo == null) {
             return;
@@ -218,7 +295,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         }
         lqw.orderByAsc(GzBeanSeatTypeConfig::getStoreId)
             .orderByAsc(GzBeanSeatTypeConfig::getSortNo)
-            .orderByAsc(GzBeanSeatTypeConfig::getSeatType);
+            .orderByAsc(GzBeanSeatTypeConfig::getId);
         return lqw;
     }
 }

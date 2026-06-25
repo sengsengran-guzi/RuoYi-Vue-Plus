@@ -25,7 +25,7 @@ import java.util.List;
  *       {@code List<ProductLine> products} 多明细。</li>
  *   <li><b>去估价</b>：不传金额、后端不算金额；{@code estimated_amount_cent} 落 NULL，实际金额到店核对定。</li>
  *   <li>数量桶 {@code product.qtyBucketCode} 单选驱动「预计回收时长」（命中 {@code gz_recycle_qty_range.duration_minutes}）。</li>
- *   <li>到店档 {@code arrivalSlot}（morning/afternoon）service 内映射 slot_start/slot_end（前端不传时间）。</li>
+ *   <li>到店时段 {@code timeSlotId}（gz_recycle_time_slot.id，按门店可配）service 取其起止落 slot_start/slot_end（GZ-RECYCLE-006）。</li>
  *   <li>{@code imageIds}（旧 submitImageIds 改名）service 兜底必填（抛 4101）。</li>
  * </ul>
  *
@@ -65,13 +65,13 @@ public class GzRecycleAppointmentSubmitBo implements Serializable {
     private LocalDate apptDate;
 
     /**
-     * 到店档（取代旧 slotStart/slotEnd 直传）：morning / afternoon。
+     * 到店时段 id（GZ-RECYCLE-006，gz_recycle_time_slot.id；按门店可配，取代写死的 morning/afternoon）。
      *
-     * <p>service 内固定映射 slot_start/slot_end（morning 10:00-13:00 / afternoon 13:00-17:00），前端不传时间。
-     * 非法取值由 service 抛业务异常。</p>
+     * <p>service 按 timeSlotId 校验「属于本门店 + 启用」并取其 start_time/end_time 落预约单
+     * slot_start/slot_end（前端不传时间）。非法 / 跨店 / 已停用由 service 抛业务异常。</p>
      */
-    @NotBlank(message = "请选择到店时段")
-    private String arrivalSlot;
+    @NotNull(message = "请选择到店时段")
+    private Long timeSlotId;
 
     /** 去重 token（可选） */
     private String dedupClientToken;

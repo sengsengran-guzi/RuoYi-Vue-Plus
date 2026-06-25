@@ -99,13 +99,13 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
      * @return 覆盖该格的当前活跃 booking 数（与 gz_bean_seat_type_config.quantity 比对）
      */
     @Select("SELECT COUNT(*) FROM gz_bean_booking " +
-        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_type = #{seatType} " +
+        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_type_config_id = #{seatTypeConfigId} " +
         "  AND sess_date = #{sessDate} AND slot_start <= #{slot} AND slot_end > #{slot} " +
         "  AND status = 'pending' AND pay_status IN ('paying','paid') AND del_flag = '0' " +
         "FOR UPDATE")
     long countActiveCoveringSlotForUpdate(@Param("tenantId") String tenantId,
                                           @Param("storeId") Long storeId,
-                                          @Param("seatType") String seatType,
+                                          @Param("seatTypeConfigId") Long seatTypeConfigId,
                                           @Param("sessDate") LocalDate sessDate,
                                           @Param("slot") LocalTime slot);
 
@@ -120,12 +120,12 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
      * @return 覆盖该格的当前活跃 booking 数
      */
     @Select("SELECT COUNT(*) FROM gz_bean_booking " +
-        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_type = #{seatType} " +
+        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_type_config_id = #{seatTypeConfigId} " +
         "  AND sess_date = #{sessDate} AND slot_start <= #{slot} AND slot_end > #{slot} " +
         "  AND status = 'pending' AND pay_status IN ('paying','paid') AND del_flag = '0'")
     long countActiveCoveringSlot(@Param("tenantId") String tenantId,
                                  @Param("storeId") Long storeId,
-                                 @Param("seatType") String seatType,
+                                 @Param("seatTypeConfigId") Long seatTypeConfigId,
                                  @Param("sessDate") LocalDate sessDate,
                                  @Param("slot") LocalTime slot);
 
@@ -138,13 +138,13 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
      */
     @Select("SELECT COUNT(*) FROM gz_bean_booking " +
         "WHERE tenant_id = #{tenantId} AND user_id = #{userId} AND store_id = #{storeId} " +
-        "  AND seat_type = #{seatType} AND sess_date = #{sessDate} " +
+        "  AND seat_type_config_id = #{seatTypeConfigId} AND sess_date = #{sessDate} " +
         "  AND slot_start < #{reqEnd} AND slot_end > #{reqStart} " +
         "  AND status = 'pending' AND pay_status IN ('paying','paid') AND del_flag = '0'")
     long countActiveUserOverlap(@Param("tenantId") String tenantId,
                                 @Param("userId") Long userId,
                                 @Param("storeId") Long storeId,
-                                @Param("seatType") String seatType,
+                                @Param("seatTypeConfigId") Long seatTypeConfigId,
                                 @Param("sessDate") LocalDate sessDate,
                                 @Param("reqStart") LocalTime reqStart,
                                 @Param("reqEnd") LocalTime reqEnd);

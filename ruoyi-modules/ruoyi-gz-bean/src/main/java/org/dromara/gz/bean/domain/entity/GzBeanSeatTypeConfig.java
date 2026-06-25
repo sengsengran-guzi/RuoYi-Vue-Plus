@@ -51,10 +51,22 @@ public class GzBeanSeatTypeConfig extends TenantEntity {
     /** FK → gz_bean_store.id */
     private Long storeId;
 
-    /** 座位类型（字典 gz_bean_seat_type：single/double/quad） — UNIQUE(tenant_id, store_id, seat_type) */
+    /**
+     * 门店内稳定 code（旧 single/double/quad；新行后端自动生成，admin 不暴露）— UNIQUE(tenant_id, store_id, seat_type)。
+     * V1.2.x 去字典化后仅作旧数据兼容 + 历史 booking 反查，类型真源是本行自身（ADR-0014 §1）。
+     */
     private String seatType;
 
-    /** 数量（配额上限 = 余量基础） */
+    /** 自定义显示名（取代字典 label；mp 类型卡 + admin + booking 名快照都用它）— UNIQUE(tenant_id, store_id, name) */
+    private String name;
+
+    /** 订法 whole=整桌(不可拆座) / seat=按座(可拼桌)（ADR-0014 §2） */
+    private String bookMode;
+
+    /** 每桌座位数（seat 模式 quantity*capacity = 每 1h 格总座数；whole 模式仅展示用） */
+    private Integer capacity;
+
+    /** 数量（每 1h 格物理单位数 = 桌/单位数；分母按 book_mode 推导，ADR-0014 §2） */
     private Integer quantity;
 
     /** 单价（分） */

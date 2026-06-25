@@ -1,6 +1,5 @@
 package org.dromara.gz.bean.domain.bo;
 
-import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import lombok.Data;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -32,9 +31,9 @@ public class GzBeanPaidBookingSubmitBo implements Serializable {
     @NotNull
     private Long storeId;
 
-    /** 座位类型（single/double/quad，字典 gz_bean_seat_type；取代旧 seatId） */
-    @NotBlank
-    private String seatType;
+    /** 座位类型 config id（gz_bean_seat_type_config.id；取代旧 seatType 字符串，ADR-0014 §5 配额计数 + 计价维度） */
+    @NotNull
+    private Long seatTypeConfigId;
 
     /** 预约日期（yyyy-MM-dd） */
     @NotNull

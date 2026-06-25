@@ -72,11 +72,14 @@ class GzBeanBookingServiceImplTest {
     @Mock private GzBeanStoreMapper storeMapper;
     @Mock private GzUserMapper gzUserMapper;
     @Mock private org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper seatTypeConfigMapper;
+    @Mock private org.dromara.gz.bean.mapper.GzBeanSeatTypePriceMapper seatTypePriceMapper;
     @Mock private org.dromara.gz.bean.mapper.GzBeanTimeSlotTemplateMapper timeSlotTemplateMapper;
     @Mock private org.springframework.beans.factory.ObjectProvider<org.dromara.gz.common.pay.service.IGzPayTransactionService> payServiceProvider;
     @Mock private org.dromara.gz.common.pay.service.IGzPayTransactionService payService;
     @Mock private org.springframework.beans.factory.ObjectProvider<org.dromara.gz.coupon.service.IGzUserCouponService> couponServiceProvider;
     @Mock private org.dromara.gz.coupon.service.IGzUserCouponService couponService;
+    @Mock private org.springframework.beans.factory.ObjectProvider<org.dromara.gz.common.pay.service.IPayRefundService> payRefundServiceProvider;
+    @Mock private org.dromara.gz.common.pay.service.IPayRefundService payRefundService;
 
     private QrCodeSigner qrCodeSigner;
     private GzBeanBookingServiceImpl service;
@@ -88,8 +91,11 @@ class GzBeanBookingServiceImplTest {
         qrCodeSigner = new QrCodeSigner(props);
         service = new GzBeanBookingServiceImpl(
             bookingMapper, bookingLogMapper, storeMapper, gzUserMapper, qrCodeSigner,
-            seatTypeConfigMapper, timeSlotTemplateMapper, payServiceProvider, couponServiceProvider
+            seatTypeConfigMapper, seatTypePriceMapper, timeSlotTemplateMapper, payServiceProvider, couponServiceProvider,
+            payRefundServiceProvider
         );
+        // 按星期价格：默认无覆盖 → effectivePrice 回退基础价（ADR-0014 §3）；个别用例自行覆盖 stub
+        lenient().when(seatTypePriceMapper.selectByConfig(anyLong())).thenReturn(java.util.List.of());
         // 券态机 provider：onPindouPaid / closePindou 在 markPaid/markPayClosed 成功后无条件调 redeem/unlock
         //   （内部判 couponId==null 跳过），故 getObject() 总会被取一次 → lenient stub 返回 mock service。
         lenient().when(couponServiceProvider.getObject()).thenReturn(couponService);
@@ -272,6 +278,88 @@ class GzBeanBookingServiceImplTest {
         // dedup_token 应切到 booking_no 释放座位
         assertEquals("BK20260601000001", booking.getDedupToken());
         verify(bookingLogMapper).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
+        // 未付款单：不发起退款
+        verify(payRefundServiceProvider, never()).getObject();
+    }
+
+    @Test
+    @DisplayName("cancel · 已付款单（paid + out_trade_no + 金额>0）→ 发起全额退款 + status cancelled；券待退款回调退（cancel 内不退）")
+    void cancel_paidBooking_triggersFullRefund() {
+        GzBeanBooking booking = new GzBeanBooking();
+        booking.setId(60L);
+        booking.setStatus("pending");
+        booking.setPayStatus("paid");
+        booking.setBookingNo("BK20260611000060");
+        booking.setOutTradeNo("PINDOU-20260611-000060");
+        booking.setAmountCent(1500L);
+        booking.setCouponId(9L);
+        when(bookingMapper.selectById(60L)).thenReturn(booking);
+        when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
+        when(payServiceProvider.getObject()).thenReturn(payService);
+        org.dromara.gz.common.pay.domain.vo.GzPayTransactionVO txn = new org.dromara.gz.common.pay.domain.vo.GzPayTransactionVO();
+        txn.setId(888L);
+        when(payService.getByOutTradeNo("PINDOU-20260611-000060")).thenReturn(txn);
+        when(payRefundServiceProvider.getObject()).thenReturn(payRefundService);
+
+        service.cancel(60L, "user", "1");
+
+        assertEquals("cancelled", booking.getStatus());
+        // 用原支付交易行 id 发起全额退款，triggeredBy = operatorId
+        org.mockito.ArgumentCaptor<org.dromara.gz.common.pay.domain.bo.RefundApplyBo> cap =
+            org.mockito.ArgumentCaptor.forClass(org.dromara.gz.common.pay.domain.bo.RefundApplyBo.class);
+        verify(payRefundService).apply(cap.capture(), eq("1"));
+        assertEquals(888L, cap.getValue().getTransactionId().longValue());
+        // 真实付款单：券在退款回调里退，cancel 内不调 returnUsed
+        verify(couponService, never()).returnUsed(anyLong());
+    }
+
+    @Test
+    @DisplayName("cancel · 已付款单退款受理失败 → 抛异常（事务回滚：不改 status、不写 log，不退钱就不取消）")
+    void cancel_paidBooking_refundRejected_propagates() {
+        GzBeanBooking booking = new GzBeanBooking();
+        booking.setId(61L);
+        booking.setStatus("pending");
+        booking.setPayStatus("paid");
+        booking.setBookingNo("BK20260611000061");
+        booking.setOutTradeNo("PINDOU-20260611-000061");
+        booking.setAmountCent(1500L);
+        when(bookingMapper.selectById(61L)).thenReturn(booking);
+        when(payServiceProvider.getObject()).thenReturn(payService);
+        org.dromara.gz.common.pay.domain.vo.GzPayTransactionVO txn = new org.dromara.gz.common.pay.domain.vo.GzPayTransactionVO();
+        txn.setId(889L);
+        when(payService.getByOutTradeNo("PINDOU-20260611-000061")).thenReturn(txn);
+        when(payRefundServiceProvider.getObject()).thenReturn(payRefundService);
+        doThrow(new org.dromara.common.core.exception.ServiceException("退款受理失败"))
+            .when(payRefundService).apply(any(), anyString());
+
+        assertThrows(org.dromara.common.core.exception.ServiceException.class,
+            () -> service.cancel(61L, "user", "1"));
+        // 退款受理在 status 改写之前 → 失败即不推进
+        verify(bookingMapper, never()).updateById(any(GzBeanBooking.class));
+        verify(bookingLogMapper, never()).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
+    }
+
+    @Test
+    @DisplayName("cancel · 全券抵扣免费单（paid 但 out_trade_no=NULL）→ 不退款，券 returnUsed 退回可用")
+    void cancel_freeCouponBooking_returnsCouponNoRefund() {
+        GzBeanBooking booking = new GzBeanBooking();
+        booking.setId(62L);
+        booking.setStatus("pending");
+        booking.setPayStatus("paid");
+        booking.setBookingNo("BK20260611000062");
+        booking.setOutTradeNo(null);   // 免费 / 全券抵扣 → 无正向支付单
+        booking.setAmountCent(0L);
+        booking.setCouponId(12L);
+        when(bookingMapper.selectById(62L)).thenReturn(booking);
+        when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
+
+        service.cancel(62L, "user", "1");
+
+        assertEquals("cancelled", booking.getStatus());
+        // 无真实付款 → 不发起退款
+        verify(payRefundServiceProvider, never()).getObject();
+        // 券退回可用
+        verify(couponService).returnUsed(12L);
     }
 
     // ============================================================
@@ -464,7 +552,8 @@ class GzBeanBookingServiceImplTest {
         org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo bo =
             new org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo();
         bo.setStoreId(1L);
-        bo.setSeatType(seatType);
+        // 去字典后下单按 config id；测试 config 固定 id=10L（newConfig），seatType 字符串参数仅作可读标签
+        bo.setSeatTypeConfigId(10L);
         bo.setSessDate(SESS_DATE);
         bo.setSlotStart(start);
         bo.setSlotEnd(end);
@@ -478,9 +567,18 @@ class GzBeanBookingServiceImplTest {
         return u;
     }
 
+    /** 整桌(whole)类型，capacity=1，slotCapacity=quantity（ADR-0014 §2）。 */
     private org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig newConfig(String seatType, int quantity, long priceCent) {
         return org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
-            .id(10L).storeId(1L).seatType(seatType).quantity(quantity).priceCent(priceCent).enabled(1).build();
+            .id(10L).storeId(1L).seatType("st10").name(seatType).bookMode("whole").capacity(1)
+            .quantity(quantity).priceCent(priceCent).enabled(1).build();
+    }
+
+    /** 按座(seat)类型，slotCapacity=quantity*capacity（ADR-0014 §2）。 */
+    private org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig newSeatConfig(int quantity, int capacity, long priceCent) {
+        return org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+            .id(10L).storeId(1L).seatType("st10").name("四人共享桌").bookMode("seat").capacity(capacity)
+            .quantity(quantity).priceCent(priceCent).enabled(1).build();
     }
 
     private GzBeanTimeSlotTemplate newWindow(LocalTime start, LocalTime end) {
@@ -514,10 +612,10 @@ class GzBeanBookingServiceImplTest {
         stubBusinessWindow();
         when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
         when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("single", 8, 1500));
-        when(bookingMapper.countActiveUserOverlap(eq("1001"), eq(1L), eq(1L), eq("single"), any(), any(), any())).thenReturn(0L);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("single", 8, 1500));
+        when(bookingMapper.countActiveUserOverlap(eq("1001"), eq(1L), eq(1L), eq(10L), any(), any(), any())).thenReturn(0L);
         // 区间内第一格（10:00）覆盖活跃数 == quantity (8) → 满
-        when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq("single"), any(), any())).thenReturn(8L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(8L);
 
         ServiceException ex = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("single"), 1L));
         assertEquals(GzBeanErrorCode.QUOTA_FULL, ex.getCode());
@@ -532,11 +630,11 @@ class GzBeanBookingServiceImplTest {
         stubBusinessWindow();
         when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
         when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("single", 1, 1500));
-        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyString(), any(), any(), any())).thenReturn(0L);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("single", 1, 1500));
+        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyLong(), any(), any(), any())).thenReturn(0L);
         // 逐格升序：10:00 活跃 0（放行）→ 11:00 活跃 1（== quantity 满）→ 整笔回滚
-        when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq("single"), any(), eq(LocalTime.of(10, 0)))).thenReturn(0L);
-        when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq("single"), any(), eq(LocalTime.of(11, 0)))).thenReturn(1L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq(10L), any(), eq(LocalTime.of(10, 0)))).thenReturn(0L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq(10L), any(), eq(LocalTime.of(11, 0)))).thenReturn(1L);
 
         ServiceException ex = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("single"), 1L));
         assertEquals(GzBeanErrorCode.QUOTA_FULL, ex.getCode());
@@ -555,12 +653,12 @@ class GzBeanBookingServiceImplTest {
         stubBusinessWindow();
         when(gzUserMapper.selectById(anyLong())).thenAnswer(inv -> newPaidUser(inv.getArgument(0)));
         when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("single", 1, 1500));
-        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyString(), any(), any(), any())).thenReturn(0L);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("single", 1, 1500));
+        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyLong(), any(), any(), any())).thenReturn(0L);
         // 非交叠格恒 0；交叠格 11:00 首次 0（A 放行）、二次 1（B 见 A 已占 → 满）
-        lenient().when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq("single"), any(), eq(LocalTime.of(10, 0)))).thenReturn(0L);
-        lenient().when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq("single"), any(), eq(LocalTime.of(12, 0)))).thenReturn(0L);
-        when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq("single"), any(), eq(LocalTime.of(11, 0)))).thenReturn(0L, 1L);
+        lenient().when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq(10L), any(), eq(LocalTime.of(10, 0)))).thenReturn(0L);
+        lenient().when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq(10L), any(), eq(LocalTime.of(12, 0)))).thenReturn(0L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq(10L), any(), eq(LocalTime.of(11, 0)))).thenReturn(0L, 1L);
         org.dromara.gz.common.pay.domain.vo.MpPayParamsVO pp =
             org.dromara.gz.common.pay.domain.vo.MpPayParamsVO.builder().outTradeNo("PINDOU-20990101-000001").build();
         when(payServiceProvider.getObject()).thenReturn(payService);
@@ -586,10 +684,10 @@ class GzBeanBookingServiceImplTest {
         stubBusinessWindow();
         when(gzUserMapper.selectById(anyLong())).thenAnswer(inv -> newPaidUser(inv.getArgument(0)));
         when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("single", 1, 1500));
-        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyString(), any(), any(), any())).thenReturn(0L);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("single", 1, 1500));
+        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyLong(), any(), any(), any())).thenReturn(0L);
         // 相邻不交叠（A 占 10:00/11:00，B 占 12:00/13:00）→ 各格活跃恒 0，两笔都放行
-        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyString(), any(), any())).thenReturn(0L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyLong(), any(), any())).thenReturn(0L);
         org.dromara.gz.common.pay.domain.vo.MpPayParamsVO pp =
             org.dromara.gz.common.pay.domain.vo.MpPayParamsVO.builder().outTradeNo("PINDOU-X").build();
         when(payServiceProvider.getObject()).thenReturn(payService);
@@ -616,7 +714,7 @@ class GzBeanBookingServiceImplTest {
             newWindow(LocalTime.of(12, 0), LocalTime.of(22, 0))));
         when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
         when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("single", 8, 1500));
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("single", 8, 1500));
 
         // 请求 10:00..13:00 跨越缺失的 11:00 格 → SLOT_RANGE_INVALID
         ServiceException ex = assertThrows(ServiceException.class,
@@ -631,7 +729,7 @@ class GzBeanBookingServiceImplTest {
         GzBeanBookingServiceImpl spy = spyWithRedisOk();
         when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
         when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("single", 8, 1500));
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("single", 8, 1500));
 
         ServiceException ex = assertThrows(ServiceException.class,
             () -> spy.submitPaid(newPaidBo("single", LocalTime.of(10, 0), LocalTime.of(10, 30)), 1L));
@@ -646,9 +744,9 @@ class GzBeanBookingServiceImplTest {
         stubBusinessWindow();
         when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
         when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("single", 4, 1500));
-        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyString(), any(), any(), any())).thenReturn(0L);
-        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyString(), any(), any())).thenReturn(0L);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("single", 4, 1500));
+        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyLong(), any(), any(), any())).thenReturn(0L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyLong(), any(), any())).thenReturn(0L);
         org.dromara.gz.common.pay.domain.vo.MpPayParamsVO pp =
             org.dromara.gz.common.pay.domain.vo.MpPayParamsVO.builder()
                 .outTradeNo("PINDOU-20990101-000002").timeStamp("t").nonceStr("n").build();
@@ -667,7 +765,7 @@ class GzBeanBookingServiceImplTest {
         assertEquals("PINDOU-20990101-000002", vo.getOutTradeNo());
         assertNotNull(vo.getPayParams());
         // 逐格 FOR UPDATE 调 3 次（10/11/12）
-        verify(bookingMapper, times(3)).countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyString(), any(), any());
+        verify(bookingMapper, times(3)).countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyLong(), any(), any());
         // 支付单金额 = 4500
         org.mockito.ArgumentCaptor<org.dromara.gz.common.pay.domain.bo.CreateOrderBo> cap =
             org.mockito.ArgumentCaptor.forClass(org.dromara.gz.common.pay.domain.bo.CreateOrderBo.class);
@@ -683,9 +781,9 @@ class GzBeanBookingServiceImplTest {
         stubBusinessWindow();
         when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
         when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("single", 8, 0));
-        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyString(), any(), any(), any())).thenReturn(0L);
-        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyString(), any(), any())).thenReturn(0L);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("single", 8, 0));
+        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyLong(), any(), any(), any())).thenReturn(0L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyLong(), any(), any())).thenReturn(0L);
 
         org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO vo = spy.submitPaid(newPaidBo("single"), 1L);
 
@@ -718,13 +816,13 @@ class GzBeanBookingServiceImplTest {
         when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
         when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
         // 未配置
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(null);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(null);
         ServiceException ex1 = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("quad"), 1L));
         assertEquals(GzBeanErrorCode.SEAT_TYPE_NOT_CONFIGURED, ex1.getCode());
         // 停用
         org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig disabled = newConfig("quad", 2, 5000);
         disabled.setEnabled(0);
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(disabled);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(disabled);
         ServiceException ex2 = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("quad"), 1L));
         assertEquals(GzBeanErrorCode.SEAT_TYPE_DISABLED, ex2.getCode());
     }
@@ -736,12 +834,93 @@ class GzBeanBookingServiceImplTest {
         stubBusinessWindow();
         when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
         when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("single", 8, 1500));
-        when(bookingMapper.countActiveUserOverlap(eq("1001"), eq(1L), eq(1L), eq("single"), any(), any(), any())).thenReturn(1L);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("single", 8, 1500));
+        when(bookingMapper.countActiveUserOverlap(eq("1001"), eq(1L), eq(1L), eq(10L), any(), any(), any())).thenReturn(1L);
 
         ServiceException ex = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("single"), 1L));
         assertEquals(GzBeanErrorCode.DUPLICATE_USER_BOOKING, ex.getCode());
         verify(bookingMapper, never()).insert(any(GzBeanBooking.class));
+    }
+
+    // ------------------------------ ADR-0014 双模式分母 + 按星期价格 ------------------------------
+
+    private void stubBillingPipeline(GzBeanBookingServiceImpl spy) {
+        when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
+        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
+        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyLong(), any(), any(), any())).thenReturn(0L);
+        org.dromara.gz.common.pay.domain.vo.MpPayParamsVO pp =
+            org.dromara.gz.common.pay.domain.vo.MpPayParamsVO.builder().outTradeNo("PINDOU-ADR14").build();
+        when(payServiceProvider.getObject()).thenReturn(payService);
+        when(payService.createBusinessOrder(any())).thenReturn(pp);
+        when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
+    }
+
+    @Test
+    @DisplayName("submitPaid · seat 模式分母 = quantity*capacity：quantity=2 capacity=4 → 第 8 座(active=8)满拒（whole 模式 quantity=2 早该满，证明用总座数）")
+    void submitPaid_seatMode_denominatorIsQuantityTimesCapacity_reject() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        stubBusinessWindow();
+        when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
+        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newSeatConfig(2, 4, 1500)); // 总座 8
+        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyLong(), any(), any(), any())).thenReturn(0L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyLong(), any(), any())).thenReturn(8L);
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("seat"), 1L));
+        assertEquals(GzBeanErrorCode.QUOTA_FULL, ex.getCode());
+        verify(bookingMapper, never()).insert(any(GzBeanBooking.class));
+    }
+
+    @Test
+    @DisplayName("submitPaid · seat 模式总座未满（active=7 < 8）→ 成功 INSERT（证明分母非 quantity=2）+ bookModeSnapshot=seat")
+    void submitPaid_seatMode_belowTotalSeats_succeeds() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        stubBusinessWindow();
+        stubBillingPipeline(spy);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newSeatConfig(2, 4, 1500)); // 总座 8
+        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyLong(), any(), any())).thenReturn(7L);
+
+        org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO vo =
+            spy.submitPaid(newPaidBo("seat", LocalTime.of(10, 0), LocalTime.of(11, 0)), 1L);
+        assertEquals("paying", vo.getPayStatus());
+        org.mockito.ArgumentCaptor<GzBeanBooking> cap = org.mockito.ArgumentCaptor.forClass(GzBeanBooking.class);
+        verify(bookingMapper).insert(cap.capture());
+        assertEquals("seat", cap.getValue().getBookModeSnapshot(), "下单订法快照 = seat");
+        assertEquals(10L, cap.getValue().getSeatTypeConfigId());
+    }
+
+    @Test
+    @DisplayName("submitPaid · 按星期覆盖价命中：sessDate 当天有覆盖 9999 → amount=9999×1（不用基础价 1500，ADR-0014 §3）")
+    void submitPaid_weekdayPriceOverride_hit() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        stubBusinessWindow();
+        stubBillingPipeline(spy);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("single", 8, 1500));
+        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyLong(), any(), any())).thenReturn(0L);
+        int wd = SESS_DATE.getDayOfWeek().getValue();
+        when(seatTypePriceMapper.selectByConfig(10L)).thenReturn(java.util.List.of(
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypePrice.builder().weekday(wd).priceCent(9999L).build()));
+
+        org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO vo =
+            spy.submitPaid(newPaidBo("single", LocalTime.of(10, 0), LocalTime.of(11, 0)), 1L);
+        assertEquals(9999L, vo.getAmountCent(), "命中当天覆盖价");
+    }
+
+    @Test
+    @DisplayName("submitPaid · 按星期覆盖价未命中（仅配了别的星期）→ 回退基础价 1500×1（ADR-0014 §3）")
+    void submitPaid_weekdayPriceOverride_fallbackToBase() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        stubBusinessWindow();
+        stubBillingPipeline(spy);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("single", 8, 1500));
+        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyLong(), any(), any())).thenReturn(0L);
+        int otherWd = (SESS_DATE.getDayOfWeek().getValue() % 7) + 1; // 一个不等于当天的星期
+        when(seatTypePriceMapper.selectByConfig(10L)).thenReturn(java.util.List.of(
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypePrice.builder().weekday(otherWd).priceCent(9999L).build()));
+
+        org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO vo =
+            spy.submitPaid(newPaidBo("single", LocalTime.of(10, 0), LocalTime.of(11, 0)), 1L);
+        assertEquals(1500L, vo.getAmountCent(), "未命中当天 → 回退基础价");
     }
 
     @Test
@@ -820,9 +999,9 @@ class GzBeanBookingServiceImplTest {
         stubBusinessWindow();
         when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
         when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("double", 4, 3000));
-        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyString(), any(), any(), any())).thenReturn(0L);
-        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyString(), any(), any())).thenReturn(0L);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("double", 4, 3000));
+        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyLong(), any(), any(), any())).thenReturn(0L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyLong(), any(), any())).thenReturn(0L);
         // 锁券返回券面额 1000 分
         when(couponServiceProvider.getObject()).thenReturn(couponService);
         when(couponService.lockForBooking(eq(99L), eq(1L)))
@@ -862,9 +1041,9 @@ class GzBeanBookingServiceImplTest {
         stubBusinessWindow();
         when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
         when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("double", 4, 3000));
-        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyString(), any(), any(), any())).thenReturn(0L);
-        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyString(), any(), any())).thenReturn(0L);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("double", 4, 3000));
+        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyLong(), any(), any(), any())).thenReturn(0L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyLong(), any(), any())).thenReturn(0L);
         when(couponServiceProvider.getObject()).thenReturn(couponService);
         // 券面额 9000 > 总价 6000（=3000×2 格）
         when(couponService.lockForBooking(eq(88L), eq(1L)))
@@ -893,9 +1072,9 @@ class GzBeanBookingServiceImplTest {
         stubBusinessWindow();
         when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
         when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
-        when(seatTypeConfigMapper.selectOne(any())).thenReturn(newConfig("double", 4, 3000));
-        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyString(), any(), any(), any())).thenReturn(0L);
-        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyString(), any(), any())).thenReturn(0L);
+        when(seatTypeConfigMapper.selectById(any())).thenReturn(newConfig("double", 4, 3000));
+        when(bookingMapper.countActiveUserOverlap(anyString(), anyLong(), anyLong(), anyLong(), any(), any(), any())).thenReturn(0L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyLong(), any(), any())).thenReturn(0L);
         when(couponServiceProvider.getObject()).thenReturn(couponService);
         when(couponService.lockForBooking(eq(77L), eq(1L)))
             .thenThrow(new ServiceException("优惠券不可用（已被使用或已过期）"));
@@ -974,16 +1153,23 @@ class GzBeanBookingServiceImplTest {
         GzBeanStore store = newOpenStore(1L);
         store.setTenantId("1001");
         when(storeMapper.selectById(1L)).thenReturn(store);
-        // 配置：single quantity=8 / double quantity=2
-        when(seatTypeConfigMapper.selectList(any())).thenReturn(java.util.List.of(
-            newConfig("single", 8, 1500), newConfig("double", 2, 3000)));
+        // 配置：单人(id=10) whole quantity=8 / 双人(id=20) whole quantity=2（ADR-0014 去字典 + 计数按 config id）
+        org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig cfgSingle =
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+                .id(10L).storeId(1L).seatType("st10").name("单人").bookMode("whole").capacity(1)
+                .quantity(8).priceCent(1500L).enabled(1).build();
+        org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig cfgDouble =
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+                .id(20L).storeId(1L).seatType("st20").name("双人").bookMode("whole").capacity(2)
+                .quantity(2).priceCent(3000L).enabled(1).build();
+        when(seatTypeConfigMapper.selectList(any())).thenReturn(java.util.List.of(cfgSingle, cfgDouble));
         // 午休断窗：10-12 + 14-15（13:00 / 12:00-14:00 不生成）→ 切出 [10:00, 11:00, 14:00] 三格
         when(timeSlotTemplateMapper.selectList(any())).thenReturn(java.util.List.of(
             newWindow(LocalTime.of(10, 0), LocalTime.of(12, 0)),
             newWindow(LocalTime.of(14, 0), LocalTime.of(15, 0))));
-        // single 覆盖活跃 3（< 8 → 未满）；double 覆盖活跃 2（== 2 → 满）
-        when(bookingMapper.countActiveCoveringSlot(eq("1001"), eq(1L), eq("single"), any(), any())).thenReturn(3L);
-        when(bookingMapper.countActiveCoveringSlot(eq("1001"), eq(1L), eq("double"), any(), any())).thenReturn(2L);
+        // 单人(id=10) 覆盖活跃 3（< 8 → 未满）；双人(id=20) 覆盖活跃 2（== 2 → 满）
+        when(bookingMapper.countActiveCoveringSlot(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(3L);
+        when(bookingMapper.countActiveCoveringSlot(eq("1001"), eq(1L), eq(20L), any(), any())).thenReturn(2L);
 
         java.util.List<org.dromara.gz.bean.domain.vo.GzBeanTypeSlotAvailabilityVO> list =
             service.selectTypeSlotAvailability(1L, LocalDate.of(2099, 1, 5));
@@ -997,15 +1183,16 @@ class GzBeanBookingServiceImplTest {
         list.forEach(v -> assertEquals(v.getSlotStart().plusHours(1), v.getSlotEnd()));
 
         org.dromara.gz.bean.domain.vo.GzBeanTypeSlotAvailabilityVO single = list.stream()
-            .filter(v -> "single".equals(v.getSeatType()) && LocalTime.of(10, 0).equals(v.getSlotStart()))
+            .filter(v -> Long.valueOf(10L).equals(v.getSeatTypeConfigId()) && LocalTime.of(10, 0).equals(v.getSlotStart()))
             .findFirst().orElseThrow();
         assertEquals(Boolean.FALSE, single.getFull());
-        // 契约字段名对齐 mp TypeSlotVO（name/unitPriceCent/active），防跨端 shape 断裂
+        // 契约字段名对齐 mp TypeSlotVO（seatTypeConfigId/name/bookMode/unitPriceCent/active），防跨端 shape 断裂
         assertEquals("单人", single.getName());
+        assertEquals("whole", single.getBookMode());
         assertEquals(Boolean.TRUE, single.getActive());
         assertNotNull(single.getUnitPriceCent());
         org.dromara.gz.bean.domain.vo.GzBeanTypeSlotAvailabilityVO dbl = list.stream()
-            .filter(v -> "double".equals(v.getSeatType()) && LocalTime.of(14, 0).equals(v.getSlotStart()))
+            .filter(v -> Long.valueOf(20L).equals(v.getSeatTypeConfigId()) && LocalTime.of(14, 0).equals(v.getSlotStart()))
             .findFirst().orElseThrow();
         assertEquals(Boolean.TRUE, dbl.getFull());
     }
@@ -1041,7 +1228,7 @@ class GzBeanBookingServiceImplTest {
     /* ---------- D16 P2 拼豆退款回调 onPindouRefunded ---------- */
 
     @Test
-    @DisplayName("onPindouRefunded · paid 未核销单 → markRefunded（释放配额）+ 写 log（toStatus cancelled）")
+    @DisplayName("onPindouRefunded · paid 未核销单 → markRefunded（释放配额）+ 退券恢复可用 + 写 log（toStatus cancelled）")
     void onPindouRefunded_paidPending_releasesQuota() {
         GzBeanBooking booking = new GzBeanBooking();
         booking.setId(50L);
@@ -1055,6 +1242,28 @@ class GzBeanBookingServiceImplTest {
         service.onPindouRefunded("BK20260611000050");
 
         verify(bookingMapper).markRefunded(eq(50L), any());
+        // 甲方口径：未核销消费单退款 → 退券恢复可用
+        verify(couponService).returnUsed(7L);
+        verify(bookingLogMapper).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
+    }
+
+    @Test
+    @DisplayName("onPindouRefunded · paid 已核销单（status=used）→ markRefunded 保留 status，券不退（服务已享用）")
+    void onPindouRefunded_paidUsed_keepsCouponNoReturn() {
+        GzBeanBooking booking = new GzBeanBooking();
+        booking.setId(52L);
+        booking.setBookingNo("BK20260611000052");
+        booking.setStatus("used");
+        booking.setPayStatus("paid");
+        booking.setCouponId(8L);
+        when(bookingMapper.selectByBookingNo("BK20260611000052")).thenReturn(booking);
+        when(bookingMapper.markRefunded(eq(52L), any())).thenReturn(1);
+
+        service.onPindouRefunded("BK20260611000052");
+
+        verify(bookingMapper).markRefunded(eq(52L), any());
+        // 已核销消费单退款不退券
+        verify(couponService, never()).returnUsed(anyLong());
         verify(bookingLogMapper).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
     }
 

@@ -4,7 +4,9 @@ import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigQueryBo;
+import org.dromara.gz.bean.domain.bo.GzBeanSeatTypePriceBo;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypeConfigVO;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatTypePriceVO;
 
 import java.util.Collection;
 import java.util.List;
@@ -47,4 +49,10 @@ public interface IGzBeanSeatTypeConfigService {
      * @return 是否成功
      */
     boolean toggleEnabled(Long id, Integer enabled);
+
+    /** 读某类型的按星期价格覆盖（GZ-BEAN-018，ADR-0014 §3）；未覆盖的星期不在列表（回退基础价） */
+    List<GzBeanSeatTypePriceVO> selectWeekdayPrices(Long configId);
+
+    /** 覆盖式批量存某类型的按星期价格（传入即 upsert，未传 weekday 删除其覆盖回退基础价，ADR-0014 §3） */
+    boolean saveWeekdayPrices(Long configId, GzBeanSeatTypePriceBo bo);
 }

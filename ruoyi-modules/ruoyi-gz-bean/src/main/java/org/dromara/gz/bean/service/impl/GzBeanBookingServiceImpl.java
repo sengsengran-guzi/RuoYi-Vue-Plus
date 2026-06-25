@@ -16,6 +16,7 @@ import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
 import org.dromara.gz.bean.domain.entity.GzBeanBooking;
 import org.dromara.gz.bean.domain.entity.GzBeanBookingLog;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
+import org.dromara.gz.bean.domain.entity.GzBeanSeatTypePrice;
 import org.dromara.gz.bean.domain.entity.GzBeanStore;
 import org.dromara.gz.bean.domain.entity.GzBeanTimeSlotTemplate;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
@@ -26,6 +27,7 @@ import org.dromara.gz.bean.exception.GzBeanErrorCode;
 import org.dromara.gz.bean.mapper.GzBeanBookingLogMapper;
 import org.dromara.gz.bean.mapper.GzBeanBookingMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper;
+import org.dromara.gz.bean.mapper.GzBeanSeatTypePriceMapper;
 import org.dromara.gz.bean.mapper.GzBeanStoreMapper;
 import org.dromara.gz.bean.mapper.GzBeanTimeSlotTemplateMapper;
 import org.dromara.gz.bean.service.IGzBeanBookingService;
@@ -33,9 +35,12 @@ import org.dromara.gz.bean.service.internal.QrCodeSigner;
 import org.dromara.gz.common.domain.entity.GzUser;
 import org.dromara.gz.common.mapper.GzUserMapper;
 import org.dromara.gz.common.pay.domain.bo.CreateOrderBo;
+import org.dromara.gz.common.pay.domain.bo.RefundApplyBo;
+import org.dromara.gz.common.pay.domain.vo.GzPayTransactionVO;
 import org.dromara.gz.common.pay.domain.vo.MpPayParamsVO;
 import org.dromara.gz.common.pay.enums.PayBusinessType;
 import org.dromara.gz.common.pay.service.IGzPayTransactionService;
+import org.dromara.gz.common.pay.service.IPayRefundService;
 import org.dromara.gz.coupon.service.IGzUserCouponService;
 import org.dromara.gz.coupon.service.IGzUserCouponService.LockedCoupon;
 import org.springframework.beans.factory.ObjectProvider;
@@ -85,12 +90,6 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     private static final String PAY_STATUS_PAID = "paid";
     private static final String PAY_STATUS_PAY_CLOSED = "pay_closed";
 
-    /** 座位类型 value → 中文名（= 字典 gz_bean_seat_type，附录 A.14）。
-     *  硬编码映射原因同 GzBeanSeatTypeConfigServiceImpl.VALID_SEAT_TYPES：业务租户上下文查不到系统级字典
-     *  （seed tenant_id='000000'，memory ruoyi-menu-dict-gotchas）。扩展类型时同步加此 Map + 字典项。 */
-    private static final Map<String, String> SEAT_TYPE_NAME = Map.of(
-        "single", "单人", "double", "双人", "quad", "四人桌");
-
     /** unpaid 超时回收默认时长（分钟，doc/10 §11 Q11.2，与微信 JSAPI 订单超时对齐） */
     private static final int DEFAULT_UNPAID_TIMEOUT_MINUTES = 15;
 
@@ -114,8 +113,10 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     private final GzBeanStoreMapper storeMapper;
     private final GzUserMapper gzUserMapper;
     private final QrCodeSigner qrCodeSigner;
-    /** V1.2 座位类型配额配置（GZ-BEAN-013）— 下单取单价 + quantity */
+    /** V1.2 座位类型配额配置（GZ-BEAN-013）— 下单取单价 + quantity + book_mode + capacity */
     private final GzBeanSeatTypeConfigMapper seatTypeConfigMapper;
+    /** V1.2.x 按星期价格覆盖（GZ-BEAN-018，ADR-0014 §3）— 下单/余量取生效价 */
+    private final GzBeanSeatTypePriceMapper seatTypePriceMapper;
     /** V1.2 时段模板（GZ-BEAN-002）— 余量查询枚举启用时段 */
     private final GzBeanTimeSlotTemplateMapper timeSlotTemplateMapper;
     /**
@@ -131,6 +132,11 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
      * 但 Provider 注入对未来扩展更安全）。下单锁券 / onPaid 核销 / 关单回滚才用到。
      */
     private final ObjectProvider<IGzUserCouponService> couponServiceProvider;
+    /**
+     * V1.2 退款服务（gz-common PAY-103）— 同样 {@link ObjectProvider} 惰性注入防构造期循环依赖。
+     * 取消已付款单（cancel）时发起微信原路全额退款；pay_status 由退款回调 onPindouRefunded 异步推进。
+     */
+    private final ObjectProvider<IPayRefundService> payRefundServiceProvider;
 
     /**
      * 抢 Redis 锁（{@code SET key NX EX 5}）。protected 便于单测 spy override —
@@ -273,10 +279,21 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                 GzBeanErrorCode.INVALID_STATUS);
         }
 
+        // 真实付款单（pay_status=paid + 有正向支付单 out_trade_no + 金额>0）取消即发起微信原路全额退款。
+        // 受理失败抛异常 → 整个取消事务回滚（不退钱就不取消）。免费单 / 全券抵扣单（out_trade_no=NULL）
+        // 无真实付款，跳过退款。pay_status 由退款回调 onPindouRefunded 异步推进 paid→refunded，
+        // 券回退也在回调里做（退款确认后才退券，避免「退款受理后又失败」白退券）。
+        boolean realPaid = PAY_STATUS_PAID.equals(booking.getPayStatus())
+            && StrUtil.isNotBlank(booking.getOutTradeNo())
+            && booking.getAmountCent() != null && booking.getAmountCent() > 0;
+        if (realPaid) {
+            applyFullRefund(booking, operatorType, operatorId);
+        }
+
         String fromStatus = booking.getStatus();
         booking.setStatus(STATUS_CANCELLED);
         booking.setCancelledTime(LocalDateTime.now());
-        // 释放座位（方案 C dedup_token 切 booking_no）
+        // 释放座位（方案 C dedup_token 切 booking_no；V1.2 配额按 status/pay_status 计数，离 pending 即释放）
         booking.setDedupToken(booking.getBookingNo());
 
         int updated = bookingMapper.updateById(booking);
@@ -284,10 +301,15 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             throw new ServiceException("取消失败：并发冲突");
         }
 
-        // 释放已锁定的优惠券（与 closePindou 超时路径一致）：unlock 内部对 couponId=null 跳过、
-        // WHERE status='locked' 幂等（已 paid 单的券此时是 used，不会被误改）。否则带券未付单
-        // 手动取消后券永久卡 locked、对 usable/my 两个列表都隐藏，用户白丢券（T2.10）。
+        // 券回退（甲方口径「退款 = 退实付 + 退券恢复可用」）：
+        //  - 未付款 / 支付中（券 locked）→ unlock：locked → unused，券可再用（T2.10 防券永久卡 locked）。
+        //  - 免费单 / 全券抵扣单（券已 used 但无真实付款）→ returnUsed：used → unused，券退回可用。
+        //  - 真实付款单（realPaid，券已 used）→ 此处不退券，待退款回调 onPindouRefunded 确认后退（避免白退券）。
+        // unlock / returnUsed 各自 WHERE 状态守卫互不误伤，couponId=NULL 内部跳过。
         couponServiceProvider.getObject().unlock(booking.getCouponId());
+        if (!realPaid) {
+            couponServiceProvider.getObject().returnUsed(booking.getCouponId());
+        }
 
         bookingLogMapper.insert(GzBeanBookingLog.builder()
             .bookingId(bookingId)
@@ -295,11 +317,37 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .toStatus(STATUS_CANCELLED)
             .operatorType(operatorType)
             .operatorId(operatorId)
-            .note(OPERATOR_USER.equals(operatorType) ? "用户取消（券已解锁）" : "管理员代取消（券已解锁）")
+            .note(buildCancelLogNote(operatorType, realPaid))
             .delFlag("0")
             .build());
 
         return selectVoById(bookingId);
+    }
+
+    /**
+     * 取消已付款单 → 发起微信原路全额退款（GZ-PAY-103 apply）。
+     *
+     * <p>out_trade_no → 支付交易行 → apply(transactionId, reason)：同事务 INSERT 退款单(refunding) +
+     * transaction(paid→refunding) + 调微信 V3 退款 API；受理失败抛异常（在 cancel 事务内 → 整体回滚，
+     * 不退钱就不取消）。受理成功后 pay_status 仍 paid，待退款回调 onPindouRefunded 异步推进 refunded。</p>
+     */
+    private void applyFullRefund(GzBeanBooking booking, String operatorType, String operatorId) {
+        GzPayTransactionVO txn = payServiceProvider.getObject().getByOutTradeNo(booking.getOutTradeNo());
+        if (txn == null) {
+            throw new ServiceException("取消失败：未找到原支付单（out_trade_no=" + booking.getOutTradeNo() + "）");
+        }
+        RefundApplyBo refundBo = new RefundApplyBo();
+        refundBo.setTransactionId(txn.getId());
+        refundBo.setReason(OPERATOR_USER.equals(operatorType) ? "用户取消拼豆预约" : "管理员取消拼豆预约");
+        String triggeredBy = StrUtil.isNotBlank(operatorId) ? operatorId : operatorType;
+        payRefundServiceProvider.getObject().apply(refundBo, triggeredBy);
+        log.info("[bean-cancel] full refund applied bookingNo={} outTradeNo={} txnId={} triggeredBy={}",
+            booking.getBookingNo(), booking.getOutTradeNo(), txn.getId(), triggeredBy);
+    }
+
+    private String buildCancelLogNote(String operatorType, boolean realPaid) {
+        String who = OPERATOR_USER.equals(operatorType) ? "用户取消" : "管理员代取消";
+        return who + (realPaid ? "（已发起原路退款，券随退款回调退回）" : "（券已退回）");
     }
 
     // ============================================================
@@ -588,19 +636,16 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             throw new ServiceException("门店不存在");
         }
 
-        // ④ 校验座位类型配置存在 + 启用（拿单价 + quantity）
-        GzBeanSeatTypeConfig config = seatTypeConfigMapper.selectOne(
-            Wrappers.<GzBeanSeatTypeConfig>lambdaQuery()
-                .eq(GzBeanSeatTypeConfig::getStoreId, bo.getStoreId())
-                .eq(GzBeanSeatTypeConfig::getSeatType, bo.getSeatType())
-                .last("LIMIT 1"));
-        if (config == null) {
+        // ④ 校验座位类型配置存在 + 属本门店 + 启用（拿单价 + 分母 + book_mode，ADR-0014 §2/§5）
+        GzBeanSeatTypeConfig config = seatTypeConfigMapper.selectById(bo.getSeatTypeConfigId());
+        if (config == null || config.getStoreId() == null || !config.getStoreId().equals(bo.getStoreId())) {
             throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_NOT_CONFIGURED_MSG, GzBeanErrorCode.SEAT_TYPE_NOT_CONFIGURED);
         }
         if (config.getEnabled() == null || config.getEnabled() != 1) {
             throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_DISABLED_MSG, GzBeanErrorCode.SEAT_TYPE_DISABLED);
         }
-        long quantity = config.getQuantity() == null ? 0L : config.getQuantity();
+        // 每 1h 格配额分母：seat=quantity*capacity（总座数）/ whole=quantity（桌数），每单恒占 1（ADR-0014 §2）
+        long slotCapacity = slotCapacity(config);
 
         // ④.5 区间连续性校验（ADR-0011 §5 / doc/15a §A.2）：把下单区间 [slotStart, slotEnd) 按 1h 展开成
         //   格序列 g1..gN，逐格校验「整点 + 落在某启用窗口内 + 物理相邻连续（午休 gap 不可跨窗口桥接）」。
@@ -611,7 +656,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
 
         // ⑤ 幂等：同用户同 (类型,日期) 已有与本区间重叠的活跃 booking → 拒单（doc/10 §11 Q11.3）
         long userActive = bookingMapper.countActiveUserOverlap(
-            tenantId, userId, bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), bo.getSlotStart(), bo.getSlotEnd());
+            tenantId, userId, bo.getStoreId(), config.getId(), bo.getSessDate(), bo.getSlotStart(), bo.getSlotEnd());
         if (userActive > 0) {
             throw new ServiceException(GzBeanErrorCode.DUPLICATE_USER_BOOKING_MSG, GzBeanErrorCode.DUPLICATE_USER_BOOKING);
         }
@@ -621,17 +666,17 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         //   任一格满即整笔回滚（部分格满无部分成交），msg 含哪格满。
         for (LocalTime slot : reqSlots) {
             long active = bookingMapper.countActiveCoveringSlotForUpdate(
-                tenantId, bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), slot);
-            if (active >= quantity) {
-                log.info("[bean-paid-submit] quota full storeId={} seatType={} date={} slot={} active={} quantity={}",
-                    bo.getStoreId(), bo.getSeatType(), bo.getSessDate(), slot, active, quantity);
+                tenantId, bo.getStoreId(), config.getId(), bo.getSessDate(), slot);
+            if (active >= slotCapacity) {
+                log.info("[bean-paid-submit] quota full storeId={} configId={} mode={} date={} slot={} active={} cap={}",
+                    bo.getStoreId(), config.getId(), config.getBookMode(), bo.getSessDate(), slot, active, slotCapacity);
                 throw new ServiceException(GzBeanErrorCode.QUOTA_FULL_MSG + "（" + slot + " 已满）",
                     GzBeanErrorCode.QUOTA_FULL);
             }
         }
 
-        // ⑦ 计费：实付 = 该类型单价 snapshot × 连续小时数 N（区间格数，ADR-0011 §4 / doc/15a §A.3）
-        long unitPriceCent = config.getPriceCent() == null ? 0L : config.getPriceCent();
+        // ⑦ 计费：实付 = 该类型按星期生效价（覆盖价命中则用、否则基础价）× 连续小时数 N（ADR-0014 §3 / ADR-0011 §4）
+        long unitPriceCent = effectivePrice(config, bo.getSessDate());
         long amountCent = unitPriceCent * hours;
 
         // ⑦.5 锁券抵扣（GZ-COUPON-002，doc/11 §11.3 / doc/10 §12.N4）：选券时事务内 unused → locked，
@@ -650,7 +695,8 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         // ⑧ 生成 booking_no
         LocalDateTime now = LocalDateTime.now();
         String bookingNo = generateBookingNo(now.toLocalDate());
-        String seatTypeName = SEAT_TYPE_NAME.getOrDefault(bo.getSeatType(), bo.getSeatType());
+        // 显示名快照取 config.name（去字典，ADR-0014 §1）；兜底回退 code
+        String seatTypeName = StrUtil.isNotBlank(config.getName()) ? config.getName() : config.getSeatType();
 
         // 免费单 = 实付 ≤ 0：含「免费类型无券」与「券面额 ≥ 单价（全额抵扣）」两种，均走免费单兜底（ADR-0007 §1.4）
         boolean free = payAmountCent <= 0L;
@@ -663,8 +709,10 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .userId(userId)
             .storeId(bo.getStoreId())
             // seatId / seatNoSnapshot / dedupToken：V1.2 不写（NULL）
-            .seatType(bo.getSeatType())
+            .seatType(config.getSeatType())
             .seatTypeSnapshot(seatTypeName)
+            .seatTypeConfigId(config.getId())
+            .bookModeSnapshot(config.getBookMode())
             .sessDate(bo.getSessDate())
             .slotStart(bo.getSlotStart())
             .slotEnd(bo.getSlotEnd())
@@ -675,7 +723,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .couponId(bo.getCouponId())
             .status(STATUS_PENDING)
             .payStatus(free ? PAY_STATUS_PAID : PAY_STATUS_PAYING)
-            .verifyCode(free ? qrCodeSigner.signByType(bookingNo, bo.getSessDate(), bo.getSeatType()) : null)
+            .verifyCode(free ? qrCodeSigner.signByType(bookingNo, bo.getSessDate(), config.getSeatType()) : null)
             .delFlag("0")
             .build();
         bookingMapper.insert(entity);
@@ -699,8 +747,8 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
 
         // ⑪ 免费单兜底：不建支付单，已 paid，直接返回（ADR-0007 §1.4）
         if (free) {
-            log.info("[bean-paid-submit] FREE booking paid bookingNo={} userId={} seatType={} amount=0",
-                bookingNo, userId, bo.getSeatType());
+            log.info("[bean-paid-submit] FREE booking paid bookingNo={} userId={} configId={} amount=0",
+                bookingNo, userId, config.getId());
             return buildPaidSubmitVO(entity, payAmountCent, true, null);
         }
 
@@ -722,8 +770,8 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         bookingMapper.updateById(patch);
         entity.setOutTradeNo(payParams.getOutTradeNo());
 
-        log.info("[bean-paid-submit] PAID booking created bookingNo={} userId={} seatType={} amount={} outTradeNo={}",
-            bookingNo, userId, bo.getSeatType(), payAmountCent, payParams.getOutTradeNo());
+        log.info("[bean-paid-submit] PAID booking created bookingNo={} userId={} configId={} amount={} outTradeNo={}",
+            bookingNo, userId, config.getId(), payAmountCent, payParams.getOutTradeNo());
         return buildPaidSubmitVO(entity, payAmountCent, false, payParams);
     }
 
@@ -751,6 +799,37 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         String couponPart = couponNo == null ? ""
             : String.format("，用券 %s 抵扣 %d 分", couponNo, discountAmountCent);
         return (free ? "用户提交付费预约（免费单，直接 paid）" : "用户提交付费预约（待支付）") + couponPart;
+    }
+
+    /**
+     * 该座位类型每个 1h 格的配额分母（ADR-0014 §2）：
+     * {@code seat = quantity * capacity}（总座数）/ {@code whole = quantity}（桌数）。每单恒占 1 个单位。
+     */
+    private long slotCapacity(GzBeanSeatTypeConfig config) {
+        long quantity = config.getQuantity() == null ? 0L : config.getQuantity();
+        if ("seat".equals(config.getBookMode())) {
+            long capacity = config.getCapacity() == null ? 1L : Math.max(1L, config.getCapacity());
+            return quantity * capacity;
+        }
+        return quantity;
+    }
+
+    /**
+     * 该座位类型在 {@code sessDate} 当天的生效单价（分，ADR-0014 §3）：
+     * 命中按星期覆盖价（{@code gz_bean_seat_type_price}）则用覆盖价，否则回退 config 基础价 {@code price_cent}。
+     */
+    private long effectivePrice(GzBeanSeatTypeConfig config, LocalDate sessDate) {
+        long base = config.getPriceCent() == null ? 0L : config.getPriceCent();
+        if (config.getId() == null || sessDate == null) {
+            return base;
+        }
+        int weekday = sessDate.getDayOfWeek().getValue(); // 1=Mon..7=Sun
+        for (GzBeanSeatTypePrice p : seatTypePriceMapper.selectByConfig(config.getId())) {
+            if (p.getWeekday() != null && p.getWeekday() == weekday && p.getPriceCent() != null) {
+                return p.getPriceCent();
+            }
+        }
+        return base;
     }
 
     // ============================================================
@@ -790,17 +869,22 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
 
             List<GzBeanTypeSlotAvailabilityVO> result = new ArrayList<>(configs.size() * hourSlots.size());
             for (GzBeanSeatTypeConfig cfg : configs) {
-                int quantity = cfg.getQuantity() == null ? 0 : cfg.getQuantity();
-                String typeName = SEAT_TYPE_NAME.getOrDefault(cfg.getSeatType(), cfg.getSeatType());
+                // 每格配额分母按 book_mode 取（seat=quantity*capacity / whole=quantity，ADR-0014 §2）
+                long cap = slotCapacity(cfg);
+                String typeName = StrUtil.isNotBlank(cfg.getName()) ? cfg.getName() : cfg.getSeatType();
+                // 按 sessDate 星期取生效价（覆盖价命中则用、否则基础价，ADR-0014 §3）
+                long effPrice = effectivePrice(cfg, sessDate);
                 for (LocalTime slot : hourSlots) {
                     long activeCount = bookingMapper.countActiveCoveringSlot(
-                        tenantId, storeId, cfg.getSeatType(), sessDate, slot);
-                    // 内部算 full，不暴露 remaining 数字给 mp（doc/15a §A.1 铁律）
-                    boolean full = (quantity - activeCount) <= 0L;
+                        tenantId, storeId, cfg.getId(), sessDate, slot);
+                    // 内部算 full，不暴露 remaining 数字给 mp（doc/15a §A.1 铁律；每单恒占 1 不破铁律）
+                    boolean full = (cap - activeCount) <= 0L;
                     result.add(GzBeanTypeSlotAvailabilityVO.builder()
+                        .seatTypeConfigId(cfg.getId())
                         .seatType(cfg.getSeatType())
                         .name(typeName)
-                        .unitPriceCent(cfg.getPriceCent())
+                        .bookMode(cfg.getBookMode())
+                        .unitPriceCent(effPrice)
                         .slotStart(slot)
                         .slotEnd(slot.plusHours(1))
                         .full(full)
@@ -1029,22 +1113,33 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             log.info("[bean-refund] markRefunded affected=0 (concurrent), idempotent skip bookingNo={}", bookingNo);
             return;
         }
-        // 券口径（保守默认，D16 P2）：退款只退实付（= 单笔金额 − 券面额），已 used 的券【不退还】
-        //   —— 券让利已消费，退钱又退券 = 双重让利。如甲方要退券改口径，此处加 couponService.returnUsed(coupon_id)。
+        // markRefunded 已推进：pay_status paid→refunded；status 仅 pending→cancelled（已 used 保留）。
         boolean wasPending = STATUS_PENDING.equals(booking.getStatus());
+        boolean consumed = STATUS_USED.equals(booking.getStatus());
+        // 券回退（甲方口径「退款 = 退实付 + 退券恢复可用」，D16 P2 旧「不退券」口径已废）：
+        //   未核销消费的单退款 → returnUsed：used → unused，券退回可用（含用户取消已 status=cancelled 的单，
+        //   其券回退统一在退款确认回调里做，保证「退款成功」与「退券」一致）。已核销消费单（status=used）
+        //   退款不退券（服务已享用）。未用券（coupon_id=NULL）内部跳过、WHERE status='used' 守卫幂等。
+        if (!consumed) {
+            couponServiceProvider.getObject().returnUsed(booking.getCouponId());
+        }
+        String statusNote = wasPending ? "，未核销单 status → cancelled，释放配额"
+            : consumed ? "，已核销单保留 status=used"
+            : "，单已取消（status=cancelled），退款回写完成";
+        String couponNote = booking.getCouponId() == null ? ""
+            : consumed ? "；已核销单不退券 couponId=" + booking.getCouponId()
+            : "；券已退回可用 couponId=" + booking.getCouponId();
         bookingLogMapper.insert(GzBeanBookingLog.builder()
             .bookingId(booking.getId())
             .fromStatus(booking.getStatus())
             .toStatus(wasPending ? STATUS_CANCELLED : booking.getStatus())
             .operatorType(OPERATOR_SYSTEM)
             .operatorId(null)
-            .note("退款成功（pay_status paid → refunded）"
-                + (wasPending ? "，未核销单 status → cancelled，释放配额" : "，已核销单保留 status")
-                + (booking.getCouponId() != null ? "；已用券不退还 couponId=" + booking.getCouponId() : ""))
+            .note("退款成功（pay_status paid → refunded）" + statusNote + couponNote)
             .delFlag("0")
             .build());
-        log.info("[bean-refund] booking refunded bookingNo={} wasPending={} (quota {} ) couponId={}",
-            bookingNo, wasPending, wasPending ? "released" : "n/a", booking.getCouponId());
+        log.info("[bean-refund] booking refunded bookingNo={} wasPending={} consumed={} (quota {}) couponId={}",
+            bookingNo, wasPending, consumed, wasPending ? "released" : "n/a", booking.getCouponId());
     }
 
     @Override

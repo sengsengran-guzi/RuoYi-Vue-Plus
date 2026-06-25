@@ -177,6 +177,31 @@ class GzUserCouponServiceImplTest {
         verify(baseMapper).unlockCoupon(10L);
     }
 
+    // ---------------- returnUsed（退款退券恢复可用） ----------------
+
+    @Test
+    @DisplayName("returnUsed · used→unused 退款回退成功（甲方口径：退款=退实付+退券恢复可用）")
+    void returnUsed_happy() {
+        when(baseMapper.returnUsedCoupon(1L)).thenReturn(1);
+        service.returnUsed(1L);
+        verify(baseMapper).returnUsedCoupon(1L);
+    }
+
+    @Test
+    @DisplayName("returnUsed · couponId=null（未用券单）→ 跳过不调 mapper")
+    void returnUsed_nullSkip() {
+        service.returnUsed(null);
+        verify(baseMapper, never()).returnUsedCoupon(any());
+    }
+
+    @Test
+    @DisplayName("returnUsed · affected=0（券非 used，守卫拦死）→ 幂等跳过不抛")
+    void returnUsed_notUsed() {
+        when(baseMapper.returnUsedCoupon(11L)).thenReturn(0);
+        service.returnUsed(11L); // 不抛
+        verify(baseMapper).returnUsedCoupon(11L);
+    }
+
     // ---------------- expireBatch ----------------
 
     @Test

@@ -295,6 +295,20 @@ public class GzUserCouponServiceImpl implements IGzUserCouponService {
     }
 
     @Override
+    public void returnUsed(Long couponId) {
+        if (couponId == null) {
+            return; // 未用券的单（coupon_id 为 NULL）→ 无券可回退，跳过
+        }
+        // 状态 CAS 回退：used → unused（清空 used_time + related）。affected=0 仅记日志不抛（不阻塞退款主流程）。
+        int affected = baseMapper.returnUsedCoupon(couponId);
+        if (affected == 0) {
+            log.warn("[gz-coupon] returnUsed affected=0 (not used / idempotent) couponId={}", couponId);
+            return;
+        }
+        log.info("[gz-coupon] returned used coupon to unused (refund) couponId={}", couponId);
+    }
+
+    @Override
     @Transactional(rollbackFor = Exception.class)
     public CouponExpireResult expireBatch() {
         // cron 无登录态 → 关多租户拦截器全租户扫（V1 仅 '1001'），与 gz-bean markExpiredUnpaidBatch 同模式。

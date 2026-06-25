@@ -89,6 +89,21 @@ public interface GzUserCouponMapper extends BaseMapperPlus<GzUserCoupon, GzUserC
     int unlockCoupon(@Param("id") Long id);
 
     /**
+     * 退款回退已用券（拼豆已付款单取消 / 退款成功）：{@code used → unused}，清空 used_time +
+     * related_pay_out_trade_no（甲方口径「退款 = 退实付 + 退券恢复可用」）。
+     *
+     * <p>WHERE 含 {@code status='used'} 守卫 → 幂等：重复退款回调 affected=0；且只回退「已核销」券，
+     * 不误伤 locked/unused。回到 unused 后若已过 expire_time，由 {@link #expireBatch} 兜底翻 expired。</p>
+     *
+     * @param id 用户券主键
+     * @return 受影响行数（1 = 回退成功 / 0 = 券非 used，幂等跳过）
+     */
+    @Update("UPDATE gz_user_coupon "
+        + "SET status = 'unused', used_time = NULL, related_pay_out_trade_no = NULL, update_time = now() "
+        + "WHERE id = #{id} AND status = 'used' AND del_flag = '0'")
+    int returnUsedCoupon(@Param("id") Long id);
+
+    /**
      * 过期扫描批量推进（SnailJob gzCouponExpireTask）：{@code unused → expired}，doc/11 §11.2 / doc/10 §12.N8。
      *
      * <p>WHERE 含 {@code status='unused'}（<b>仅扫 unused，locked 态不被误伤</b>——已锁定即在用，
