@@ -314,18 +314,30 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
         return reallyPaid ? ReconcileOutcome.PAID : ReconcileOutcome.SKIPPED_TERMINAL;
     }
 
+    /**
+     * 写支付回调审计日志 —— 失败仅记 ERROR、<b>绝不向上抛</b>（GZ-PAY 加固，2026-06-25 真机首单教训）。
+     *
+     * <p>审计是次要、支付状态推进是主要。若审计 INSERT 异常（如列截断 / DB 抖动）向上透传，会让外层
+     * {@link #handlePaymentNotify} 的 {@code @Transactional} 整笔回滚 → {@code pay_status} 永卡 paying
+     * （真机支付全挂）。try/catch 兜底：审计写失败不阻断支付确认。MySQL 列截断是语句级回滚，事务/连接仍可用，
+     * 后续 markPaid 正常提交。</p>
+     */
     private void writeCallbackLog(String transactionId, String outTradeNo, String rawBody,
                                   String signature, String processStatus, String processError) {
-        GzPayCallbackLog log = GzPayCallbackLog.builder()
-            .transactionId(transactionId)
-            .outTradeNo(outTradeNo)
-            .callbackType(CALLBACK_TYPE_PAYMENT)
-            .rawBody(rawBody)
-            .signature(signature)
-            .processStatus(processStatus)
-            .processError(processError)
-            .build();
-        callbackLogMapper.insert(log);
+        try {
+            callbackLogMapper.insert(GzPayCallbackLog.builder()
+                .transactionId(transactionId)
+                .outTradeNo(outTradeNo)
+                .callbackType(CALLBACK_TYPE_PAYMENT)
+                .rawBody(rawBody)
+                .signature(signature)
+                .processStatus(processStatus)
+                .processError(processError)
+                .build());
+        } catch (Exception e) {
+            log.error("[gz-pay] 写支付回调审计日志失败（已忽略，不影响支付确认）out_trade_no={} processStatus={}: {}",
+                outTradeNo, processStatus, e.getMessage(), e);
+        }
     }
 
     // ============================================================

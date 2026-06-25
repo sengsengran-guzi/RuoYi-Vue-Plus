@@ -145,6 +145,31 @@ class GzPayTransactionServiceImplTest {
         verify(callbackDispatcher, times(1)).dispatch(any(GzPayTransaction.class));
     }
 
+    @Test
+    @DisplayName("加固：回调审计日志写入失败（列截断等）→ 不阻断支付确认（仍 markPaid + dispatch + 返回 true）")
+    void handlePaymentNotify_callbackLogInsertFails_stillConfirmsPaid() {
+        NotifyContext ctx = new NotifyContext("0", "n", "sig", "serial", "{}");
+        when(wechatPayClient.parseAndVerifyNotify(ctx)).thenReturn(
+            new CallbackResult("wx_txn_1", "TEST-20260604-000001", "SUCCESS", 1L, null, "{decrypted}"));
+
+        GzPayTransaction tx = new GzPayTransaction();
+        tx.setId(1001L);
+        tx.setVersion(0);
+        tx.setStatus(PayStatus.PENDING);
+        when(transactionMapper.selectByOutTradeNo("TEST-20260604-000001")).thenReturn(tx);
+        when(transactionMapper.markPaid(eq(1001L), eq(0), eq("wx_txn_1"), any(), any())).thenReturn(1);
+        // 模拟真机首单事故：signature 列截断 → 审计 INSERT 抛 DataIntegrityViolationException
+        when(callbackLogMapper.insert(any(GzPayCallbackLog.class)))
+            .thenThrow(new org.springframework.dao.DataIntegrityViolationException("Data too long for column 'signature'"));
+
+        boolean ok = service.handlePaymentNotify(ctx);
+
+        // 关键保证：审计写失败被 try/catch 吞掉 → 支付照常确认（markPaid + SPI 分发），不回滚
+        assertTrue(ok, "审计写失败不应阻断支付确认");
+        verify(transactionMapper).markPaid(eq(1001L), eq(0), eq("wx_txn_1"), any(), any());
+        verify(callbackDispatcher, times(1)).dispatch(any(GzPayTransaction.class));
+    }
+
     // ============================================================
     //  2. 重复回调：订单已 paid → duplicated，不再 markPaid
     // ============================================================

@@ -191,18 +191,28 @@ public class PayRefundServiceImpl implements IPayRefundService {
         return true;
     }
 
+    /**
+     * 写退款回调审计日志 —— 失败仅记 ERROR、<b>绝不向上抛</b>（GZ-PAY 加固，同支付回调口径）。
+     *
+     * <p>审计 INSERT 异常若向上透传，会让外层退款回调 {@code @Transactional} 整笔回滚 → 退款态不推进。
+     * try/catch 兜底：审计写失败不阻断退款确认。</p>
+     */
     private void writeCallbackLog(String transactionId, String outTradeNo, String rawBody,
                                   String signature, String processStatus, String processError) {
-        GzPayCallbackLog cbLog = GzPayCallbackLog.builder()
-            .transactionId(transactionId)
-            .outTradeNo(outTradeNo)
-            .callbackType(CALLBACK_TYPE_REFUND)
-            .rawBody(rawBody)
-            .signature(signature)
-            .processStatus(processStatus)
-            .processError(processError)
-            .build();
-        callbackLogMapper.insert(cbLog);
+        try {
+            callbackLogMapper.insert(GzPayCallbackLog.builder()
+                .transactionId(transactionId)
+                .outTradeNo(outTradeNo)
+                .callbackType(CALLBACK_TYPE_REFUND)
+                .rawBody(rawBody)
+                .signature(signature)
+                .processStatus(processStatus)
+                .processError(processError)
+                .build());
+        } catch (Exception e) {
+            log.error("[gz-pay] 写退款回调审计日志失败（已忽略，不影响退款确认）out_trade_no={} processStatus={}: {}",
+                outTradeNo, processStatus, e.getMessage(), e);
+        }
     }
 
     // ============================================================
