@@ -580,6 +580,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         //   owner / superadmin（staffStoreId == null）→ 受 query.storeId 可选筛选（不限制）。
         Long effectiveStoreId = staffStoreId != null ? staffStoreId : query.getStoreId();
         boolean hasStatusList = query.getStatusList() != null && !query.getStatusList().isEmpty();
+        boolean hasPayStatusList = query.getPayStatusList() != null && !query.getPayStatusList().isEmpty();
         LambdaQueryWrapper<GzBeanBooking> wrapper = Wrappers.<GzBeanBooking>lambdaQuery()
             .eq(effectiveStoreId != null, GzBeanBooking::getStoreId, effectiveStoreId)
             .ge(query.getSessDateFrom() != null, GzBeanBooking::getSessDate, query.getSessDateFrom())
@@ -587,6 +588,8 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             // 状态多选优先（IN），否则回落单值 status（兼容旧调用）
             .in(hasStatusList, GzBeanBooking::getStatus, query.getStatusList())
             .eq(!hasStatusList && StrUtil.isNotBlank(query.getStatus()), GzBeanBooking::getStatus, query.getStatus())
+            // 支付状态多选（IN）
+            .in(hasPayStatusList, GzBeanBooking::getPayStatus, query.getPayStatusList())
             .like(StrUtil.isNotBlank(query.getBookingNo()), GzBeanBooking::getBookingNo, query.getBookingNo())
             .like(StrUtil.isNotBlank(query.getMobile()), GzBeanBooking::getMobileSnapshot, query.getMobile())
             .orderByDesc(GzBeanBooking::getSessDate)

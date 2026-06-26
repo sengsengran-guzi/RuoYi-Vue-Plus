@@ -36,6 +36,9 @@ public class GzBeanBookingQueryBo implements Serializable {
     /** 状态多选（GZ-BEAN-008 admin 列表筛选）；非空时 IN (...)，优先于 status 单值 */
     private List<String> statusList;
 
+    /** 支付状态多选（unpaid/paying/paid/pay_closed/refunded）；非空时 IN (...) */
+    private List<String> payStatusList;
+
     /** 业务码搜索 */
     private String bookingNo;
 
