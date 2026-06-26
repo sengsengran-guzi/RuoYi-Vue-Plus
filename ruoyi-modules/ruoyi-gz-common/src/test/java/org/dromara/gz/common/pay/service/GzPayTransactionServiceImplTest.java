@@ -152,7 +152,7 @@ class GzPayTransactionServiceImplTest {
         verify(callbackLogMapper, times(2)).insert(any(GzPayCallbackLog.class));
         // markPaid 成功 → SPI 分发被调一次（test 单 dispatcher 内部跳过，但 service 仍调 dispatch）
         verify(callbackDispatcher, times(1)).dispatch(any(GzPayTransaction.class));
-        // 发货上报总开关默认关 → 不入队（拼豆服务类经营类目未开放上传，避免无效失败重试）
+        // test 单 resolveShippingInfo 返 empty（无业务 handler）→ 即便开关开也不入队
         verify(shippingService, never()).enqueue(any(GzPayTransaction.class), any());
     }
 

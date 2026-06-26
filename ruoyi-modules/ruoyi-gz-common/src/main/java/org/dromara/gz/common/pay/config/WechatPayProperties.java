@@ -49,15 +49,19 @@ public class WechatPayProperties {
     private String publicKeyId;
 
     /**
-     * 微信「订单中心/购物订单」发货信息上报总开关（默认 <b>关</b>）。
+     * 微信支付「发货管理 / 发货信息录入」上报总开关（默认 <b>开</b>）。
      *
-     * <p>购物订单/发货管理仅向<b>实物电商类</b>小程序开放，拼豆等<b>服务/虚拟类不在约束范围</b>且经营类目
-     * 未开放上传（调 upload_shipping_info 必失败）。故现阶段默认关，避免无效失败重试风暴。</p>
+     * <p>微信支付<b>强制</b>要求小程序支付后上传发货信息 —— 微信已就「谷子宇宙拼豆」4 笔未发货订单发警告，
+     * 明确<b>影响订单资金正常结算</b>。拼豆=到店服务/虚拟单，按虚拟商品 {@code logistics_type=3} 上报
+     * （对应小程序后台「支付与交易-订单管理-发货信息录入」页的 API）。</p>
      *
-     * <p><b>预购（实物跨境电商）上线时</b>：给小程序加实物电商经营类目 → 购物订单申请接入通过 →
-     * 本开关置 {@code true}，拼豆（虚拟 type 3）+ 预购（实物 type 1）即开始上报。一行配置不动代码。</p>
+     * <p><b>勿与「交易组件-购物订单」混淆</b>：那是另一套<b>消费者订单中心插件</b>，电商类目专属（拼豆开通弹
+     * 「经营类目超出范围」），<b>与发货管理无关、不影响结算</b>，忽略即可。</p>
+     *
+     * <p>留作 kill switch：若某业务确不适用上报、或上报接口返权限错误，注入 false 临时关，落
+     * {@code gz_pay_shipping_order.last_error} 排查后再决策。</p>
      */
-    private boolean shippingUploadEnabled = false;
+    private boolean shippingUploadEnabled = true;
 
     /** 回调地址完整 URL（统一下单 notify_url 传给微信，需含域名；real 必填） */
     private String notifyUrl;
