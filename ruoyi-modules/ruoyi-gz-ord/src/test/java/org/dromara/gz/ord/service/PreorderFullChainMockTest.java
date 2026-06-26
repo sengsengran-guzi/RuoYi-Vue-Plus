@@ -79,6 +79,8 @@ class PreorderFullChainMockTest {
     private GzOrdOrderMapper ordOrderMapper;
     @Mock
     private org.dromara.gz.ord.mapper.GzOrdProductMapper ordProductMapper;
+    @Mock
+    private org.dromara.gz.common.pay.service.IGzPayShippingService shippingService;
 
     private MockWechatPayClient mockClient;
     private GzPayTransactionServiceImpl payService;
@@ -126,7 +128,7 @@ class PreorderFullChainMockTest {
             org.mockito.Mockito.mock(org.springframework.beans.factory.ObjectProvider.class);
         lenient().when(dispatcherProvider.getObject()).thenReturn(dispatcher);
         payService = new GzPayTransactionServiceImpl(
-            payTxMapper, callbackLogMapper, generator, mockClient, props, dispatcherProvider);
+            payTxMapper, callbackLogMapper, generator, mockClient, props, shippingService, dispatcherProvider);
 
         wirePayMappers();
         wireOrderMappers();
