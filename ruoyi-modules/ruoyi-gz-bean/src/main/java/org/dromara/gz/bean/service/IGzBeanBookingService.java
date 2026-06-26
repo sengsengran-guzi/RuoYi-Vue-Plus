@@ -226,6 +226,26 @@ public interface IGzBeanBookingService {
     boolean closePindou(Long bookingId);
 
     /**
+     * 用户放弃支付 → 立即关单释放座位配额（mp pay-dismiss 主动调，不等 5min 超时 job）。
+     *
+     * <p>复用 {@link #closePindou} 同款 race-safe 条件 UPDATE（{@code markPayClosed}：
+     * {@code pay_status unpaid/paying → pay_closed} + {@code status pending → cancelled}）：</p>
+     * <ul>
+     *   <li><b>立即释放配额</b>：status 离 pending 即不计活跃（口径 status=pending AND pay_status IN paying/paid）。</li>
+     *   <li><b>race-safe 不误关</b>：真实支付回调先到把单刷成 paid → {@code markPayClosed} WHERE 守卫 affected=0 →
+     *       幂等跳过返 false（绝不关掉已付款单 = 不漏退款）。</li>
+     *   <li>券回滚解锁 + 写 booking_log（operatorType=user 归因，区别于 job 的 system）。</li>
+     * </ul>
+     *
+     * <p><b>所有权</b>：调用方（mp controller）须先校验 booking 属当前用户（同 {@link #cancel} 约定，controller 校验 service 信任）。</p>
+     *
+     * @param bookingId 预约 id
+     * @param operatorId 操作用户 id（落 booking_log.operator_id）
+     * @return true = 关闭成功 / false = 已非 unpaid/paying（已付款 / 已关闭，幂等跳过）
+     */
+    boolean closeUnpaid(Long bookingId, String operatorId);
+
+    /**
      * 批量回收超时未付的占位单（GZ-BEAN-014 AC 8，doc/10 §11.N13a）。
      *
      * <p>扫 {@code pay_status IN (unpaid,paying) AND status=pending AND create_time < now−timeout} →

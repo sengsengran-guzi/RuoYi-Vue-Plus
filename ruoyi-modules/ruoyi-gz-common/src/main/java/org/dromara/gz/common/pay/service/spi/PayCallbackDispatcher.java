@@ -3,11 +3,13 @@ package org.dromara.gz.common.pay.service.spi;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
+import org.dromara.gz.common.pay.shipping.ShippingInfo;
 import org.springframework.stereotype.Component;
 
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * 支付回调业务分发注册中心（GZ-PAY-101 AC 4，决策 D2）。
@@ -89,5 +91,19 @@ public class PayCallbackDispatcher {
             txn.getBusinessType(), handler.getClass().getSimpleName(), txn.getOutTradeNo(), txn.getBusinessOrderNo());
         // 抛异常向上透传 → handlePaymentNotify 事务回滚（doc/10 §6.E2）
         handler.onPaid(txn);
+    }
+
+    /**
+     * 取本笔交易的微信「订单中心」发货信息（无 handler / 业务未接入 → 空）。
+     *
+     * <p>由 {@code handlePaymentNotify} 在 {@link #dispatch} 之后调用，用于落 {@code gz_pay_shipping_order}
+     * + 上报发货信息。<b>与 onPaid 解耦</b>：发货上报失败不应回滚支付，故不在 onPaid 内做。</p>
+     *
+     * @param txn 已置 paid 的支付交易行
+     * @return 发货信息；空 = 该业务不接入订单中心（test 单 / 暂未接入业务）
+     */
+    public Optional<ShippingInfo> resolveShippingInfo(GzPayTransaction txn) {
+        PayCallbackHandler handler = resolve(txn.getBusinessType());
+        return handler == null ? Optional.empty() : handler.buildShippingInfo(txn);
     }
 }

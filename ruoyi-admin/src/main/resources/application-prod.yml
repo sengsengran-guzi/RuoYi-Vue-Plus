@@ -298,6 +298,10 @@ gz:
     public-key-id: ${WECHAT_PAY_PUBLIC_KEY_ID:}       # PUB_KEY_ID_xxxxx，同页可见
     notify-url: ${WECHAT_PAY_NOTIFY_URL:}
     refund-notify-url: ${WECHAT_PAY_REFUND_NOTIFY_URL:}
+    # 微信「订单中心/购物订单」发货信息上报总开关。默认关：购物订单仅向实物电商开放，拼豆等服务/虚拟类
+    # 经营类目未开放上传。预购（实物跨境电商）上线 + 给小程序加实物电商类目 + 购物订单申请接入通过后，
+    # 注入 WECHAT_PAY_SHIPPING_UPLOAD_ENABLED=true 重启即开（拼豆虚拟 type3 + 预购实物 type1 一起上报）。
+    shipping-upload-enabled: ${WECHAT_PAY_SHIPPING_UPLOAD_ENABLED:false}
     test:
       amount-cent: 1
   # mp 真机自测入口（/app/gz/test/**）总开关。prod 默认关（防生产被刷真实订单/打款）；

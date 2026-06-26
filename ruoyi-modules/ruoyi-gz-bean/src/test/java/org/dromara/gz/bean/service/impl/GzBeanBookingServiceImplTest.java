@@ -988,6 +988,52 @@ class GzBeanBookingServiceImplTest {
         verify(bookingLogMapper, never()).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
     }
 
+    @Test
+    @DisplayName("closeUnpaid · 用户放弃支付：paying → pay_closed + status→cancelled（立即释放配额）+ user 归因 log")
+    void closeUnpaid_releasesQuotaWithUserAttribution() {
+        GzBeanBooking booking = GzBeanBooking.builder().id(20L).status("pending").payStatus("paying").build();
+        when(bookingMapper.selectById(20L)).thenReturn(booking);
+        when(bookingMapper.markPayClosed(eq(20L), any())).thenReturn(1);
+
+        boolean closed = service.closeUnpaid(20L, "1");
+
+        assertTrue(closed);
+        verify(bookingMapper).markPayClosed(eq(20L), any());
+        org.mockito.ArgumentCaptor<org.dromara.gz.bean.domain.entity.GzBeanBookingLog> cap =
+            org.mockito.ArgumentCaptor.forClass(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class);
+        verify(bookingLogMapper).insert(cap.capture());
+        assertEquals("user", cap.getValue().getOperatorType());
+        assertEquals("1", cap.getValue().getOperatorId());
+    }
+
+    @Test
+    @DisplayName("closeUnpaid · 真实回调先到已 paid（markPayClosed affected=0）→ 幂等跳过不误关、不写 log（race-safe）")
+    void closeUnpaid_idempotentWhenAlreadyPaid() {
+        GzBeanBooking booking = GzBeanBooking.builder().id(21L).status("pending").payStatus("paid").build();
+        when(bookingMapper.selectById(21L)).thenReturn(booking);
+        when(bookingMapper.markPayClosed(eq(21L), any())).thenReturn(0);
+
+        boolean closed = service.closeUnpaid(21L, "1");
+
+        org.junit.jupiter.api.Assertions.assertFalse(closed);
+        verify(bookingLogMapper, never()).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
+    }
+
+    @Test
+    @DisplayName("closeUnpaid · 用券单放弃支付 → 券回滚解锁（locked→unused，同 closePindou）")
+    void closeUnpaid_withCoupon_unlocks() {
+        GzBeanBooking booking = GzBeanBooking.builder()
+            .id(22L).status("pending").payStatus("paying").couponId(99L).build();
+        when(bookingMapper.selectById(22L)).thenReturn(booking);
+        when(bookingMapper.markPayClosed(eq(22L), any())).thenReturn(1);
+        when(couponServiceProvider.getObject()).thenReturn(couponService);
+
+        boolean closed = service.closeUnpaid(22L, "1");
+
+        assertTrue(closed);
+        verify(couponService).unlock(eq(99L));
+    }
+
     // ============================================================
     //  GZ-COUPON-002 拼豆抵扣（券锁定 / 核销 / 回滚 + 实付重算，doc/11 §11.3）
     // ============================================================

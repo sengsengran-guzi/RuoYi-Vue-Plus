@@ -1064,6 +1064,24 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     @Override
     @Transactional(rollbackFor = Exception.class)
     public boolean closePindou(Long bookingId) {
+        return doClosePindou(bookingId, OPERATOR_SYSTEM, null,
+            "支付关闭（pay_status → pay_closed，status → cancelled），释放配额");
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public boolean closeUnpaid(Long bookingId, String operatorId) {
+        return doClosePindou(bookingId, OPERATOR_USER, operatorId,
+            "用户放弃支付，立即关单释放配额（pay_status → pay_closed，status → cancelled）");
+    }
+
+    /**
+     * 关单核心（race-safe 条件 UPDATE + 券回滚 + 审计日志），closePindou（system/job）与 closeUnpaid（user）共用。
+     *
+     * <p>{@link GzBeanBookingMapper#markPayClosed} 的 {@code WHERE pay_status IN ('unpaid','paying')} 守卫即
+     * 幂等 + race-safe 闸门：真实支付回调先到把单刷 paid → affected=0 → 跳过（绝不关掉已付款单 = 不漏退款）。</p>
+     */
+    private boolean doClosePindou(Long bookingId, String operatorType, String operatorId, String note) {
         GzBeanBooking booking = bookingMapper.selectById(bookingId);
         if (booking == null) {
             return false;
@@ -1082,14 +1100,14 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .bookingId(bookingId)
             .fromStatus(STATUS_PENDING)
             .toStatus(STATUS_CANCELLED)
-            .operatorType(OPERATOR_SYSTEM)
-            .operatorId(null)
-            .note("支付关闭（pay_status → pay_closed，status → cancelled），释放配额"
+            .operatorType(operatorType)
+            .operatorId(operatorId)
+            .note(note
                 + (booking.getCouponId() != null ? "，券已解锁 couponId=" + booking.getCouponId() : ""))
             .delFlag("0")
             .build());
-        log.info("[bean-payclosed] booking closed bookingId={} (quota released) couponId={}",
-            bookingId, booking.getCouponId());
+        log.info("[bean-payclosed] booking closed bookingId={} operatorType={} (quota released) couponId={}",
+            bookingId, operatorType, booking.getCouponId());
         return true;
     }
 

@@ -195,6 +195,32 @@ public class GzBeanBookingMpController {
     }
 
     /**
+     * 用户放弃支付 → 立即关单释放座位配额（mp 下单后取消微信支付浮层时调，不等 5min 超时 job）。
+     *
+     * <p>复用 {@code closeUnpaid}：race-safe 条件 UPDATE（{@code pay_status unpaid/paying → pay_closed} +
+     * {@code status pending → cancelled}），真实回调先到已 paid 则幂等跳过返 false（绝不关已付款单 = 不漏退款）。
+     * 所有权在 controller 校验（同 cancel）。前端 fire-and-forget，关失败由超时 job 兜底。</p>
+     *
+     * @return true = 已关单释放 / false = 已非 unpaid/paying（已付款 / 已关闭，幂等跳过）
+     */
+    @PostMapping("/{id}/close-unpaid")
+    public R<Boolean> closeUnpaid(@PathVariable Long id) {
+        Long userId = LoginHelper.getUserId();
+        if (userId == null) {
+            return R.fail(401, "未登录");
+        }
+        GzBeanBookingVO existed = bookingService.selectVoById(id);
+        if (existed == null) {
+            return R.fail("预约不存在");
+        }
+        if (!String.valueOf(userId).equals(String.valueOf(existed.getUserId()))) {
+            log.warn("[bean-booking-mp] close-unpaid forbidden userId={} but booking.userId={}", userId, existed.getUserId());
+            return R.fail(403, "无权操作该预约");
+        }
+        return R.ok(bookingService.closeUnpaid(id, String.valueOf(userId)));
+    }
+
+    /**
      * mp 店员扫码核销（GZ-BEAN-011 / ADR-0004 决策 2）。
      *
      * <p>店员在 mp 个人中心「管理」区「核销」→ {@code wx.scanCode} 扫顾客预约码（payload

@@ -23,6 +23,7 @@ import org.dromara.gz.common.pay.enums.PayBusinessType;
 import org.dromara.gz.common.pay.enums.PayStatus;
 import org.dromara.gz.common.pay.mapper.GzPayCallbackLogMapper;
 import org.dromara.gz.common.pay.mapper.GzPayTransactionMapper;
+import org.dromara.gz.common.pay.service.IGzPayShippingService;
 import org.dromara.gz.common.pay.service.IGzPayTransactionService;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.CallbackResult;
@@ -77,6 +78,7 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
     private final PayOrderNoGenerator orderNoGenerator;
     private final IWechatPayClient wechatPayClient;
     private final WechatPayProperties payProperties;
+    private final IGzPayShippingService shippingService;
     /**
      * 支付回调 SPI 分发器 —— 用 {@link ObjectProvider} 延迟解析以打断构造期循环依赖。
      *
@@ -281,7 +283,17 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
         tx.setTransactionId(transactionId);
         tx.setFeeCent(feeCent);
         tx.setPaidTime(paidTime);
-        callbackDispatcherProvider.getObject().dispatch(tx);
+        PayCallbackDispatcher dispatcher = callbackDispatcherProvider.getObject();
+        dispatcher.dispatch(tx);
+
+        // ⑥' 发货信息上报入队（微信「订单中心」，消除支付完成页「未接入购物订单与卡包」提示）。
+        //     与 onPaid 解耦（resolveShippingInfo 独立于 dispatch）：上报走 gz_pay_shipping_order +
+        //     异步上报 + SnailJob 兜底，enqueue 内部 catch 兜底，<b>上报失败绝不回滚支付</b>（同 writeCallbackLog 纪律）。
+        //     总开关默认关：购物订单仅向实物电商开放，拼豆等服务/虚拟类经营类目未开放上传（调了必失败），
+        //     预购（实物电商）上线 + 类目接入后置 gz.pay.shipping-upload-enabled=true 再开（决策见 WechatPayProperties）。
+        if (payProperties.isShippingUploadEnabled()) {
+            dispatcher.resolveShippingInfo(tx).ifPresent(info -> shippingService.enqueue(tx, info));
+        }
 
         // ⑥ callback_log processed
         writeCallbackLog(transactionId, outTradeNo, rawBody, signature, CB_PROCESSED, null);

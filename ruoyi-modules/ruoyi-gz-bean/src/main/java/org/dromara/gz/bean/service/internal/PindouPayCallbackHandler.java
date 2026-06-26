@@ -6,7 +6,10 @@ import org.dromara.gz.bean.service.IGzBeanBookingService;
 import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
 import org.dromara.gz.common.pay.enums.PayBusinessType;
 import org.dromara.gz.common.pay.service.spi.PayCallbackHandler;
+import org.dromara.gz.common.pay.shipping.ShippingInfo;
 import org.springframework.stereotype.Component;
+
+import java.util.Optional;
 
 /**
  * 拼豆付费支付成功回调 handler（GZ-BEAN-014 AC 5，激活 {@code PayBusinessType.PINDOU}）。
@@ -43,5 +46,14 @@ public class PindouPayCallbackHandler implements PayCallbackHandler {
         log.info("[pindou-onpaid] 收到拼豆支付回调 bookingNo={} outTradeNo={} amount={}",
             bookingNo, txn.getOutTradeNo(), txn.getAmountCent());
         bookingService.onPindouPaid(bookingNo, txn.getOutTradeNo());
+    }
+
+    /**
+     * 拼豆 = 到店座位预约，纯虚拟服务（无实物物流）→ 上报微信订单中心为虚拟商品（logistics_type=3）。
+     * 消除支付完成页「当前支付的小程序尚未接入：购物订单与卡包」提示。
+     */
+    @Override
+    public Optional<ShippingInfo> buildShippingInfo(GzPayTransaction txn) {
+        return Optional.of(ShippingInfo.virtual("谷子宇宙·拼豆预约 " + txn.getBusinessOrderNo()));
     }
 }

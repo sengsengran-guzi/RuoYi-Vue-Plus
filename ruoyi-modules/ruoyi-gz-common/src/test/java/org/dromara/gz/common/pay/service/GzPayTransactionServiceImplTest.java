@@ -30,7 +30,10 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.beans.factory.ObjectProvider;
 
 import java.time.LocalDateTime;
+import org.dromara.gz.common.pay.shipping.ShippingInfo;
+
 import java.util.List;
+import java.util.Optional;
 import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -73,6 +76,9 @@ class GzPayTransactionServiceImplTest {
     @Mock
     private PayCallbackDispatcher callbackDispatcher;
 
+    @Mock
+    private IGzPayShippingService shippingService;
+
     private WechatPayProperties payProperties;
 
     private GzPayTransactionServiceImpl service;
@@ -82,11 +88,14 @@ class GzPayTransactionServiceImplTest {
         payProperties = new WechatPayProperties();
         payProperties.setClientMode("mock");
         payProperties.getTest().setAmountCent(1L);
+        // 发货信息上报与 onPaid 解耦：mock dispatcher 默认无桩 → resolveShippingInfo 返 null 会 NPE，
+        // 显式桩成 empty（test 单本就不接订单中心，不触 enqueue）
+        lenient().when(callbackDispatcher.resolveShippingInfo(any())).thenReturn(Optional.empty());
         @SuppressWarnings("unchecked")
         ObjectProvider<PayCallbackDispatcher> callbackDispatcherProvider = mock(ObjectProvider.class);
         lenient().when(callbackDispatcherProvider.getObject()).thenReturn(callbackDispatcher);
         service = new GzPayTransactionServiceImpl(
-            transactionMapper, callbackLogMapper, orderNoGenerator, wechatPayClient, payProperties, callbackDispatcherProvider);
+            transactionMapper, callbackLogMapper, orderNoGenerator, wechatPayClient, payProperties, shippingService, callbackDispatcherProvider);
     }
 
     // ============================================================
@@ -143,6 +152,31 @@ class GzPayTransactionServiceImplTest {
         verify(callbackLogMapper, times(2)).insert(any(GzPayCallbackLog.class));
         // markPaid 成功 → SPI 分发被调一次（test 单 dispatcher 内部跳过，但 service 仍调 dispatch）
         verify(callbackDispatcher, times(1)).dispatch(any(GzPayTransaction.class));
+        // 发货上报总开关默认关 → 不入队（拼豆服务类经营类目未开放上传，避免无效失败重试）
+        verify(shippingService, never()).enqueue(any(GzPayTransaction.class), any());
+    }
+
+    @Test
+    @DisplayName("发货上报开关开：回调 paid + resolveShippingInfo 命中 → enqueue 入队（预购实物电商上线后场景）")
+    void handlePaymentNotify_shippingEnabled_enqueues() {
+        payProperties.setShippingUploadEnabled(true);
+        NotifyContext ctx = new NotifyContext("0", "n", "sig", "serial", "{}");
+        when(wechatPayClient.parseAndVerifyNotify(ctx)).thenReturn(
+            new CallbackResult("wx_txn_2", "PINDOU-20260704-000001", "SUCCESS", 1L, null, "{decrypted}"));
+
+        GzPayTransaction tx = new GzPayTransaction();
+        tx.setId(2002L);
+        tx.setVersion(0);
+        tx.setStatus(PayStatus.PENDING);
+        when(transactionMapper.selectByOutTradeNo("PINDOU-20260704-000001")).thenReturn(tx);
+        when(transactionMapper.markPaid(eq(2002L), eq(0), eq("wx_txn_2"), any(), any())).thenReturn(1);
+        when(callbackDispatcher.resolveShippingInfo(any()))
+            .thenReturn(Optional.of(ShippingInfo.virtual("谷子宇宙·拼豆预约")));
+
+        boolean ok = service.handlePaymentNotify(ctx);
+
+        assertTrue(ok);
+        verify(shippingService, times(1)).enqueue(any(GzPayTransaction.class), any());
     }
 
     @Test

@@ -70,6 +70,9 @@ class GzPayBusinessFullChainMockTest {
     @Mock
     private org.dromara.gz.common.pay.mapper.GzPayRefundMapper refundMapper;
 
+    @Mock
+    private IGzPayShippingService shippingService;
+
     private MockWechatPayClient mockClient;
     private PayCallbackDispatcher dispatcher;
     /** 测试内联 preorder 支付 handler（真实 handler 已下沉 gz-ord，此处仅验 SPI 路由命中） */
@@ -108,7 +111,7 @@ class GzPayBusinessFullChainMockTest {
 
         PayOrderNoGenerator generator = new PayOrderNoGenerator(transactionMapper, refundMapper, PayGeneratorTestSupport.inMemoryRedisson());
         service = new GzPayTransactionServiceImpl(
-            transactionMapper, callbackLogMapper, generator, mockClient, props, dispatcherProvider);
+            transactionMapper, callbackLogMapper, generator, mockClient, props, shippingService, dispatcherProvider);
 
         wireInMemoryMappers();
     }

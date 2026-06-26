@@ -48,6 +48,17 @@ public class WechatPayProperties {
     /** 微信支付公钥 ID（公钥模式必填，形如 PUB_KEY_ID_xxxxx，env var ${WECHAT_PAY_PUBLIC_KEY_ID}） */
     private String publicKeyId;
 
+    /**
+     * 微信「订单中心/购物订单」发货信息上报总开关（默认 <b>关</b>）。
+     *
+     * <p>购物订单/发货管理仅向<b>实物电商类</b>小程序开放，拼豆等<b>服务/虚拟类不在约束范围</b>且经营类目
+     * 未开放上传（调 upload_shipping_info 必失败）。故现阶段默认关，避免无效失败重试风暴。</p>
+     *
+     * <p><b>预购（实物跨境电商）上线时</b>：给小程序加实物电商经营类目 → 购物订单申请接入通过 →
+     * 本开关置 {@code true}，拼豆（虚拟 type 3）+ 预购（实物 type 1）即开始上报。一行配置不动代码。</p>
+     */
+    private boolean shippingUploadEnabled = false;
+
     /** 回调地址完整 URL（统一下单 notify_url 传给微信，需含域名；real 必填） */
     private String notifyUrl;
 

@@ -1,6 +1,9 @@
 package org.dromara.gz.common.pay.service.spi;
 
 import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
+import org.dromara.gz.common.pay.shipping.ShippingInfo;
+
+import java.util.Optional;
 
 /**
  * 支付成功回调业务分发 SPI（GZ-PAY-101 AC 4）。
@@ -47,4 +50,18 @@ public interface PayCallbackHandler {
      *            定位自己的业务订单）
      */
     void onPaid(GzPayTransaction txn);
+
+    /**
+     * 构造本笔交易的微信「订单中心」发货信息（upload_shipping_info，消除支付完成页「未接入购物订单」提示）。
+     *
+     * <p>默认返回 {@link Optional#empty()} = 不上报发货信息（test 单 / 暂未接入订单中心的业务）。需要接入
+     * 的业务（如拼豆）override 返回 {@link ShippingInfo}（虚拟商品 = {@link ShippingInfo#virtual}）。返回值
+     * 由 PAY-101 在交易 paid 后落 {@code gz_pay_shipping_order} + 异步上报，<b>上报失败不回滚支付</b>。</p>
+     *
+     * @param txn 已置 paid 的支付交易行
+     * @return 发货信息；空 = 本业务不接入订单中心
+     */
+    default Optional<ShippingInfo> buildShippingInfo(GzPayTransaction txn) {
+        return Optional.empty();
+    }
 }

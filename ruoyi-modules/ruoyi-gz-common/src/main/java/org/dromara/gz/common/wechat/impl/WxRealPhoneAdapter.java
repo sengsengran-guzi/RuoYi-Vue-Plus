@@ -7,15 +7,10 @@ import cn.hutool.json.JSONUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.exception.ServiceException;
-import org.dromara.common.redis.utils.RedisUtils;
-import org.dromara.gz.common.wechat.WxMiniappProperties;
+import org.dromara.gz.common.wechat.WxAccessTokenManager;
 import org.dromara.gz.common.wechat.WxPhoneAdapter;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.stereotype.Component;
-
-import java.time.Duration;
-import java.util.HashMap;
-import java.util.Map;
 
 /**
  * 微信手机号 real 通道实现（getuserphonenumber）。
@@ -25,13 +20,12 @@ import java.util.Map;
  *
  * <p>调用链（doc/10 §3.N6 手机号强收集）：</p>
  * <pre>
- * 1. access_token = cgi-bin/token（client_credential，appid + secret）— Redis 缓存复用
+ * 1. access_token = {@link WxAccessTokenManager}（全局共享 Redis 缓存，cgi-bin/token）
  * 2. POST wxa/business/getuserphonenumber?access_token=... body={code} → phone_info.purePhoneNumber
  * </pre>
  *
- * <p>access_token 全局缓存（key {@code wx:miniapp:access_token}，TTL = expires_in - 余量）：微信侧
- * access_token 有并发刷新限制（同一时刻只有一个有效），且与本应用其它微信能力（客服 / 订阅消息）共享，
- * 故集中在本类用 Redis 缓存。token 失效（errcode 40001/42001/40014）时强刷一次重试。</p>
+ * <p>access_token 不再本类私有持有 —— 抽到 {@link WxAccessTokenManager} 统一管理（手机号 / 发货录入等
+ * 共用一份，避免互顶失效）。token 失效（errcode 40001/42001/40014）时调 {@code getToken(true)} 强刷重试。</p>
  *
  * <p>不引入 weixin-java SDK（CLAUDE.md §6 #8 不发散依赖）；复用 {@link WxRealLoginAdapter} 同款 hutool
  * {@code HttpUtil} + {@code JSONUtil}。</p>
@@ -44,37 +38,25 @@ import java.util.Map;
 @ConditionalOnExpression("'${wx.miniapp.appid:wxMOCK}' != 'wxMOCK'")
 public class WxRealPhoneAdapter implements WxPhoneAdapter {
 
-    /** access_token 获取接口。 */
-    private static final String ACCESS_TOKEN_URL = "https://api.weixin.qq.com/cgi-bin/token";
-
     /** 手机号获取接口。 */
     private static final String GET_PHONE_URL = "https://api.weixin.qq.com/wxa/business/getuserphonenumber";
-
-    /** access_token Redis 缓存 key。 */
-    private static final String ACCESS_TOKEN_CACHE_KEY = "wx:miniapp:access_token";
 
     /** HTTP 超时（毫秒）。 */
     private static final int HTTP_TIMEOUT_MS = 5000;
 
-    /** access_token 提前过期余量（秒）— 避免取到临界刚过期的 token。 */
-    private static final long TOKEN_EXPIRE_SAFETY_SECONDS = 300L;
-
-    /** access_token 默认有效期（秒）— 微信侧通常返 7200，兜底用。 */
-    private static final long TOKEN_DEFAULT_TTL_SECONDS = 7200L;
-
-    private final WxMiniappProperties properties;
+    private final WxAccessTokenManager accessTokenManager;
 
     @Override
     public String code2Phone(String code) {
         if (StrUtil.isBlank(code)) {
             throw new ServiceException("手机号授权 code 不能为空");
         }
-        JSONObject resp = callGetPhone(code, getAccessToken(false));
+        JSONObject resp = callGetPhone(code, accessTokenManager.getToken(false));
         Integer errcode = resp.getInt("errcode");
         // token 失效 → 强刷一次重试（40001 invalid / 42001 expired / 40014 invalid token）
         if (errcode != null && (errcode == 40001 || errcode == 42001 || errcode == 40014)) {
             log.warn("[wx-phone] access_token 失效 errcode={}，强刷重试", errcode);
-            resp = callGetPhone(code, getAccessToken(true));
+            resp = callGetPhone(code, accessTokenManager.getToken(true));
         }
         return extractPhone(resp);
     }
@@ -123,50 +105,5 @@ public class WxRealPhoneAdapter implements WxPhoneAdapter {
             throw new ServiceException("微信获取手机号失败：手机号为空");
         }
         return phone;
-    }
-
-    /**
-     * 取 access_token（Redis 缓存优先）。
-     *
-     * @param forceRefresh true 时跳过缓存强制重新拉取（token 失效重试场景）
-     */
-    private String getAccessToken(boolean forceRefresh) {
-        if (!forceRefresh) {
-            String cached = RedisUtils.getCacheObject(ACCESS_TOKEN_CACHE_KEY);
-            if (StrUtil.isNotBlank(cached)) {
-                return cached;
-            }
-        }
-        Map<String, Object> params = new HashMap<>(4);
-        params.put("grant_type", "client_credential");
-        params.put("appid", properties.getAppid());
-        params.put("secret", properties.getSecret());
-
-        String body;
-        try {
-            body = HttpUtil.createGet(ACCESS_TOKEN_URL)
-                .form(params)
-                .timeout(HTTP_TIMEOUT_MS)
-                .execute()
-                .body();
-        } catch (Exception e) {
-            log.error("[wx-phone] 获取 access_token 网络异常", e);
-            throw new ServiceException("微信侧网络异常，请稍后重试");
-        }
-        JSONObject json = JSONUtil.parseObj(body);
-        String token = json.getStr("access_token");
-        if (StrUtil.isBlank(token)) {
-            log.warn("[wx-phone] 获取 access_token 失败 errcode={} errmsg={}",
-                json.getInt("errcode"), json.getStr("errmsg"));
-            throw new ServiceException("微信获取 access_token 失败: " + json.getStr("errmsg"));
-        }
-        Integer expiresIn = json.getInt("expires_in");
-        long ttl = (expiresIn != null ? expiresIn : TOKEN_DEFAULT_TTL_SECONDS) - TOKEN_EXPIRE_SAFETY_SECONDS;
-        if (ttl < 60L) {
-            ttl = 60L;
-        }
-        RedisUtils.setCacheObject(ACCESS_TOKEN_CACHE_KEY, token, Duration.ofSeconds(ttl));
-        log.info("[wx-phone] access_token 刷新成功 ttl={}s", ttl);
-        return token;
     }
 }
