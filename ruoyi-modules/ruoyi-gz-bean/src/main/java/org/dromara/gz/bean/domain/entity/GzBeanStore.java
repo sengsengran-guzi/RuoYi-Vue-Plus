@@ -70,6 +70,9 @@ public class GzBeanStore extends TenantEntity {
     /** 营业时间字符串（V1.0 人肉字符串） */
     private String businessHours;
 
+    /** 门店图片（gz_file_object.id，可空；无图 mp 不显示） */
+    private Long imageId;
+
     /** 状态 open=营业 / closed=停业 / maintenance=维护中 */
     private String status;
 

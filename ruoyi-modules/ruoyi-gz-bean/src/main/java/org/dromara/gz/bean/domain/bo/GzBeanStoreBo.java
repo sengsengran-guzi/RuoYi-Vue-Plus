@@ -75,6 +75,9 @@ public class GzBeanStoreBo extends BaseEntity {
     @Size(max = 255, message = "营业时间长度不能超过 255", groups = {AddGroup.class, EditGroup.class})
     private String businessHours;
 
+    /** 门店图片（gz_file_object.id，可空；admin 上传，mp 无图不显示） */
+    private Long imageId;
+
     /** 状态 open / closed / maintenance — 不填默认 open */
     @Pattern(regexp = "^(open|closed|maintenance)$", message = "门店状态仅支持 open / closed / maintenance",
         groups = {AddGroup.class, EditGroup.class})

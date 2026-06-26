@@ -11,6 +11,8 @@ import org.dromara.gz.bean.domain.bo.GzBeanStoreQueryBo;
 import org.dromara.gz.bean.domain.entity.GzBeanStore;
 import org.dromara.gz.bean.domain.vo.GzBeanStoreVO;
 import org.dromara.gz.bean.mapper.GzBeanStoreMapper;
+import org.dromara.gz.common.domain.vo.GzFileObjectVO;
+import org.dromara.gz.common.service.IGzFileService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -49,12 +51,14 @@ class GzBeanStoreServiceImplTest {
 
     @Mock
     private GzBeanStoreMapper baseMapper;
+    @Mock
+    private IGzFileService fileService;
 
     private GzBeanStoreServiceImpl service;
 
     @BeforeEach
     void setUp() {
-        service = new GzBeanStoreServiceImpl(baseMapper);
+        service = new GzBeanStoreServiceImpl(baseMapper, fileService);
     }
 
     // ------------------------------ insertByBo ------------------------------
@@ -198,6 +202,46 @@ class GzBeanStoreServiceImplTest {
         assertEquals(1, result.size());
         assertEquals("CD001", result.get(0).getStoreNo());
         verify(baseMapper).selectVoList(any(Wrapper.class));
+    }
+
+    @Test
+    @DisplayName("selectMpList 解析门店图片签名 URL（imageId 命中 → imageUrl；无 imageId → null，不调 fileService）")
+    void selectMpList_resolvesImageUrl() {
+        GzBeanStoreVO withImg = new GzBeanStoreVO();
+        withImg.setId(1L);
+        withImg.setStoreNo("CD001");
+        withImg.setImageId(900L);
+        GzBeanStoreVO noImg = new GzBeanStoreVO();
+        noImg.setId(2L);
+        noImg.setStoreNo("CD002");
+        // noImg.imageId 留 null
+        when(baseMapper.selectVoList(any(Wrapper.class))).thenReturn(List.of(withImg, noImg));
+        GzFileObjectVO file = new GzFileObjectVO();
+        file.setUrl("https://oss/signed/store.png?sign=x");
+        when(fileService.getPresignedUrl(900L)).thenReturn(file);
+
+        List<GzBeanStoreVO> result = service.selectMpList();
+
+        assertEquals("https://oss/signed/store.png?sign=x", result.get(0).getImageUrl());
+        assertNull(result.get(1).getImageUrl());
+        verify(fileService).getPresignedUrl(900L);
+        verify(fileService, never()).getPresignedUrl(null);
+    }
+
+    @Test
+    @DisplayName("selectMpList 图片解析异常 → imageUrl 兜底 null（不抛、不阻断列表）")
+    void selectMpList_imageUrlResolveFailsGracefully() {
+        GzBeanStoreVO vo = new GzBeanStoreVO();
+        vo.setId(1L);
+        vo.setStoreNo("CD001");
+        vo.setImageId(901L);
+        when(baseMapper.selectVoList(any(Wrapper.class))).thenReturn(List.of(vo));
+        when(fileService.getPresignedUrl(901L)).thenThrow(new RuntimeException("oss down"));
+
+        List<GzBeanStoreVO> result = service.selectMpList();
+
+        assertEquals(1, result.size());
+        assertNull(result.get(0).getImageUrl());
     }
 
     // ------------------------------ selectOptions ------------------------------

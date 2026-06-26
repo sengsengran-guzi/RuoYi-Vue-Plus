@@ -53,6 +53,16 @@ public class GzBeanStoreVO implements Serializable {
     /** 营业时间字符串 */
     private String businessHours;
 
+    /** 门店图片 file id（gz_file_object.id；admin 回显 / GzImageThumb 用） */
+    private Long imageId;
+
+    /**
+     * 门店图片可访问 URL（1h 预签名）。
+     * <p>仅 mp 端 {@code selectMpList} 由 imageId 解析填充；admin 端不填（走 imageId + GzImageThumb）。
+     * 无图 / 解析失败 → null（mp 不显示，不回退占位）。AutoMapper 无对应 entity 字段 → 不参与映射。</p>
+     */
+    private String imageUrl;
+
     /** 状态 open / closed / maintenance */
     private String status;
 

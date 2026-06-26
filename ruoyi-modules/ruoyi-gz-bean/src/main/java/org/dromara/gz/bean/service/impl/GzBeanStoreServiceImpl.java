@@ -16,6 +16,7 @@ import org.dromara.gz.bean.domain.entity.GzBeanStore;
 import org.dromara.gz.bean.domain.vo.GzBeanStoreVO;
 import org.dromara.gz.bean.mapper.GzBeanStoreMapper;
 import org.dromara.gz.bean.service.IGzBeanStoreService;
+import org.dromara.gz.common.service.IGzFileService;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -50,6 +51,8 @@ public class GzBeanStoreServiceImpl implements IGzBeanStoreService {
     private static final int DEFAULT_MAX_ADVANCE_DAYS = 14;
 
     private final GzBeanStoreMapper baseMapper;
+    /** 门店图片 file id → 1h 预签名 URL（mp 端 selectMpList 解析用） */
+    private final IGzFileService fileService;
 
     @Override
     public TableDataInfo<GzBeanStoreVO> selectPageList(GzBeanStoreQueryBo query, PageQuery pageQuery) {
@@ -134,6 +137,7 @@ public class GzBeanStoreServiceImpl implements IGzBeanStoreService {
         e.setLatitude(bo.getLatitude());
         e.setPhone(bo.getPhone());
         e.setBusinessHours(bo.getBusinessHours());
+        e.setImageId(bo.getImageId());
         e.setStatus(bo.getStatus());
         e.setMaxAdvanceDays(bo.getMaxAdvanceDays());
         e.setRemark(bo.getRemark());
@@ -160,7 +164,26 @@ public class GzBeanStoreServiceImpl implements IGzBeanStoreService {
             .eq(GzBeanStore::getType, DEFAULT_TYPE)
             .eq(GzBeanStore::getStatus, DEFAULT_STATUS)
             .orderByAsc(GzBeanStore::getStoreNo);
-        return baseMapper.selectVoList(lqw);
+        List<GzBeanStoreVO> list = baseMapper.selectVoList(lqw);
+        // 门店图片：image_id → 1h 预签名 URL（私有桶，不存裸串）。无图 / 解析失败 → imageUrl 留 null，mp 不显示（不回退占位）。
+        for (GzBeanStoreVO vo : list) {
+            vo.setImageUrl(resolveImageUrl(vo.getImageId()));
+        }
+        return list;
+    }
+
+    /** image_id → 可访问预签名 URL；null / 解析失败 → null（不抛、不回退占位，同 gz-gacha 口径）。 */
+    private String resolveImageUrl(Long imageId) {
+        if (imageId == null) {
+            return null;
+        }
+        try {
+            var file = fileService.getPresignedUrl(imageId);
+            return file == null ? null : file.getUrl();
+        } catch (Exception ex) {
+            log.warn("[gz-bean-store] resolve image url failed imageId={}", imageId, ex);
+            return null;
+        }
     }
 
     @Override
