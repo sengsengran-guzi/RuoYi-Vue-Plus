@@ -82,10 +82,18 @@ public class GzBeanBookingVO implements Serializable {
     /** V1.2 支付单业务码（免费单为 null） */
     private String outTradeNo;
 
+    /** 业务状态机 pending / used / cancelled / no_show（内部，与 payStatus 正交，ADR-0007） */
     private String status;
 
-    /** V1.2 付费状态机 unpaid/paying/paid/pay_closed/refunded（前端 dict-tag gz_bean_pay_status 翻译） */
+    /** V1.2 付费状态机 unpaid/paying/paid/pay_closed/refunded（内部，支付/配额/对账引擎用） */
     private String payStatus;
+
+    /**
+     * admin 展示用「单一综合状态」（派生码，dict-tag gz_bean_booking_status 翻译）。
+     * 由 {@link org.dromara.gz.bean.service.impl.GzBeanBookingServiceImpl#deriveBizStatus} 从
+     * (status, payStatus) 推导：paid/used/cancelled/refunded/no_show（真实订单）+ unpaid/closed（从没付成功）。
+     */
+    private String bizStatus;
 
     @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
     private LocalDateTime verifyTime;

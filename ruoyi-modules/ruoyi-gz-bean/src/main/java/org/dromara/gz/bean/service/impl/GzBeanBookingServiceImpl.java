@@ -56,6 +56,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 /**
  * 拼豆预约服务实现（GZ-BEAN-004）。
@@ -89,6 +90,16 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     private static final String PAY_STATUS_PAYING = "paying";
     private static final String PAY_STATUS_PAID = "paid";
     private static final String PAY_STATUS_PAY_CLOSED = "pay_closed";
+    private static final String PAY_STATUS_REFUNDED = "refunded";
+
+    /** admin 单一综合状态 bizStatus 派生码（= 字典 gz_bean_booking_status dict_value，VO 派生回显/筛选用） */
+    private static final String BIZ_PAID = "paid";
+    private static final String BIZ_USED = "used";
+    private static final String BIZ_CANCELLED = "cancelled";
+    private static final String BIZ_REFUNDED = "refunded";
+    private static final String BIZ_NO_SHOW = "no_show";
+    private static final String BIZ_UNPAID = "unpaid";
+    private static final String BIZ_CLOSED = "closed";
 
     /** unpaid 超时回收默认时长（分钟，doc/10 §11 Q11.2，与微信 JSAPI 订单超时对齐） */
     private static final int DEFAULT_UNPAID_TIMEOUT_MINUTES = 15;
@@ -491,6 +502,8 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         }
         // 门店名 + 地址（详情页顶部 / 列表卡片用）
         enrichStoreInfo(vo);
+        // 派生单一综合状态供 admin dict-tag 回显（详情抽屉 / 核销·取消返回）
+        vo.setBizStatus(deriveBizStatus(vo.getStatus(), vo.getPayStatus()));
         // 核销码 QR payload（详情页渲码用，BEAN-005）：按 bookingNo + sessDate + seatId 即时重算，
         // 口径与 BEAN-004 submit 返回一致；payload 不持久化（doc/11 §3.6 verifyCode 不入 VO 字段）。
         vo.setQrPayload(buildQrPayload(vo));
@@ -579,25 +592,92 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         //   staff 绑定门店（staffStoreId != null）→ 强制按其门店，忽略前端传入的 query.storeId（防越权看别店）；
         //   owner / superadmin（staffStoreId == null）→ 受 query.storeId 可选筛选（不限制）。
         Long effectiveStoreId = staffStoreId != null ? staffStoreId : query.getStoreId();
-        boolean hasStatusList = query.getStatusList() != null && !query.getStatusList().isEmpty();
-        boolean hasPayStatusList = query.getPayStatusList() != null && !query.getPayStatusList().isEmpty();
+        boolean hasBizStatusList = query.getBizStatusList() != null && !query.getBizStatusList().isEmpty();
         LambdaQueryWrapper<GzBeanBooking> wrapper = Wrappers.<GzBeanBooking>lambdaQuery()
             .eq(effectiveStoreId != null, GzBeanBooking::getStoreId, effectiveStoreId)
             .ge(query.getSessDateFrom() != null, GzBeanBooking::getSessDate, query.getSessDateFrom())
             .le(query.getSessDateTo() != null, GzBeanBooking::getSessDate, query.getSessDateTo())
-            // 状态多选优先（IN），否则回落单值 status（兼容旧调用）
-            .in(hasStatusList, GzBeanBooking::getStatus, query.getStatusList())
-            .eq(!hasStatusList && StrUtil.isNotBlank(query.getStatus()), GzBeanBooking::getStatus, query.getStatus())
-            // 支付状态多选（IN）
-            .in(hasPayStatusList, GzBeanBooking::getPayStatus, query.getPayStatusList())
             .like(StrUtil.isNotBlank(query.getBookingNo()), GzBeanBooking::getBookingNo, query.getBookingNo())
-            .like(StrUtil.isNotBlank(query.getMobile()), GzBeanBooking::getMobileSnapshot, query.getMobile())
-            .orderByDesc(GzBeanBooking::getSessDate)
+            .like(StrUtil.isNotBlank(query.getMobile()), GzBeanBooking::getMobileSnapshot, query.getMobile());
+        // 综合状态筛选：非空 → 按所选 bizStatus 映射到 (status,pay_status) 条件（含 unpaid/closed 才显从没付成功的）；
+        //   空 → 默认只显「真实订单」(pay_status∈paid,refunded)，从没付成功的占位单不算订单、默认隐藏。
+        if (hasBizStatusList) {
+            applyBizStatusFilter(wrapper, query.getBizStatusList());
+        } else {
+            wrapper.in(GzBeanBooking::getPayStatus, List.of(PAY_STATUS_PAID, PAY_STATUS_REFUNDED));
+        }
+        wrapper.orderByDesc(GzBeanBooking::getSessDate)
             .orderByDesc(GzBeanBooking::getSlotStart);
         Page<GzBeanBookingVO> page = bookingMapper.selectVoPage(pageQuery.build(), wrapper);
         // 列表展示门店名 → 批量 enrich（复用 BEAN-005 私有方法，避免 N+1）
         enrichStoreInfoBatch(page.getRecords());
+        // 派生单一综合状态供 admin dict-tag 回显
+        page.getRecords().forEach(vo -> vo.setBizStatus(deriveBizStatus(vo.getStatus(), vo.getPayStatus())));
         return TableDataInfo.build(page);
+    }
+
+    /**
+     * 由 (status, payStatus) 推导 admin 展示用「单一综合状态」bizStatus（= 字典 gz_bean_booking_status dict_value）。
+     *
+     * <p>口径与迁移 V202607050001 / 字典严格一致。优先判 pay_closed / refunded（此时 status 已是 cancelled，
+     * 但展示应体现支付结局）；其余按 status 展开，pending 再按是否已付分 paid / unpaid。</p>
+     */
+    public static String deriveBizStatus(String status, String payStatus) {
+        if (PAY_STATUS_PAY_CLOSED.equals(payStatus)) {
+            return BIZ_CLOSED;
+        }
+        if (PAY_STATUS_REFUNDED.equals(payStatus)) {
+            return BIZ_REFUNDED;
+        }
+        if (STATUS_USED.equals(status)) {
+            return BIZ_USED;
+        }
+        if (STATUS_CANCELLED.equals(status)) {
+            return BIZ_CANCELLED;
+        }
+        if (STATUS_NO_SHOW.equals(status)) {
+            return BIZ_NO_SHOW;
+        }
+        if (STATUS_PENDING.equals(status)) {
+            return PAY_STATUS_PAID.equals(payStatus) ? BIZ_PAID : BIZ_UNPAID;
+        }
+        // 理论不可达（status 枚举已穷尽）；容错返原值，dict-tag 无匹配显原码而非空
+        return status;
+    }
+
+    /**
+     * admin「综合状态」多选筛选：把所选 bizStatus 映射回底层 (status, pay_status) 条件，OR 组合。
+     * 形如 {@code AND ( (status=pending AND pay_status=paid) OR (status=used) OR ... )}。未知值忽略。
+     */
+    private void applyBizStatusFilter(LambdaQueryWrapper<GzBeanBooking> wrapper, List<String> bizStatusList) {
+        Map<String, Consumer<LambdaQueryWrapper<GzBeanBooking>>> mapping = new LinkedHashMap<>();
+        mapping.put(BIZ_PAID, w -> w.eq(GzBeanBooking::getStatus, STATUS_PENDING).eq(GzBeanBooking::getPayStatus, PAY_STATUS_PAID));
+        mapping.put(BIZ_USED, w -> w.eq(GzBeanBooking::getStatus, STATUS_USED));
+        mapping.put(BIZ_CANCELLED, w -> w.eq(GzBeanBooking::getStatus, STATUS_CANCELLED).eq(GzBeanBooking::getPayStatus, PAY_STATUS_PAID));
+        mapping.put(BIZ_REFUNDED, w -> w.eq(GzBeanBooking::getPayStatus, PAY_STATUS_REFUNDED));
+        mapping.put(BIZ_NO_SHOW, w -> w.eq(GzBeanBooking::getStatus, STATUS_NO_SHOW));
+        mapping.put(BIZ_UNPAID, w -> w.eq(GzBeanBooking::getStatus, STATUS_PENDING)
+            .in(GzBeanBooking::getPayStatus, List.of(PAY_STATUS_UNPAID, PAY_STATUS_PAYING)));
+        mapping.put(BIZ_CLOSED, w -> w.eq(GzBeanBooking::getPayStatus, PAY_STATUS_PAY_CLOSED));
+
+        List<Consumer<LambdaQueryWrapper<GzBeanBooking>>> conds = bizStatusList.stream()
+            .map(mapping::get)
+            .filter(java.util.Objects::nonNull)
+            .toList();
+        if (conds.isEmpty()) {
+            // 全是未知值 → 不应命中任何行（避免退化成无筛选）
+            wrapper.eq(GzBeanBooking::getId, -1L);
+            return;
+        }
+        wrapper.and(outer -> {
+            for (int i = 0; i < conds.size(); i++) {
+                if (i == 0) {
+                    outer.and(conds.get(i));
+                } else {
+                    outer.or(conds.get(i));
+                }
+            }
+        });
     }
 
     // ============================================================
