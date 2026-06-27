@@ -109,8 +109,12 @@ spring:
     baseline-description: ruoyi-base-before-flyway
     table: flyway_schema_history
     encoding: UTF-8
-    # 严格顺序（不允许乱序补跑）+ 启动校验已应用脚本 checksum（迁移文件一旦应用不可改）
-    out-of-order: false
+    # out-of-order=true：允许乱序补跑 —— 新迁移即便时间戳 < 已应用的最大版本，仍作为 pending 正常执行，
+    #   不再因「晚提交 / 时间戳手填偏小」hard-fail（A 类 out-of-order 启动失败）。gz 迁移多为独立
+    #   字典/菜单/建表 seed、无跨文件依赖，跨环境应用顺序差异风险低。
+    # validate-on-migrate=true：仍启动校验已应用脚本 checksum —— 防 B 类「改/删/复用已应用迁移」漂移。
+    #   ⚠️ 两者互补：out-of-order 只解 A 类；B 类靠「迁移 append-only 不可变」纪律（CLAUDE.md §5 / kevin-coder §0）。
+    out-of-order: true
     validate-on-migrate: true
     # 不使用 Flyway 占位符替换：迁移脚本即最终 SQL，注释中可自由写 ${ENV_VAR}（如支付 env var 名）
     # 而不被当成 ${...} 占位符 hard-fail。env var 注入由应用运行时负责，不经 Flyway。
