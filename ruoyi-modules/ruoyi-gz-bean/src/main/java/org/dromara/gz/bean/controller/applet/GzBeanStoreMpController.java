@@ -1,5 +1,6 @@
 package org.dromara.gz.bean.controller.applet;
 
+import cn.dev33.satoken.annotation.SaIgnore;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.domain.R;
@@ -17,14 +18,16 @@ import java.util.List;
  * <p>路径 {@code /app/gz/bean/store}（sensenran C 端 mp 前缀 {@code /app/}，
  * 与 admin {@code /system/} 区分）。</p>
  *
- * <p>登录态：本接口需登录态（拼豆预约前提；浏览态不允许选门店）。
- * sa-token mp-client 鉴权域 — 默认要求 token，未登录 → 401（由全局拦截，无需 @SaIgnore）。</p>
+ * <p><b>匿名可读</b>（{@link SaIgnore}）：拼豆是落地首页 tab，游客需先浏览门店/日期/座位类型再决定是否
+ * 登录预约（browse-first，与 news/gacha/商品 一致）；登录仅在「提交预约」(booking/paid-submit) 处由
+ * mp 端 ensureLoggedIn 弹协议 sheet 触发。只读目录无敏感数据。</p>
  *
- * <p>语义（doc/10 §3 / doc/11 §3.1）：仅返回 type='pindou' + status='open' 的门店；
- * V1.0 只有 1 行（成都春熙路店）。mp UI 单门店时隐藏选择条直接显示门店名（doc/12 MP-BEAN-SELECT）。</p>
+ * <p>语义（doc/10 §3 / doc/11 §3.1）：仅返回 type='pindou' + status='open' 的门店。
+ * mp UI 单门店时隐藏选择条直接显示门店名（doc/12 MP-BEAN-SELECT）。</p>
  *
  * @author kevin-coder (sensenran-guzi · GZ-BEAN-001)
  */
+@SaIgnore
 @Slf4j
 @RestController
 @RequiredArgsConstructor

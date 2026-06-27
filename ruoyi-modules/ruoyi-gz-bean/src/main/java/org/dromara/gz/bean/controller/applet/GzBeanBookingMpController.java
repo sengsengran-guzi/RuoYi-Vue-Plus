@@ -1,6 +1,7 @@
 package org.dromara.gz.bean.controller.applet;
 
 import cn.dev33.satoken.annotation.SaCheckPermission;
+import cn.dev33.satoken.annotation.SaIgnore;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -108,6 +109,9 @@ public class GzBeanBookingMpController {
      * 每档：full=false → 「可约」可点；full=true → 「已满」灰显不可点。不下发余量数字（doc/15a §A.1 铁律）。
      * </pre>
      */
+    // 匿名可读：拼豆落地页游客浏览「座位类型×时段」可约/价格所需（browse-first，与门店/时段列表一致）；
+    // 仅只读可用性，不含个人数据。本类其余端点（提交/我的/取消/店员/核销）仍需登录态，故注解打在方法级。
+    @SaIgnore
     @GetMapping("/type-slots")
     public R<List<GzBeanTypeSlotAvailabilityVO>> typeSlots(
         @RequestParam Long storeId,

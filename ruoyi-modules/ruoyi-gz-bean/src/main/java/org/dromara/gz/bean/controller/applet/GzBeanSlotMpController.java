@@ -1,5 +1,6 @@
 package org.dromara.gz.bean.controller.applet;
 
+import cn.dev33.satoken.annotation.SaIgnore;
 import jakarta.validation.constraints.NotNull;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -29,8 +30,12 @@ import java.util.List;
  * <p>service 内部按 {@code enabled=1} + {@code weekdays} 含 date 的星期 + {@code effective_date / expire_date}
  * 范围过滤（doc/11 §3.2 重要语义），mp 端直接渲染即可。</p>
  *
+ * <p><b>匿名可读</b>（{@link SaIgnore}）：拼豆落地页游客浏览时段所需，无敏感数据（browse-first，
+ * 与门店列表一致）；登录仅在「提交预约」处触发。</p>
+ *
  * @author kevin-coder (sensenran-guzi · GZ-BEAN-003)
  */
+@SaIgnore
 @Slf4j
 @Validated
 @RestController
