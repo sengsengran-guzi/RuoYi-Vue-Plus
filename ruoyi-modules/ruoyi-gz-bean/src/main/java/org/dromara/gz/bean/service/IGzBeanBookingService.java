@@ -4,12 +4,15 @@ import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
+import org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
 import org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatMapVO;
 import org.dromara.gz.bean.domain.vo.GzBeanStaffOverviewVO;
 import org.dromara.gz.bean.domain.vo.GzBeanTypeSlotAvailabilityVO;
 
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.List;
 
 /**
@@ -188,6 +191,26 @@ public interface IGzBeanBookingService {
     List<GzBeanTypeSlotAvailabilityVO> selectTypeSlotAvailability(Long storeId, LocalDate sessDate);
 
     /**
+     * mp 影院选座可用性查询（GZ-BEAN-024，ADR-0015 §3 / doc/11 §3.4「可用性接口 VO」）。
+     *
+     * <p>返回该门店该日全部<b>启用且挂桌型</b>（{@code seat_type_config_id NOT NULL 且 enabled=1}）的座位单元，
+     * 每座一档 = {@code seatId / seatNo / tableNo / zone / seatTypeConfigId / typeName（config.name）/
+     * bookMode / unitPriceCent（按 sessDate 星期取生效价）/ full（该座在 [slotStart, slotEnd) 内任一格被占）}。
+     * mp 影院图按 zone / 桌型 / table_no 分组渲染，对所选区间逐座算 full（被占 → 灰显不可点）。</p>
+     *
+     * <p><b>区间未选</b>（{@code slotStart} / {@code slotEnd} 任一为空）→ 仅返回座位布局，{@code full} 恒 false
+     * （供选区间前预览影院图）。<b>区间已选</b> → 先校验区间连续性（同 submit 口径），精确算每座 full。
+     * 取代 ADR-0014 的「类型 × 格」可用性 VO（{@link #selectTypeSlotAvailability}，mp 029 改后保留兼容）。</p>
+     *
+     * @param storeId   门店 ID
+     * @param sessDate  预约日期
+     * @param slotStart 区间起（整点，可空 = 仅预览布局）
+     * @param slotEnd   区间止（整点，可空）
+     * @return 按 zone / 桌型 sortNo / table_no / seatNo 升序的座位单元可用性列表
+     */
+    List<GzBeanSeatMapVO> selectSeatMap(Long storeId, LocalDate sessDate, LocalTime slotStart, LocalTime slotEnd);
+
+    /**
      * 支付成功业务回调（GZ-BEAN-014 AC 5，doc/10 §11.N9）。由 {@code PindouPayCallbackHandler.onPaid}
      * 在 PAY-101 回调事务内调用（business_order_no = booking_no 定位）。
      *
@@ -266,4 +289,57 @@ public interface IGzBeanBookingService {
      */
     record ExpiredUnpaidResult(int scanned, int closed, int skipped, int failed) {
     }
+
+    // ============================================================
+    //  GZ-BEAN-026 店内计时看板（ADR-0015 §5 / doc/11 §3.12 / doc/10 §11 看板子流程）
+    // ============================================================
+
+    /**
+     * 店内计时看板查询（GZ-BEAN-026，ADR-0015 §5 / doc/11 §3.12 / doc/10 §11）。
+     *
+     * <p>返回某门店某日<b>各启用且挂桌型座位单元</b>的实时状态行（看板状态机）：空闲 / 已约未到 /
+     * 使用中 / 临近结束 / 已超时。座位无活跃单 → {@code idle}（当前单字段全空）；有活跃单 → 回填该座
+     * 当前单（取覆盖当前时刻的活跃单；无覆盖当前但有未来 pending 则取最早一笔）+ 看板状态。
+     * 使用中（已核销）回 {@code remainingMinutes}（到计划 slot_end 倒计时），≤ 阈值（sys_config
+     * {@code gz.bean.board.near_end_minutes}，默认 15）→ near_end 高亮。</p>
+     *
+     * <p>座位单元来源同 seat-map（{@code enabled=1 且 seat_type_config_id NOT NULL}，legacy 无桌型座不进）；
+     * 活跃单口径同防超卖（status IN pending/used AND pay_status IN paying/paid，ADR-0007）。</p>
+     *
+     * @param storeId  门店 ID
+     * @param sessDate 看板日期
+     * @return 按桌型 / table_no / seatNo 升序的座位单元看板行列表（空店 / 无启用座 → 空列表）
+     */
+    List<GzBeanBoardRowVO> selectBoard(Long storeId, LocalDate sessDate);
+
+    /**
+     * 提前放座（GZ-BEAN-026，ADR-0015 §5 / doc/11 §3.12 / doc/10 §11）。
+     *
+     * <p>对某在店使用中（{@code status='used'}）单写 {@code actual_end_time=now} +
+     * {@code actual_end_slot=ceil(now→整点)}，<b>不改 status / pay_status</b>（仍 used/paid，是已用记录）。
+     * 放座后该座 {@code actual_end_slot} 之后的格立即可被再约（防超卖区间重叠判断收紧到 actual_end_slot）。
+     * 幂等：已放过座 / 非 used 单跳过（条件 UPDATE 守卫）。</p>
+     *
+     * @param bookingId  预约 ID
+     * @param operatorId 操作人（admin username / mp 店员归因，落 booking_log）
+     * @return 放座后看板行 VO（含 actualEndTime）
+     */
+    GzBeanBoardRowVO releaseSeatEarly(Long bookingId, String operatorId);
+
+    /**
+     * 延时（GZ-BEAN-026，ADR-0015 §5 / doc/11 §3.12 / doc/10 §11）：把 {@code slot_end} 往后推
+     * {@code addHours} 个整点格。
+     *
+     * <p>对某在店使用中（{@code status='used'}）单：先按具体座位区间互斥校验该座新增格区间
+     * {@code [oldSlotEnd, oldSlotEnd+addHours)} 未被<b>除自身外</b>的活跃单占（占了拒绝 E4b
+     * {@link org.dromara.gz.bean.exception.GzBeanErrorCode#EXTEND_CONFLICT}）→ 通过则 UPDATE slot_end。
+     * <b>V1 延时不走线上补付</b>（差额线下结算 / 门店政策，amount_cent 不变）。已放过座
+     * （actual_end_time 非空）的单不可延时（座位已释放，延时无意义 → BOARD_OP_INVALID_STATUS）。</p>
+     *
+     * @param bookingId  预约 ID
+     * @param addHours   延后整点格数（正整数 1..N）
+     * @param operatorId 操作人（落 booking_log）
+     * @return 延时后看板行 VO（含新 slotEnd）
+     */
+    GzBeanBoardRowVO extendBooking(Long bookingId, int addHours, String operatorId);
 }

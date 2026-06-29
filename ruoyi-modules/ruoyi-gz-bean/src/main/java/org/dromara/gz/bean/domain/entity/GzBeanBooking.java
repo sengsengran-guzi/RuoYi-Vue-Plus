@@ -128,6 +128,26 @@ public class GzBeanBooking extends TenantEntity {
     /** 过期标记时间（仅 no_show 状态写） */
     private LocalDateTime noShowTime;
 
+    /**
+     * 实际离场 / 放座时刻（ADR-0015 §5 / doc/11 §3.12 计时看板）。提前放座或延时后写；
+     * {@code NULL} = 未放座，按计划 {@code slot_end} 占用。
+     */
+    private LocalDateTime actualEndTime;
+
+    /**
+     * 占用止界整点格（ADR-0015 §5/§6 / doc/11 §3.6）：{@code actual_end_time} 向上取整到整点格。
+     * 防超卖区间重叠判断用 {@code COALESCE(actual_end_slot, slot_end)}——提前放座后该座
+     * {@code actual_end_slot} 之后的格立即可再约。
+     */
+    private LocalTime actualEndSlot;
+
+    /**
+     * 前 N 名免费标记（ADR-0015 §4 / doc/11 §3.11）：{@code 1}=命中前 N 名免费促销的免费单
+     * （{@code amount_cent=0}，实付 0，不计 GMV）/ {@code 0}=正常单（含全券抵扣到 0 的单，不算促销免费）。
+     * <p>桶内已发计数维度（含 cancelled / no_show，名额不回收防刷，doc/11 §3.11）。</p>
+     */
+    private Integer isFree;
+
     /** 去重 token（方案 C） — UNIQUE(tenant_id, store_id, dedup_token) */
     private String dedupToken;
 

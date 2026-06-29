@@ -13,17 +13,22 @@ import org.dromara.common.satoken.utils.LoginHelper;
 import org.dromara.common.web.core.BaseController;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingVerifyScanBo;
+import org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
 import org.dromara.gz.bean.mapper.GzAdminUserStoreMapper;
 import org.dromara.gz.bean.service.IGzBeanBookingService;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.time.LocalDate;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -113,6 +118,58 @@ public class GzBeanBookingController extends BaseController {
         String adminUsername = LoginHelper.getUsername();
         log.info("[bean-booking-admin] cancel id={} by={}", id, adminUsername);
         return R.ok(bookingService.cancel(id, "admin", adminUsername));
+    }
+
+    // ============================================================
+    //  GZ-BEAN-026 店内计时看板（ADR-0015 §5 / doc/11 §3.12 / doc/10 §11 看板子流程）
+    //  看板查询 + 提前放座 + 延时 —— owner / 店员现场操作，复用 booking:verify 权限
+    //  （店员核销权限语义最接近；独立权限点 gz:bean:board:* 待 GZ-BEAN-028 admin 看板 menu seed 拆分）
+    // ============================================================
+
+    /**
+     * 店内计时看板（GZ-BEAN-026）：某门店某日各启用座位单元实时状态行。
+     *
+     * <p>店员到店看「哪个座位还有多久结束」。owner/superadmin 看全部门店，store_id 自选；staff 绑定门店时
+     * 由 plus-ui 传其门店 storeId（看板按 storeId 维度查，本端点不做强隔离 —— V1.0 多店放开口径，
+     * staff 误传他店仅是看别店看板，无写操作越权风险）。</p>
+     *
+     * @param storeId  门店 ID（必填）
+     * @param sessDate 看板日期（必填，默认前端传当日）
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @GetMapping("/board")
+    public R<List<GzBeanBoardRowVO>> board(@RequestParam Long storeId,
+                                           @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate sessDate) {
+        return R.ok(bookingService.selectBoard(storeId, sessDate));
+    }
+
+    /**
+     * 提前放座（GZ-BEAN-026）：对某在店使用中（used）单写 actual_end_time/slot，该座剩余格立即可再约。
+     * 不改 status（仍 used）。幂等：已放座单重复点无害（返当前看板行）。
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @Log(title = "拼豆看板提前放座", businessType = BusinessType.UPDATE)
+    @PostMapping("/{id}/release-seat")
+    public R<GzBeanBoardRowVO> releaseSeat(@PathVariable Long id) {
+        String adminUsername = LoginHelper.getUsername();
+        log.info("[bean-board-admin] releaseSeat id={} by={}", id, adminUsername);
+        return R.ok(bookingService.releaseSeatEarly(id, adminUsername));
+    }
+
+    /**
+     * 延时（GZ-BEAN-026）：把某在店使用中（used）单的 slot_end 往后推 addHours 个整点格。
+     * 先按具体座位区间互斥校验新增格未被占（占了拒绝 EXTEND_CONFLICT）。V1 不线上补付。
+     *
+     * @param id       预约 ID
+     * @param addHours 延后整点格数（正整数）
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @Log(title = "拼豆看板延时", businessType = BusinessType.UPDATE)
+    @PostMapping("/{id}/extend")
+    public R<GzBeanBoardRowVO> extend(@PathVariable Long id, @RequestParam int addHours) {
+        String adminUsername = LoginHelper.getUsername();
+        log.info("[bean-board-admin] extend id={} addHours={} by={}", id, addHours, adminUsername);
+        return R.ok(bookingService.extendBooking(id, addHours, adminUsername));
     }
 
     /* ============ private ============ */

@@ -19,9 +19,16 @@ public final class GzBeanErrorCode {
     public static final int PHONE_REQUIRED = 4001;
     public static final String PHONE_REQUIRED_MSG = "拼豆预约需提供手机号，请先授权";
 
-    /** 座位已被占用（DB UNIQUE 兜底命中，doc/10 §3.E1） */
+    /**
+     * 具体座位区间被占（GZ-BEAN-024 影院选座防超卖，ADR-0015 §2 / doc/11 §3.6）。
+     *
+     * <p>下单事务内对 {@code (store, seat_id, sess_date)} 活跃单 {@code FOR UPDATE} 判区间重叠，命中即拒单
+     * 整笔回滚。<b>码偏差说明</b>：ADR-0015 / doc/11 §3.6 建议码 4012，但 4012 已被
+     * {@link #SEAT_TYPE_NOT_CONFIGURED} 占用（早于本批落地）；本码沿用既有 {@code SEAT_TAKEN=4002} 常量
+     * （语义即「座位已被占」，已接入 mp）。mp/admin 端按本常量对接（4002），不要按文档 4012。</p>
+     */
     public static final int SEAT_TAKEN = 4002;
-    public static final String SEAT_TAKEN_MSG = "座位已被预约，请重选";
+    public static final String SEAT_TAKEN_MSG = "该座位该时段已被预约，请重选座位或时段";
 
     /** 同用户同时段已有 pending 预约（应用层校验） */
     public static final int DUPLICATE_USER_BOOKING = 4003;
@@ -90,6 +97,29 @@ public final class GzBeanErrorCode {
      */
     public static final int SLOT_RANGE_INVALID = 4016;
     public static final String SLOT_RANGE_INVALID_MSG = "所选时段不连续或跨越休息时段，请重选";
+
+    // ============================================================
+    //  GZ-BEAN-026 店内计时看板（ADR-0015 §5 / doc/10 §11 看板子流程异常分支）
+    // ============================================================
+
+    /**
+     * 看板放座 / 延时操作的预约状态不允许（仅在店使用中 {@code status='used'} 单可放座 / 延时，doc/11 §3.12）。
+     * 与核销/取消复用 {@link #INVALID_STATUS}（4008）的语义区分：本码专指看板侧操作前置态不满足，
+     * service 拼当前状态中文返回；mp/admin 端按 code 映射文案。
+     */
+    public static final int BOARD_OP_INVALID_STATUS = 4017;
+    public static final String BOARD_OP_INVALID_STATUS_MSG = "该预约非在店使用中，不可执行此看板操作";
+
+    /**
+     * 延时撞占（GZ-BEAN-026 E4b，ADR-0015 §5 / doc/10 §11.E4b）：把 slot_end 推后，新增格已被别人占
+     * （具体座位区间互斥校验不过）→ 拒绝延时。
+     */
+    public static final int EXTEND_CONFLICT = 4018;
+    public static final String EXTEND_CONFLICT_MSG = "该座位后续时段已被预约，无法延时";
+
+    /** 延时小时数非法（须为正整数 1..N，doc/11 §3.12 延时按整点格推后） */
+    public static final int EXTEND_HOURS_INVALID = 4019;
+    public static final String EXTEND_HOURS_INVALID_MSG = "延时小时数非法，请输入正整数";
 
     private GzBeanErrorCode() {
     }

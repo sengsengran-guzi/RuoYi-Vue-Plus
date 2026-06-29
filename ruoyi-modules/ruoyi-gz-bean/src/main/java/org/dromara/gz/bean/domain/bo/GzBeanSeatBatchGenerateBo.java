@@ -1,8 +1,5 @@
 package org.dromara.gz.bean.domain.bo;
 
-import jakarta.validation.constraints.Max;
-import jakarta.validation.constraints.Min;
-import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 import lombok.Data;
 
@@ -10,13 +7,21 @@ import java.io.Serial;
 import java.io.Serializable;
 
 /**
- * 批量生成座位 BO（GZ-BEAN-002 AC 3）。
+ * 按桌型批量生成座位单元 BO（ADR-0015 §1 / doc/11 §3.3）。
  *
- * <p>按编号自动生成 N 个座位（如 prefix=A，startIndex=1，count=6 → A1 / A2 / ... / A6）。</p>
+ * <p>降低 admin 维护负担：admin 不逐个手画座位，填桌型即按 {@code book_mode} 自动生成带编号的座位单元——
+ * {@code whole} 生成 {@code quantity} 个桌单元（按桌编号，前缀派生）；
+ * {@code seat} 生成 {@code quantity × capacity} 个座位单元（按 table_no 分组，同桌聚合编号）。</p>
  *
- * <p>UNIQUE(tenant_id, store_id, seat_no) 已存在则跳过该编号（service 层逐个 INSERT IGNORE 语义）。</p>
+ * <p><b>两种触发口径</b>（二选一）：</p>
+ * <ul>
+ *   <li>传 {@code seatTypeConfigId} — 仅为该桌型生成（store_id 由 config 推导）；</li>
+ *   <li>仅传 {@code storeId}（不传 seatTypeConfigId）— 为该门店所有启用桌型全量生成。</li>
+ * </ul>
  *
- * @author kevin-coder (sensenran-guzi · GZ-BEAN-002)
+ * <p>幂等：已存在同 {@code seat_no} 的座位不重复建；命中软删座则复活并回填 config 关联。</p>
+ *
+ * @author kevin-coder (sensenran-guzi · GZ-BEAN-023)
  */
 @Data
 public class GzBeanSeatBatchGenerateBo implements Serializable {
@@ -24,32 +29,23 @@ public class GzBeanSeatBatchGenerateBo implements Serializable {
     @Serial
     private static final long serialVersionUID = 1L;
 
-    /** 门店 ID */
-    @NotNull(message = "门店 ID 不能为空")
+    /**
+     * 门店 ID（全量生成模式必填）。
+     * <p>不传 seatTypeConfigId 时按本门店所有启用桌型全量生成；传 seatTypeConfigId 时本字段忽略（由 config 推导）。</p>
+     */
     private Long storeId;
 
-    /** 前缀（如 "A" / "B"），可空，空时直接用数字编号 */
+    /**
+     * 桌型 config ID（单桌型生成模式）。
+     * <p>传入则仅为该桌型生成座位单元；不传则走 storeId 全量模式。</p>
+     */
+    private Long seatTypeConfigId;
+
+    /**
+     * 编号前缀（可空）。
+     * <p>空时按桌型 name 派生默认前缀（首字母无法可靠提取中文时回退 seat_type code）。
+     * 指定则覆盖默认前缀（如「S」「D」「Q」）。</p>
+     */
     @Size(max = 8, message = "前缀长度不能超过 8")
     private String prefix;
-
-    /** 起始序号（默认 1） */
-    @NotNull(message = "起始序号不能为空")
-    @Min(value = 1, message = "起始序号不能小于 1")
-    @Max(value = 999, message = "起始序号不能大于 999")
-    private Integer startIndex;
-
-    /** 生成数量（1-30） */
-    @NotNull(message = "生成数量不能为空")
-    @Min(value = 1, message = "生成数量至少 1")
-    @Max(value = 30, message = "生成数量至多 30")
-    private Integer count;
-
-    /** 行标（如 "A"） — 可空，用于辅助网格 */
-    @Size(max = 8, message = "行标长度不能超过 8")
-    private String rowLabel;
-
-    /** 起始列序号（如 1） — 可空 */
-    @Min(value = 1, message = "起始列序号不能小于 1")
-    @Max(value = 99, message = "起始列序号不能大于 99")
-    private Integer startColIndex;
 }

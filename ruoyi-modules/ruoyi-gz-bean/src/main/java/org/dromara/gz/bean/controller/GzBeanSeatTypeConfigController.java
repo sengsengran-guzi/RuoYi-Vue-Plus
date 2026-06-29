@@ -118,14 +118,22 @@ public class GzBeanSeatTypeConfigController extends BaseController {
         return toAjax(seatTypeConfigService.removeByIds(List.of(ids)) ? 1 : 0);
     }
 
-    /** 读某类型的按星期价格覆盖（GZ-BEAN-018，ADR-0014 §3）。未覆盖的星期不在列表（回退基础价） */
+    /**
+     * 读某类型的「按星期 × 1h 格」价格覆盖（GZ-BEAN-018 → GZ-BEAN-033，ADR-0015 §3.1）。
+     * 每行 {@code {weekday, slotStart, priceCent}}：{@code slotStart=null} = 该星期整天默认价 /
+     * {@code "HH:00:00"} = 该星期该 1h 格覆盖价。未覆盖的「星期 × 格」不在列表（下单 3 级回退）。
+     */
     @SaCheckPermission("gz:bean:seatTypeConfig:list")
     @GetMapping("/{id}/weekday-prices")
     public R<List<GzBeanSeatTypePriceVO>> weekdayPrices(@NotNull @PathVariable Long id) {
         return R.ok(seatTypeConfigService.selectWeekdayPrices(id));
     }
 
-    /** 覆盖式批量存某类型的按星期价格（属编辑权限；未传 weekday 删除其覆盖回退基础价，ADR-0014 §3） */
+    /**
+     * 覆盖式批量存某类型的「按星期 × 1h 格」价格（属编辑权限，ADR-0015 §3.1）。
+     * payload {@code items: [{weekday, slotStart, priceCent}, ...]}（{@code slotStart} 可空=整天默认 / "HH:00:00"=格覆盖）；
+     * 未传的「星期 × 格」删除其覆盖回退默认 / 基础价。空 items = 清空全部覆盖（全回退基础价）。
+     */
     @SaCheckPermission("gz:bean:seatTypeConfig:edit")
     @Log(title = "拼豆座位类型按星期价格", businessType = BusinessType.UPDATE)
     @PutMapping("/{id}/weekday-prices")

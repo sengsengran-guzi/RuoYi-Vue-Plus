@@ -50,9 +50,15 @@ public interface IGzBeanSeatTypeConfigService {
      */
     boolean toggleEnabled(Long id, Integer enabled);
 
-    /** 读某类型的按星期价格覆盖（GZ-BEAN-018，ADR-0014 §3）；未覆盖的星期不在列表（回退基础价） */
+    /**
+     * 读某类型的「按星期 × 1h 格」价格覆盖（GZ-BEAN-018 → GZ-BEAN-033，ADR-0015 §3.1）。
+     * 行 {@code {weekday, slotStart, priceCent}}：slotStart=null 整天默认 / HH:00:00 格覆盖；未覆盖不在列表（下单 3 级回退）。
+     */
     List<GzBeanSeatTypePriceVO> selectWeekdayPrices(Long configId);
 
-    /** 覆盖式批量存某类型的按星期价格（传入即 upsert，未传 weekday 删除其覆盖回退基础价，ADR-0014 §3） */
+    /**
+     * 覆盖式批量存某类型的「按星期 × 1h 格」价格（传入即 upsert by (weekday, slotStart)，
+     * 未传删除其覆盖回退默认 / 基础价，ADR-0015 §3.1）。
+     */
     boolean saveWeekdayPrices(Long configId, GzBeanSeatTypePriceBo bo);
 }

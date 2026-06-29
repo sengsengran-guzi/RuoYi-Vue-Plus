@@ -20,6 +20,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.math.BigDecimal;
+import java.time.LocalTime;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -207,40 +208,87 @@ class GzBeanSeatTypeConfigServiceImplTest {
         verify(baseMapper, never()).updateById(any(GzBeanSeatTypeConfig.class));
     }
 
-    // ------------------------------ 按星期价格覆盖（ADR-0014 §3） ------------------------------
+    // ------------------------------ 按星期 × 1h 格价格覆盖（ADR-0015 §3.1） ------------------------------
 
     @Test
-    @DisplayName("selectWeekdayPrices 回填 priceYuan + 按星期升序")
+    @DisplayName("selectWeekdayPrices 回填 priceYuan + slotStart + 按星期升序（同星期内整天默认 null 排最前、格价按整点升序）")
     void selectWeekdayPrices_fillsAndSorts() {
         when(seatTypePriceMapper.selectByConfig(10L)).thenReturn(List.of(
-            GzBeanSeatTypePrice.builder().weekday(6).priceCent(5000L).build(),
-            GzBeanSeatTypePrice.builder().weekday(1).priceCent(2000L).build()));
+            GzBeanSeatTypePrice.builder().weekday(6).priceCent(5000L).build(),                                    // 周六整天默认
+            GzBeanSeatTypePrice.builder().weekday(1).slotStart(LocalTime.of(14, 0)).priceCent(3000L).build(),     // 周一 14:00 格
+            GzBeanSeatTypePrice.builder().weekday(1).priceCent(2000L).build(),                                    // 周一整天默认
+            GzBeanSeatTypePrice.builder().weekday(1).slotStart(LocalTime.of(10, 0)).priceCent(2500L).build()));   // 周一 10:00 格
 
         List<GzBeanSeatTypePriceVO> vos = service.selectWeekdayPrices(10L);
-        assertEquals(2, vos.size());
-        assertEquals(1, vos.get(0).getWeekday(), "按星期升序");
-        assertEquals(6, vos.get(1).getWeekday());
-        assertEquals(0, new BigDecimal("50.00").compareTo(vos.get(1).getPriceYuan()));
+        assertEquals(4, vos.size());
+        // 周一三行：整天默认(null) → 10:00 → 14:00
+        assertEquals(1, vos.get(0).getWeekday());
+        assertNull(vos.get(0).getSlotStart(), "整天默认行排最前");
+        assertEquals(LocalTime.of(10, 0), vos.get(1).getSlotStart());
+        assertEquals(LocalTime.of(14, 0), vos.get(2).getSlotStart());
+        assertEquals(6, vos.get(3).getWeekday());
+        assertEquals(0, new BigDecimal("50.00").compareTo(vos.get(3).getPriceYuan()));
     }
 
     @Test
-    @DisplayName("saveWeekdayPrices 覆盖式：先清后插，未传星期被删（回退基础价）")
+    @DisplayName("saveWeekdayPrices 覆盖式：先清后插（整天默认 null 行 + 格价行），未传被删（回退）")
     void saveWeekdayPrices_overwrite() {
+        when(baseMapper.selectById(10L)).thenReturn(
+            GzBeanSeatTypeConfig.builder().id(10L).storeId(1L).build());
+        GzBeanSeatTypePriceBo bo = new GzBeanSeatTypePriceBo();
+        GzBeanSeatTypePriceBo.Item dayDefault = new GzBeanSeatTypePriceBo.Item();
+        dayDefault.setWeekday(6);
+        dayDefault.setPriceCent(8800L);                       // slotStart null = 整天默认
+        GzBeanSeatTypePriceBo.Item slot = new GzBeanSeatTypePriceBo.Item();
+        slot.setWeekday(6);
+        slot.setSlotStart(LocalTime.of(19, 0));
+        slot.setPriceCent(12000L);                            // 周六 19:00 格价
+        bo.setItems(List.of(dayDefault, slot));
+
+        assertTrue(service.saveWeekdayPrices(10L, bo));
+        verify(seatTypePriceMapper).physicalDeleteByConfig(10L);   // 先物理清场（防软删残留撞 uk）
+        ArgumentCaptor<GzBeanSeatTypePrice> cap = ArgumentCaptor.forClass(GzBeanSeatTypePrice.class);
+        verify(seatTypePriceMapper, times(2)).insert(cap.capture());   // 两行
+        List<GzBeanSeatTypePrice> inserted = cap.getAllValues();
+        assertTrue(inserted.stream().anyMatch(p -> p.getSlotStart() == null && p.getPriceCent() == 8800L),
+            "整天默认行 slotStart=null");
+        assertTrue(inserted.stream().anyMatch(p -> LocalTime.of(19, 0).equals(p.getSlotStart()) && p.getPriceCent() == 12000L),
+            "格价行 slotStart=19:00");
+        inserted.forEach(p -> assertEquals(10L, p.getSeatTypeConfigId()));
+    }
+
+    @Test
+    @DisplayName("saveWeekdayPrices 非整点 slotStart → ServiceException（与下单逐格语义一致）")
+    void saveWeekdayPrices_nonWholeHour_throws() {
         when(baseMapper.selectById(10L)).thenReturn(
             GzBeanSeatTypeConfig.builder().id(10L).storeId(1L).build());
         GzBeanSeatTypePriceBo bo = new GzBeanSeatTypePriceBo();
         GzBeanSeatTypePriceBo.Item it = new GzBeanSeatTypePriceBo.Item();
         it.setWeekday(6);
+        it.setSlotStart(LocalTime.of(10, 30));                // 非整点
         it.setPriceCent(8800L);
         bo.setItems(List.of(it));
 
-        assertTrue(service.saveWeekdayPrices(10L, bo));
-        verify(seatTypePriceMapper).delete(any(Wrapper.class));   // 先清
-        ArgumentCaptor<GzBeanSeatTypePrice> cap = ArgumentCaptor.forClass(GzBeanSeatTypePrice.class);
-        verify(seatTypePriceMapper).insert(cap.capture());        // 再插
-        assertEquals(6, cap.getValue().getWeekday());
-        assertEquals(8800L, cap.getValue().getPriceCent());
-        assertEquals(10L, cap.getValue().getSeatTypeConfigId());
+        assertThrows(ServiceException.class, () -> service.saveWeekdayPrices(10L, bo));
+    }
+
+    @Test
+    @DisplayName("saveWeekdayPrices 同星期同格重复配价 → ServiceException（防 UNIQUE 冲突）")
+    void saveWeekdayPrices_dupSlot_throws() {
+        when(baseMapper.selectById(10L)).thenReturn(
+            GzBeanSeatTypeConfig.builder().id(10L).storeId(1L).build());
+        GzBeanSeatTypePriceBo bo = new GzBeanSeatTypePriceBo();
+        GzBeanSeatTypePriceBo.Item a = new GzBeanSeatTypePriceBo.Item();
+        a.setWeekday(6);
+        a.setSlotStart(LocalTime.of(10, 0));
+        a.setPriceCent(2000L);
+        GzBeanSeatTypePriceBo.Item b = new GzBeanSeatTypePriceBo.Item();
+        b.setWeekday(6);
+        b.setSlotStart(LocalTime.of(10, 0));                  // 与 a 同 (weekday, slotStart)
+        b.setPriceCent(3000L);
+        bo.setItems(List.of(a, b));
+
+        assertThrows(ServiceException.class, () -> service.saveWeekdayPrices(10L, bo));
     }
 
     @Test
@@ -250,7 +298,7 @@ class GzBeanSeatTypeConfigServiceImplTest {
             GzBeanSeatTypeConfig.builder().id(10L).storeId(1L).build());
         GzBeanSeatTypePriceBo bo = new GzBeanSeatTypePriceBo();
         assertTrue(service.saveWeekdayPrices(10L, bo));
-        verify(seatTypePriceMapper).delete(any(Wrapper.class));
+        verify(seatTypePriceMapper).physicalDeleteByConfig(10L);
         verify(seatTypePriceMapper, never()).insert(any(GzBeanSeatTypePrice.class));
     }
 

@@ -129,25 +129,206 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
                                  @Param("sessDate") LocalDate sessDate,
                                  @Param("slot") LocalTime slot);
 
+    // ============================================================
+    //  GZ-BEAN-024 具体座位区间互斥防超卖（ADR-0015 §2 / doc/11 §3.6，取代逐格配额计数）
+    // ============================================================
+
     /**
-     * 同用户同 (类型,日期) 已有与 {@code [reqStart, reqEnd)} <b>区间重叠</b>的活跃 booking 数（幂等校验，doc/10 §11 Q11.3）。
+     * 具体座位区间互斥防超卖核心查询（GZ-BEAN-024，ADR-0015 §2 / doc/11 §3.6）。
      *
-     * <p>区间模型下「同一时段」= 区间重叠（两区间相交 ⟺ {@code slot_start < reqEnd AND slot_end > reqStart}）。
-     * 活跃同上（status=pending AND pay_status IN paying/paid）。{@code >0} 则该用户已占重叠时段名额，
-     * service 层拒单（防同用户重复占配额）。</p>
+     * <p>下单<b>同一事务</b>内对单个具体座位 {@code seatId} 当日活跃单 {@code FOR UPDATE} 悲观锁，判请求区间
+     * {@code [reqStart, reqEnd)} 是否与该座任一已占区间重叠。命中任一行（区间重叠）→ 该座已被占，整笔回滚
+     * 拒单（{@link org.dromara.gz.bean.exception.GzBeanErrorCode#SEAT_TAKEN}）；无命中 → 放行 INSERT。
+     * 单维度悲观锁 {@code (store, seat_id, sess_date)}，无需逐格循环加锁（取代 ADR-0011 逐格配额计数）。</p>
+     *
+     * <p><b>占用止界 = {@code COALESCE(actual_end_slot, slot_end)}</b>（ADR-0015 §2/§5）：未提前放座的活跃单
+     * 按计划 {@code slot_end} 占用；已提前放座的 {@code used} 单按 {@code actual_end_slot} 占用 —— 放座后该座
+     * {@code actual_end_slot} 之后的格立即可被再约。</p>
+     *
+     * <p><b>区间重叠判定</b>（doc/11 §3.6 钉死）：{@code reqStart < occEnd AND occStart < reqEnd}，即
+     * {@code slot_start < reqEnd AND COALESCE(actual_end_slot, slot_end) > reqStart}。</p>
+     *
+     * <p><b>活跃定义</b>（ADR-0007 沿用，不变）：{@code status IN ('pending','used') AND
+     * pay_status IN ('paying','paid')} —— pending（待到店）占计划区间，used（在店使用中 / 未放座）在有效占用
+     * 区间内仍占座；cancelled / no_show / pay_closed / refunded 全部释放。</p>
+     *
+     * <p><b>tenant_id 显式传</b>：mp 下单事务用户态 JWT 无 tenant，不依赖拦截器自动注入（同 submit 注释），
+     * 由 service 从 store / user 取 tenant 显式传入。</p>
+     *
+     * @return 命中的活跃 booking id 列表（非空即该座区间被占 → SEAT_TAKEN 拒单）
+     */
+    @Select("SELECT id FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_id = #{seatId} " +
+        "  AND sess_date = #{sessDate} " +
+        "  AND slot_start < #{reqEnd} AND COALESCE(actual_end_slot, slot_end) > #{reqStart} " +
+        "  AND status IN ('pending','used') AND pay_status IN ('paying','paid') AND del_flag = '0' " +
+        "FOR UPDATE")
+    List<Long> selectActiveSeatOverlapForUpdate(@Param("tenantId") String tenantId,
+                                                @Param("storeId") Long storeId,
+                                                @Param("seatId") Long seatId,
+                                                @Param("sessDate") LocalDate sessDate,
+                                                @Param("reqStart") LocalTime reqStart,
+                                                @Param("reqEnd") LocalTime reqEnd);
+
+    /**
+     * seat-map 可用性：批量取某门店某日<b>每个具体座位</b>在请求区间 {@code [reqStart, reqEnd)} 内是否被占
+     * （GZ-BEAN-024，无锁，仅展示用）。返回该日所有「与请求区间重叠的活跃单」所占的 {@code seat_id} 去重列表，
+     * service 层据此对每座算 {@code full}（座 id ∈ 本列表 → full=true）。重叠 + 活跃 + 占用止界口径同
+     * {@link #selectActiveSeatOverlapForUpdate}，但不加 {@code FOR UPDATE}、不限定单座。</p>
+     *
+     * @return 在请求区间内被占的座位 id 去重列表
+     */
+    @Select("SELECT DISTINCT seat_id FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_id IS NOT NULL " +
+        "  AND sess_date = #{sessDate} " +
+        "  AND slot_start < #{reqEnd} AND COALESCE(actual_end_slot, slot_end) > #{reqStart} " +
+        "  AND status IN ('pending','used') AND pay_status IN ('paying','paid') AND del_flag = '0'")
+    List<Long> selectOccupiedSeatIds(@Param("tenantId") String tenantId,
+                                     @Param("storeId") Long storeId,
+                                     @Param("sessDate") LocalDate sessDate,
+                                     @Param("reqStart") LocalTime reqStart,
+                                     @Param("reqEnd") LocalTime reqEnd);
+
+    /**
+     * 同用户同 (<b>具体座位</b>,日期) 已有与 {@code [reqStart, reqEnd)} <b>区间重叠</b>的活跃 booking 数（幂等校验，ADR-0015）。
+     *
+     * <p>影院式具体座位模型（ADR-0015）下幂等维度 = <b>seat_id</b>（非桌型）：允许同一用户在同一时段订同桌型的
+     * <b>多个不同空座</b>（如帮同行朋友各订一座）；仅当该用户重复提交<b>同一个具体座位</b>且区间重叠时 {@code >0}，
+     * service 层据此幂等返回原单。区间重叠 = {@code slot_start < reqEnd AND COALESCE(actual_end_slot, slot_end) > reqStart}，
+     * 活跃 = {@code status='pending' AND pay_status IN(paying,paid)}（仅 pending 待支付/待到店单算重复提交）。</p>
      */
     @Select("SELECT COUNT(*) FROM gz_bean_booking " +
         "WHERE tenant_id = #{tenantId} AND user_id = #{userId} AND store_id = #{storeId} " +
-        "  AND seat_type_config_id = #{seatTypeConfigId} AND sess_date = #{sessDate} " +
-        "  AND slot_start < #{reqEnd} AND slot_end > #{reqStart} " +
+        "  AND seat_id = #{seatId} AND sess_date = #{sessDate} " +
+        "  AND slot_start < #{reqEnd} AND COALESCE(actual_end_slot, slot_end) > #{reqStart} " +
         "  AND status = 'pending' AND pay_status IN ('paying','paid') AND del_flag = '0'")
     long countActiveUserOverlap(@Param("tenantId") String tenantId,
                                 @Param("userId") Long userId,
                                 @Param("storeId") Long storeId,
-                                @Param("seatTypeConfigId") Long seatTypeConfigId,
+                                @Param("seatId") Long seatId,
                                 @Param("sessDate") LocalDate sessDate,
                                 @Param("reqStart") LocalTime reqStart,
                                 @Param("reqEnd") LocalTime reqEnd);
+
+    // ============================================================
+    //  GZ-BEAN-025 前 N 名免费促销周期桶计数（ADR-0015 §4 / doc/11 §3.11）
+    // ============================================================
+
+    /**
+     * 周期桶内已发免费单数（GZ-BEAN-025，ADR-0015 §4）。
+     *
+     * <p>统计某门店在当前周期桶时间范围 {@code [bucketStart, bucketEnd)}（按 {@code create_time} 切桶）内
+     * 已发放的免费单数（{@code is_free=1}），与 {@code gz_bean_free_promo.free_count} 比对判名额是否用尽。</p>
+     *
+     * <p><b>名额不回收（防刷，doc/11 §3.11）</b>：计数口径 = {@code is_free=1 AND del_flag='0'}，
+     * <b>含 cancelled / no_show</b>（不加 status 过滤）—— 已发即占名额，防「下单占免费 → 取消 → 再刷」。</p>
+     *
+     * <p>下单事务内调用前由 service 抢 Redis 桶锁 {@code gz:bean:lock:free_promo:{store}:{bucket}} 串行化；
+     * 本计数本身无 {@code FOR UPDATE}（桶锁已串行化发放，且 is_free 单刚 INSERT 即在同事务可见，
+     * 串行下读到的计数准确）。status 接口（无锁展示用）也复用本查询。</p>
+     *
+     * <p><b>tenant_id 显式传</b>：mp 下单事务 / 匿名 status 接口 JWT 可能无可靠 tenant，由 service 显式传入
+     * （同 submit / seat-overlap 注释）。</p>
+     *
+     * @param tenantId    租户
+     * @param storeId     门店
+     * @param bucketStart 当前周期桶起（含），create_time &gt;= 此值
+     * @param bucketEnd   当前周期桶止（不含），create_time &lt; 此值
+     * @return 桶内已发免费单数（含已取消 / 未到店的免费单）
+     */
+    @Select("SELECT COUNT(*) FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND is_free = 1 " +
+        "  AND create_time >= #{bucketStart} AND create_time < #{bucketEnd} AND del_flag = '0'")
+    long countBucketIssuedFree(@Param("tenantId") String tenantId,
+                               @Param("storeId") Long storeId,
+                               @Param("bucketStart") LocalDateTime bucketStart,
+                               @Param("bucketEnd") LocalDateTime bucketEnd);
+
+    // ============================================================
+    //  GZ-BEAN-026 店内计时看板（ADR-0015 §5 / doc/11 §3.12 / doc/10 §11 看板子流程）
+    // ============================================================
+
+    /**
+     * 看板：拉某门店某日全部<b>活跃且挂具体座位</b>的 booking（GZ-BEAN-026）。
+     *
+     * <p>{@code seat_id IS NOT NULL}（影院选座单才进看板，legacy 无具体座位的旧单不进）+
+     * 活跃口径 {@code status IN ('pending','used') AND pay_status IN ('paying','paid')}
+     * （ADR-0007 沿用，与防超卖一致：pending 待到店 / used 在店使用中均占座）。service 层按 seat_id
+     * 归集，对每座算看板状态（空闲/已约未到/使用中/临近结束/已超时）。</p>
+     *
+     * <p>按 seat_id、slot_start 升序，便于 service 同座多单时取「覆盖当前时刻 / 最早未结束」的当前单。
+     * tenant_id 显式传（看板由 admin 登录态 / mp 店员态调，统一显式 scope 同 seat-map 注释）。</p>
+     *
+     * @param tenantId 租户
+     * @param storeId  门店
+     * @param sessDate 看板日期
+     * @return 当日该店全部活跃挂座单（含 actual_end_time/slot，service 据此算看板状态 + 放座/超时）
+     */
+    @Select("SELECT * FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND sess_date = #{sessDate} " +
+        "  AND seat_id IS NOT NULL " +
+        "  AND status IN ('pending','used') AND pay_status IN ('paying','paid') AND del_flag = '0' " +
+        "ORDER BY seat_id, slot_start")
+    List<GzBeanBooking> selectActiveBookingsForBoard(@Param("tenantId") String tenantId,
+                                                     @Param("storeId") Long storeId,
+                                                     @Param("sessDate") LocalDate sessDate);
+
+    /**
+     * 延时撞占校验（GZ-BEAN-026 E4b，ADR-0015 §5）：判某座在「新增格区间」{@code [reqStart, reqEnd)}
+     * 是否与<b>除自身外</b>的活跃单重叠。{@code FOR UPDATE} 锁住该座活跃单串行化延时与并发下单。
+     *
+     * <p>与 {@link #selectActiveSeatOverlapForUpdate} 同口径（具体座位区间互斥 + 占用止界
+     * {@code COALESCE(actual_end_slot, slot_end)}），但多 {@code id != #{excludeId}} 排除被延时单本身
+     * （否则它自己的占用区间会命中）。命中任一行 → 新增格已被别人占，拒绝延时（E4b）。</p>
+     *
+     * @return 命中的活跃 booking id 列表（非空即新增格被占 → 拒绝延时）
+     */
+    @Select("SELECT id FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_id = #{seatId} " +
+        "  AND sess_date = #{sessDate} AND id != #{excludeId} " +
+        "  AND slot_start < #{reqEnd} AND COALESCE(actual_end_slot, slot_end) > #{reqStart} " +
+        "  AND status IN ('pending','used') AND pay_status IN ('paying','paid') AND del_flag = '0' " +
+        "FOR UPDATE")
+    List<Long> selectActiveSeatOverlapExcludingForUpdate(@Param("tenantId") String tenantId,
+                                                         @Param("storeId") Long storeId,
+                                                         @Param("seatId") Long seatId,
+                                                         @Param("sessDate") LocalDate sessDate,
+                                                         @Param("excludeId") Long excludeId,
+                                                         @Param("reqStart") LocalTime reqStart,
+                                                         @Param("reqEnd") LocalTime reqEnd);
+
+    /**
+     * 提前放座条件 UPDATE（GZ-BEAN-026，doc/11 §3.12 / doc/10 §11）：写 {@code actual_end_time} +
+     * {@code actual_end_slot}，<b>不改 status</b>（仍 {@code used}，是已用记录）/ 不改 pay_status。
+     *
+     * <p>WHERE 守卫 {@code status='used' AND actual_end_time IS NULL} → 仅在店使用中（已核销）且未放过座的单
+     * 可放座，幂等：已放过座 / 非 used 的单 affected=0。放座后该座 {@code actual_end_slot} 之后的格立即可被再约
+     * （防超卖区间重叠判断收紧到 actual_end_slot，ADR-0015 §2）。</p>
+     *
+     * @return 受影响行数（1 = 放座成功 / 0 = 已放座或非 used，幂等跳过）
+     */
+    @Update("UPDATE gz_bean_booking " +
+        "SET actual_end_time = #{actualEndTime}, actual_end_slot = #{actualEndSlot} " +
+        "WHERE id = #{id} AND status = 'used' AND actual_end_time IS NULL AND del_flag = '0'")
+    int markSeatReleased(@Param("id") Long id,
+                         @Param("actualEndTime") LocalDateTime actualEndTime,
+                         @Param("actualEndSlot") LocalTime actualEndSlot);
+
+    /**
+     * 延时条件 UPDATE（GZ-BEAN-026，doc/11 §3.12 / doc/10 §11）：把 {@code slot_end} 推到 {@code newSlotEnd}。
+     *
+     * <p>WHERE 守卫 {@code status='used' AND slot_end = #{oldSlotEnd}} → 仅在店使用中（已核销）单可延时，
+     * 且 slot_end 未被并发改过（乐观防丢更新）。延时前由 service 按具体座位区间互斥校验新增格未被别人占
+     * （占了拒绝 E4b，ADR-0015 §5）。V1 延时不走线上补付。</p>
+     *
+     * @return 受影响行数（1 = 延时成功 / 0 = 非 used 或 slot_end 已变，跳过）
+     */
+    @Update("UPDATE gz_bean_booking " +
+        "SET slot_end = #{newSlotEnd} " +
+        "WHERE id = #{id} AND status = 'used' AND slot_end = #{oldSlotEnd} AND del_flag = '0'")
+    int extendSlotEnd(@Param("id") Long id,
+                      @Param("oldSlotEnd") LocalTime oldSlotEnd,
+                      @Param("newSlotEnd") LocalTime newSlotEnd);
 
     /**
      * 按 out_trade_no 查 booking（支付回调 onPaid 用 business_order_no=booking_no 定位，此辅以 out_trade_no 校验）。

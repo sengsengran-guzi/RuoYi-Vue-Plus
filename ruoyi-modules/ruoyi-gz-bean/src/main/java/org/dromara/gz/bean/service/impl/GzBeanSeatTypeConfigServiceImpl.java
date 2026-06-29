@@ -26,6 +26,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -182,12 +183,15 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         for (GzBeanSeatTypePrice p : rows) {
             vos.add(GzBeanSeatTypePriceVO.builder()
                 .weekday(p.getWeekday())
+                .slotStart(p.getSlotStart())
                 .priceCent(p.getPriceCent())
                 .priceYuan(p.getPriceCent() == null ? null
                     : new BigDecimal(p.getPriceCent()).divide(CENT_PER_YUAN, 2, RoundingMode.HALF_UP))
                 .build());
         }
-        vos.sort(Comparator.comparing(GzBeanSeatTypePriceVO::getWeekday));
+        // 按 weekday 升序，同星期内整天默认行（slotStart=null）排最前、其余按格起整点升序（ADR-0015 §3.1）
+        vos.sort(Comparator.comparing(GzBeanSeatTypePriceVO::getWeekday)
+            .thenComparing(GzBeanSeatTypePriceVO::getSlotStart, Comparator.nullsFirst(Comparator.naturalOrder())));
         return vos;
     }
 
@@ -201,18 +205,32 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         if (config == null) {
             throw new ServiceException("座位类型配置不存在：" + configId);
         }
-        // 覆盖式：先清掉该 config 全部周覆盖，再插入传入项（未传 weekday = 删除其覆盖 → 回退基础价，ADR-0014 §3）
-        seatTypePriceMapper.delete(Wrappers.<GzBeanSeatTypePrice>lambdaQuery()
-            .eq(GzBeanSeatTypePrice::getSeatTypeConfigId, configId));
+        // 覆盖式：先清掉该 config 全部「星期 × 格」覆盖，再插入传入项
+        //   （未传的「星期 × 格」= 删除其覆盖 → 下单时 3 级回退：格价 → 整天默认 → 基础价，ADR-0015 §3.1）
+        //   ⚠️ 必须物理删（非 @TableLogic 软删）：uk_gz_bean_stp 不含 del_flag，软删残留行会与 re-insert 同键撞 DuplicateKey（覆盖式重存必炸）
+        seatTypePriceMapper.physicalDeleteByConfig(configId);
         int inserted = 0;
+        // 同次 payload 内去重 (weekday, slotStart)：防 UNIQUE(tenant, config, weekday, slot_start) 冲突
+        Set<String> seen = new java.util.HashSet<>();
         if (bo != null && bo.getItems() != null) {
             for (GzBeanSeatTypePriceBo.Item item : bo.getItems()) {
                 if (item.getWeekday() == null || item.getPriceCent() == null) {
                     continue;
                 }
+                // slotStart 非空时必为整点（HH:00:00）；非整点拒绝（与下单逐格语义一致）
+                LocalTime slotStart = item.getSlotStart();
+                if (slotStart != null && (slotStart.getMinute() != 0 || slotStart.getSecond() != 0 || slotStart.getNano() != 0)) {
+                    throw new ServiceException("格起时间必须为整点（HH:00）：" + slotStart);
+                }
+                String dedupKey = item.getWeekday() + "@" + (slotStart == null ? "*" : slotStart.toString());
+                if (!seen.add(dedupKey)) {
+                    throw new ServiceException("同一星期同一格重复配价：weekday=" + item.getWeekday()
+                        + " slotStart=" + (slotStart == null ? "整天默认" : slotStart));
+                }
                 seatTypePriceMapper.insert(GzBeanSeatTypePrice.builder()
                     .seatTypeConfigId(configId)
                     .weekday(item.getWeekday())
+                    .slotStart(slotStart)
                     .priceCent(item.getPriceCent())
                     .delFlag("0")
                     .build());

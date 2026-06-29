@@ -10,16 +10,18 @@ import java.time.LocalDate;
 import java.time.LocalTime;
 
 /**
- * mp 端付费预约提交参数（GZ-BEAN-017，V1.2 1h 区间连续多选）。
+ * mp 端付费预约提交参数（GZ-BEAN-024，影院选座 + 1h 区间连续多选）。
  *
- * <p>对应 {@code POST /app/gz/bean/booking/paid-submit}。一笔 = 1 座位类型 + 1 个连续 1h 区间
+ * <p>对应 {@code POST /app/gz/bean/booking/paid-submit}。一笔 = 1 <b>具体座位</b> + 1 个连续 1h 区间
  * （{@code slotStart..slotEnd} 跨 N = (slotEnd − slotStart) 小时 个连续 1h 格，如 10:00..13:00 = 3 格）。
- * 字段名 / 数量不变（仍是单 {@code slotStart}/{@code slotEnd}），仅语义从「1 个命名时段」变为「N 连续 1h 格区间」。
  * {@code userId} / {@code openid} 由 sa-token 拿，不接受前端传入。</p>
  *
- * <p>权威：doc/15a §A.2 / ADR-0011（取代 ADR-0007/0008 的单笔单时段口径）。</p>
+ * <p><b>影院选座（ADR-0015 §2/§3）</b>：入参从「座位类型 config」改为<b>具体座位 {@code seatId}</b>
+ * —— 防超卖 = 该具体座位区间互斥；计价 / book_mode 经 {@code seatId → gz_bean_seat → seat_type_config} 取。</p>
  *
- * @author kevin-coder (sensenran-guzi · GZ-BEAN-017)
+ * <p>权威：ADR-0015 §2/§3 / doc/11 §3.4「可用性接口 VO」/ §3.6（取代 ADR-0011/0014 的「按桌型 config 配额计数」入参）。</p>
+ *
+ * @author kevin-coder (sensenran-guzi · GZ-BEAN-024)
  */
 @Data
 public class GzBeanPaidBookingSubmitBo implements Serializable {
@@ -31,9 +33,12 @@ public class GzBeanPaidBookingSubmitBo implements Serializable {
     @NotNull
     private Long storeId;
 
-    /** 座位类型 config id（gz_bean_seat_type_config.id；取代旧 seatType 字符串，ADR-0014 §5 配额计数 + 计价维度） */
+    /**
+     * 具体座位单元 id（gz_bean_seat.id；影院选座，ADR-0015 §2 防超卖 + 经座位取桌型计价 / book_mode）。
+     * 取代旧 seatTypeConfigId 入参（config 现由 seatId → seat → config 派生）。
+     */
     @NotNull
-    private Long seatTypeConfigId;
+    private Long seatId;
 
     /** 预约日期（yyyy-MM-dd） */
     @NotNull

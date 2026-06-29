@@ -13,6 +13,7 @@ import org.dromara.gz.bean.domain.bo.GzBeanBookingVerifyScanBo;
 import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
 import org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatMapVO;
 import org.dromara.gz.bean.domain.vo.GzBeanStaffOverviewVO;
 import org.dromara.gz.bean.domain.vo.GzBeanTypeSlotAvailabilityVO;
 import org.dromara.gz.bean.service.IGzBeanBookingService;
@@ -27,6 +28,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.List;
 
 /**
@@ -36,8 +38,9 @@ import java.util.List;
  *
  * <p>端点：</p>
  * <ul>
- *   <li>{@code POST /paid-submit} — 付费区间预约下单（逐格防超卖 + 计费，GZ-BEAN-017）</li>
- *   <li>{@code GET  /type-slots} — 选座 1h 格余量（可约 / 已满）</li>
+ *   <li>{@code POST /paid-submit} — 付费区间预约下单（影院选座具体座位区间互斥防超卖 + 计费，GZ-BEAN-024）</li>
+ *   <li>{@code GET  /seat-map} — 影院选座可用性（具体座位维度，可订 / 已占，GZ-BEAN-024）</li>
+ *   <li>{@code GET  /type-slots} — 选座 1h 格余量（按桌型 × 格，可约 / 已满；mp 029 改后保留兼容）</li>
  *   <li>{@code GET  /my} — 我的预约列表（按 sessDate desc）</li>
  *   <li>{@code GET  /{id}} — 预约详情（仅当前用户）</li>
  *   <li>{@code POST /{id}/cancel} — 用户取消预约（doc/10 §3.N9）</li>
@@ -57,16 +60,16 @@ public class GzBeanBookingMpController {
     private final IGzBeanBookingService bookingService;
 
     /**
-     * V1.2 付费<b>区间</b>预约下单（GZ-BEAN-017，1h 连续多选，doc/15a §A.2）。
+     * 影院选座付费<b>区间</b>预约下单（GZ-BEAN-024，具体座位 + 1h 连续多选，ADR-0015 §2/§3）。
      *
      * <pre>
      * POST /app/gz/bean/booking/paid-submit
-     * Body:    { storeId, seatType, sessDate, slotStart, slotEnd, couponId?, dedupClientToken? }
-     *          （slotStart..slotEnd 跨 N 连续 1h 格，如 10:00..13:00 = 3 格）
+     * Body:    { storeId, seatId, sessDate, slotStart, slotEnd, couponId?, dedupClientToken? }
+     *          （seatId = 影院图选中的具体座位；slotStart..slotEnd 跨 N 连续 1h 格，如 10:00..13:00 = 3 格）
      *
      * 200 OK（付费单，实付>0）
      * { "code":200, "data": {
-     *     "id":"...", "bookingNo":"BK...", "seatType":"single", "seatTypeSnapshot":"单人",
+     *     "id":"...", "bookingNo":"BK...", "seatType":"st10", "seatTypeSnapshot":"四人共享桌",
      *     "amountCent":4500(=单价×N), "discountAmountCent":0, "payAmountCent":4500,
      *     "payStatus":"paying", "free":false, "outTradeNo":"PINDOU-...",
      *     "payParams": { timeStamp, nonceStr, packageVal, signType, paySign, outTradeNo }
@@ -75,10 +78,11 @@ public class GzBeanBookingMpController {
      *
      * 业务错误（R.code）：
      *   4001 PHONE_REQUIRED          → 弹手机号授权
-     *   4011 QUOTA_FULL              → 「该时段座位已约满」（msg 含哪格满）
+     *   4002 SEAT_TAKEN              → 「该座位该时段已被预约」（具体座位区间互斥，ADR-0015 §2；座不存在/不属本店亦此码）
+     *   4005 SEAT_DISABLED           → 「该座位已停用，请重选」
      *   4016 SLOT_RANGE_INVALID      → 「所选时段不连续或跨越休息时段」（跳选 / 跨午休 / 含不可约格）
-     *   4012 SEAT_TYPE_NOT_CONFIGURED→ 「该座位类型暂未开放」
-     *   4013 SEAT_TYPE_DISABLED      → 「该座位类型已停用」
+     *   4012 SEAT_TYPE_NOT_CONFIGURED→ 「该座位暂未开放」（座未挂桌型 / 桌型缺失）
+     *   4013 SEAT_TYPE_DISABLED      → 「该座位所属桌型已停用」
      *   4014 WECHAT_ID_REQUIRED      → 弹填微信号
      *   4003 DUPLICATE_USER_BOOKING  → 「您该时段已有预约」
      *   4004 SUBMIT_TOO_FAST         → 「操作过快」
@@ -91,8 +95,8 @@ public class GzBeanBookingMpController {
         if (userId == null) {
             return R.fail(401, "未登录");
         }
-        log.info("[bean-booking-mp] paid-submit userId={} storeId={} seatTypeConfigId={} sessDate={} slotStart={} couponId={}",
-            userId, bo.getStoreId(), bo.getSeatTypeConfigId(), bo.getSessDate(), bo.getSlotStart(), bo.getCouponId());
+        log.info("[bean-booking-mp] paid-submit userId={} storeId={} seatId={} sessDate={} slotStart={} couponId={}",
+            userId, bo.getStoreId(), bo.getSeatId(), bo.getSessDate(), bo.getSlotStart(), bo.getCouponId());
         return R.ok(bookingService.submitPaid(bo, userId));
     }
 
@@ -117,6 +121,33 @@ public class GzBeanBookingMpController {
         @RequestParam Long storeId,
         @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate sessDate) {
         return R.ok(bookingService.selectTypeSlotAvailability(storeId, sessDate));
+    }
+
+    /**
+     * 影院选座可用性（GZ-BEAN-024，ADR-0015 §3 / doc/11 §3.4「可用性接口 VO」）。
+     *
+     * <pre>
+     * GET /app/gz/bean/booking/seat-map?storeId=1&sessDate=2026-06-20&slotStart=10:00:00&slotEnd=13:00:00
+     * 200 OK { "code":200, "data": [
+     *   { "seatId":"...","seatNo":"Q1-1","tableNo":"Q1","zone":"靠窗区","seatTypeConfigId":"...",
+     *     "typeName":"四人共享桌","bookMode":"seat","unitPriceCent":1500,"full":false },
+     *   ...（每个启用且挂桌型的座位单元一档；legacy config-less 座不返）
+     * ] }
+     * full=false → 可订高亮；full=true → 已占灰显不可点。提交 paid-submit 用 seatId + slotStart/slotEnd。
+     * slotStart/slotEnd 任一为空 → 仅返回座位布局（full 恒 false，供选区间前预览影院图）。
+     * </pre>
+     *
+     * <p>匿名可读（browse-first，与门店/时段列表一致）：拼豆落地页游客浏览座位图所需，仅只读可用性，
+     * 不含个人数据。区间已选时 service 内复用下单同款连续性校验（不连续/跨午休/含不可约格 → SLOT_RANGE_INVALID）。</p>
+     */
+    @SaIgnore
+    @GetMapping("/seat-map")
+    public R<List<GzBeanSeatMapVO>> seatMap(
+        @RequestParam Long storeId,
+        @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate sessDate,
+        @RequestParam(required = false) @DateTimeFormat(pattern = "HH:mm:ss") LocalTime slotStart,
+        @RequestParam(required = false) @DateTimeFormat(pattern = "HH:mm:ss") LocalTime slotEnd) {
+        return R.ok(bookingService.selectSeatMap(storeId, sessDate, slotStart, slotEnd));
     }
 
     /**
