@@ -111,6 +111,9 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     /** unpaid 超时回收默认时长（分钟，doc/10 §11 Q11.2，与微信 JSAPI 订单超时对齐） */
     private static final int DEFAULT_UNPAID_TIMEOUT_MINUTES = 15;
 
+    /** 退改时间闸：距时段开始不足该分钟数即不可取消（甲方口径，对所有单统一生效，含免费 / 全券单） */
+    private static final int CANCEL_CUTOFF_MINUTES = 20;
+
     private static final String OPERATOR_USER = "user";
     private static final String OPERATOR_ADMIN = "admin";
     /** cron 系统操作者（doc/11 §3.5 operator_type 口径 system；operator_id 为 null） */
@@ -327,6 +330,14 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                 GzBeanErrorCode.INVALID_STATUS);
         }
 
+        // 退改时间闸（甲方口径）：距时段开始不足 CANCEL_CUTOFF_MINUTES 分钟禁止取消 —— 防卡点放座 +
+        // 防「取消全退」绕过爽约罚则。对所有单统一生效（含免费 / 全券单），故在 realPaid 分流之前判。
+        // sess_date / slot_start 为 submit 必设字段，生产恒非空（不做 null 兜底以免静默放过非法数据）。
+        LocalDateTime slotStartAt = LocalDateTime.of(booking.getSessDate(), booking.getSlotStart());
+        if (LocalDateTime.now().isAfter(slotStartAt.minusMinutes(CANCEL_CUTOFF_MINUTES))) {
+            throw new ServiceException(GzBeanErrorCode.CANCEL_WINDOW_CLOSED_MSG, GzBeanErrorCode.CANCEL_WINDOW_CLOSED);
+        }
+
         // 真实付款单（pay_status=paid + 有正向支付单 out_trade_no + 金额>0）取消即发起微信原路全额退款。
         // 受理失败抛异常 → 整个取消事务回滚（不退钱就不取消）。免费单 / 全券抵扣单（out_trade_no=NULL）
         // 无真实付款，跳过退款。pay_status 由退款回调 onPindouRefunded 异步推进 paid→refunded，
@@ -399,7 +410,9 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     }
 
     // ============================================================
-    //  no_show 批量标记（GZ-BEAN-009 凌晨 2 点 cron）
+    //  no_show 批量标记（GZ-BEAN-009 高频 cron，每 5 分钟）
+    //  口径：扫「已过完时段（slot_end ≤ now）仍 pending」的单 → 标 no_show 即释放座位（甲方口径
+    //  「预定时段过完未到店即自动释放」，grace=0 按时间段而非时长，detail 见 mapper.selectExpiredPendingIds）。
     // ============================================================
 
     @Override
@@ -459,7 +472,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                 .toStatus(STATUS_NO_SHOW)
                 .operatorType(OPERATOR_SYSTEM)
                 .operatorId(null)
-                .note("系统定时标记未到店（凌晨 2 点 cron）")
+                .note("时段结束未到店，系统自动标记 no_show 并释放座位")
                 .delFlag("0")
                 .build());
         }

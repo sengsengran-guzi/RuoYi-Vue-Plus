@@ -25,6 +25,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.DuplicateKeyException;
 
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -276,6 +277,9 @@ class GzBeanBookingServiceImplTest {
         booking.setId(1L);
         booking.setStatus("pending");
         booking.setBookingNo("BK20260601000001");
+        // 远期时段：避开 20min 退改时间闸（本用例验退款分流，非时间闸）
+        booking.setSessDate(LocalDate.of(2099, 1, 1));
+        booking.setSlotStart(LocalTime.of(10, 0));
         when(bookingMapper.selectById(1L)).thenReturn(booking);
         when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
 
@@ -301,6 +305,8 @@ class GzBeanBookingServiceImplTest {
         booking.setOutTradeNo("PINDOU-20260611-000060");
         booking.setAmountCent(1500L);
         booking.setCouponId(9L);
+        booking.setSessDate(LocalDate.of(2099, 1, 1));
+        booking.setSlotStart(LocalTime.of(10, 0));
         when(bookingMapper.selectById(60L)).thenReturn(booking);
         when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
         when(payServiceProvider.getObject()).thenReturn(payService);
@@ -331,6 +337,8 @@ class GzBeanBookingServiceImplTest {
         booking.setBookingNo("BK20260611000061");
         booking.setOutTradeNo("PINDOU-20260611-000061");
         booking.setAmountCent(1500L);
+        booking.setSessDate(LocalDate.of(2099, 1, 1));
+        booking.setSlotStart(LocalTime.of(10, 0));
         when(bookingMapper.selectById(61L)).thenReturn(booking);
         when(payServiceProvider.getObject()).thenReturn(payService);
         org.dromara.gz.common.pay.domain.vo.GzPayTransactionVO txn = new org.dromara.gz.common.pay.domain.vo.GzPayTransactionVO();
@@ -358,6 +366,8 @@ class GzBeanBookingServiceImplTest {
         booking.setOutTradeNo(null);   // 免费 / 全券抵扣 → 无正向支付单
         booking.setAmountCent(0L);
         booking.setCouponId(12L);
+        booking.setSessDate(LocalDate.of(2099, 1, 1));
+        booking.setSlotStart(LocalTime.of(10, 0));
         when(bookingMapper.selectById(62L)).thenReturn(booking);
         when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
 
@@ -370,17 +380,43 @@ class GzBeanBookingServiceImplTest {
         verify(couponService).returnUsed(12L);
     }
 
+    @Test
+    @DisplayName("cancel · 距时段开始不足 20 分钟 → 抛 CANCEL_WINDOW_CLOSED（事务回滚：不退款 / 不改 status / 不写 log）")
+    void cancel_withinCutoff_throws() {
+        // 时段开始 = 现在 +10min（< 20min 闸）→ 必拒
+        LocalDateTime soon = LocalDateTime.now().plusMinutes(10);
+        GzBeanBooking booking = new GzBeanBooking();
+        booking.setId(63L);
+        booking.setStatus("pending");
+        booking.setPayStatus("paid");
+        booking.setBookingNo("BK20990101000063");
+        booking.setOutTradeNo("PINDOU-20990101-000063");
+        booking.setAmountCent(1500L);
+        booking.setSessDate(soon.toLocalDate());
+        booking.setSlotStart(soon.toLocalTime());
+        when(bookingMapper.selectById(63L)).thenReturn(booking);
+
+        org.dromara.common.core.exception.ServiceException ex = assertThrows(
+            org.dromara.common.core.exception.ServiceException.class,
+            () -> service.cancel(63L, "user", "1"));
+        assertEquals(org.dromara.gz.bean.exception.GzBeanErrorCode.CANCEL_WINDOW_CLOSED, ex.getCode());
+        // 时间闸在退款 / status 改写 / log 之前 → 全不触发
+        verify(payRefundServiceProvider, never()).getObject();
+        verify(bookingMapper, never()).updateById(any(GzBeanBooking.class));
+        verify(bookingLogMapper, never()).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
+    }
+
     // ============================================================
     //  no_show 批量标记（GZ-BEAN-009）
     // ============================================================
 
     /**
-     * AC 6 主场景：mapper 的 selectExpiredPendingIds SQL 已含 {@code status='pending' AND sess_date<CURDATE()}
-     * 过滤，故"昨日 used / 今日 pending"在 SQL 层被排除，mapper 仅返回 2 个昨日 pending 的 id（101,102）。
+     * AC 6 主场景：mapper 的 selectExpiredPendingIds SQL 已含 {@code status='pending' AND TIMESTAMP(sess_date, slot_end) <= NOW()}
+     * 过滤（已过完时段仍 pending），故未到时段 / 已 used 的单在 SQL 层被排除，mapper 仅返回 2 个待标 id（101,102）。
      * service 层逐条 markNoShow（affected=1）→ 各写 1 条 log → 统计 marked=2。
      */
     @Test
-    @DisplayName("markNoShowBatch · 2 昨日pending + 1 昨日used + 1 今日pending → 仅标 2 条 + log +2")
+    @DisplayName("markNoShowBatch · 2 已过时段 pending → 各标 no_show + log +2")
     void markNoShowBatch_only_yesterday_pending() {
         when(bookingMapper.selectExpiredPendingIds()).thenReturn(java.util.List.of(101L, 102L));
         when(bookingMapper.markNoShow(eq(101L), any())).thenReturn(1);

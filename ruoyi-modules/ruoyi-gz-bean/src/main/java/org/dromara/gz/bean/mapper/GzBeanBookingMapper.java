@@ -34,10 +34,16 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
      * cron 上下文一致；cron 无登录态 → service 层用 {@code TenantHelper.ignore} 全租户扫，见
      * IGzBeanBookingService#markNoShowBatch javadoc）。</p>
      *
-     * @return 待标 no_show 的预约 id（sess_date &lt; CURDATE() AND status='pending'）
+     * <p><b>口径（甲方「预定时段过完未到店即自动释放座位」，grace=0 按时间段而非时长）</b>：扫所有
+     * 「整个预约时段已过完（{@code TIMESTAMP(sess_date, slot_end) <= NOW()}）仍 pending」的单。
+     * 含今日早场已结束的格 + 所有历史日。标 no_show 即把 dedup_token 切 booking_no 释放座位占位，
+     * 让该座该格立刻可被同日后续时段再约。配套高频 cron（每 5 分钟，见 GzBeanNoShowMarkJob javadoc），
+     * 故座位在 slot_end 后 ≤ 5 分钟内释放。NOW() / sess_date / slot_end 均容器本地时区 Asia/Shanghai。</p>
+     *
+     * @return 待标 no_show 的预约 id（{@code status='pending' AND TIMESTAMP(sess_date, slot_end) <= NOW()}）
      */
     @Select("SELECT id FROM gz_bean_booking " +
-        "WHERE status = 'pending' AND sess_date < CURDATE() AND del_flag = '0' " +
+        "WHERE status = 'pending' AND TIMESTAMP(sess_date, slot_end) <= NOW() AND del_flag = '0' " +
         "ORDER BY id")
     List<Long> selectExpiredPendingIds();
 

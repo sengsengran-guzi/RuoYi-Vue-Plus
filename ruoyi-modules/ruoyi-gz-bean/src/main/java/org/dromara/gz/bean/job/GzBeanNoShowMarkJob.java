@@ -12,6 +12,11 @@ import org.springframework.stereotype.Component;
 /**
  * 拼豆预约 no_show 自动标记 cron 执行器（GZ-BEAN-009，doc/10 §3.N13）。
  *
+ * <p><b>触发口径（甲方「预定时段过完未到店即自动释放座位」）</b>：高频 cron（每 5 分钟）扫
+ * 「整个时段已过完（{@code TIMESTAMP(sess_date, slot_end) <= NOW()}）仍 pending」的单 → 标 no_show
+ * 即释放座位（grace=0，按时间段而非时长：用户订 2h 迟到 1h 只剩 1h，时段过完即没收且不退款）。
+ * 座位在 slot_end 后 ≤ 5 分钟内回收给同日后续时段再约。</p>
+ *
  * <p><b>调度框架</b>：RuoYi-Vue-Plus 5.5.x 用 SnailJob（com.aizuda），不是 Quartz —— 故本类是 SnailJob
  * 注解式执行器（{@code @JobExecutor}），<b>不</b>通过 Flyway INSERT {@code sys_job}/{@code sj_job} 注册。
  * job 名 / cron 表达式 / 路由策略在 <b>SnailJob 服务端控制台</b>（admin「定时任务」菜单）配置，执行器路由名
@@ -25,7 +30,9 @@ import org.springframework.stereotype.Component;
  * <ul>
  *   <li>任务名称：GZ-BEAN-NO-SHOW-MARK</li>
  *   <li>执行器路由（executor_info）：{@code gzBeanNoShowMarkTask}（= 本类 @JobExecutor name）</li>
- *   <li>触发类型：CRON，表达式 {@code 0 0 2 * * ?}（每日 02:00，容器时区 Asia/Shanghai）</li>
+ *   <li>触发类型：CRON，表达式 {@code 0 0/5 * * * ?}（每 5 分钟，容器时区 Asia/Shanghai）——
+ *       <b>必须改为高频</b>：旧值 {@code 0 0 2 * * ?}（每日 02:00）只能在次日凌晨释放座位，
+ *       与「时段过完即释放」口径不符；SQL 已改按 slot_end 扫，cron 不调高频则当天座位回收不了。</li>
  *   <li>阻塞策略：丢弃（默认）— 上次未跑完不叠加</li>
  *   <li>组：{@code ruoyi_group}</li>
  * </ul>

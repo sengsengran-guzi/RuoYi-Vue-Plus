@@ -121,6 +121,16 @@ public final class GzBeanErrorCode {
     public static final int EXTEND_HOURS_INVALID = 4019;
     public static final String EXTEND_HOURS_INVALID_MSG = "延时小时数非法，请输入正整数";
 
+    /**
+     * 距时段开始不足 {@code CANCEL_CUTOFF_MINUTES}（20）分钟，不可取消预约。
+     *
+     * <p>退改时间闸（甲方口径）：开始前 20 分钟内禁止取消退款，防止用户卡点放座 / 用「取消全退」
+     * 绕过「未到店爽约钱不退」罚则。对所有单统一生效（含免费 / 全券抵扣单）。mp 端按本 code 隐藏取消按钮 +
+     * http.ts 全局 toast 本 msg 兜底。</p>
+     */
+    public static final int CANCEL_WINDOW_CLOSED = 4020;
+    public static final String CANCEL_WINDOW_CLOSED_MSG = "距开始不足 20 分钟，不可取消";
+
     private GzBeanErrorCode() {
     }
 }
