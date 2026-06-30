@@ -95,8 +95,8 @@ public class GzBeanBookingMpController {
         if (userId == null) {
             return R.fail(401, "未登录");
         }
-        log.info("[bean-booking-mp] paid-submit userId={} storeId={} seatId={} sessDate={} slotStart={} couponId={}",
-            userId, bo.getStoreId(), bo.getSeatId(), bo.getSessDate(), bo.getSlotStart(), bo.getCouponId());
+        log.info("[bean-booking-mp] paid-submit userId={} storeId={} seatTypeConfigId={} sessDate={} slotStart={} couponId={}",
+            userId, bo.getStoreId(), bo.getSeatTypeConfigId(), bo.getSessDate(), bo.getSlotStart(), bo.getCouponId());
         return R.ok(bookingService.submitPaid(bo, userId));
     }
 
@@ -287,8 +287,8 @@ public class GzBeanBookingMpController {
     public R<GzBeanBookingVO> verifyScan(@Validated @RequestBody GzBeanBookingVerifyScanBo bo) {
         // 核销操作人：app_user username = "wx:{openid}"（落库 verified_by + 审计日志）
         String operator = LoginHelper.getUsername();
-        log.info("[bean-booking-mp] verify-scan by={} payloadLen={}",
-            operator, bo.getQrPayload() == null ? 0 : bo.getQrPayload().length());
-        return R.ok(bookingService.verifyByQrPayload(bo.getQrPayload(), operator));
+        log.info("[bean-booking-mp] verify-scan by={} seatId={} payloadLen={}",
+            operator, bo.getSeatId(), bo.getQrPayload() == null ? 0 : bo.getQrPayload().length());
+        return R.ok(bookingService.verifyByQrPayload(bo.getQrPayload(), bo.getSeatId(), operator));
     }
 }

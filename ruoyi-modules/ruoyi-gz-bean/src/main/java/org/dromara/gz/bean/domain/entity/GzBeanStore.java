@@ -79,6 +79,12 @@ public class GzBeanStore extends TenantEntity {
     /** 可预约最大提前天数（mp 端日期 chip 用；默认 14） */
     private Integer maxAdvanceDays;
 
+    /**
+     * 计时看板「临近结束」提前提醒分钟数（门店自配，ADR-0016 §6；甲方「30/40/20 店家自己设置」）。
+     * NULL → 回退全局 sys_config / 默认 30。in_use 单 remainingMinutes ≤ 本值 → near_end 高亮 + admin 弹窗。
+     */
+    private Integer nearEndMinutes;
+
     /** 备注（公共字段，ruoyi 各 entity 显式定义） */
     private String remark;
 

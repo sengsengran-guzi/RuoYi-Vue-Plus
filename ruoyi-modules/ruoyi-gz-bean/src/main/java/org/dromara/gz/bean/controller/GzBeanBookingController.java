@@ -82,14 +82,17 @@ public class GzBeanBookingController extends BaseController {
         return R.ok(vo);
     }
 
-    /** 手动核销（列表选 pending 行 → 二次确认，status pending → used） */
+    /**
+     * 手动核销 + 现场分座（列表 / 看板选 pending 行 → 分配空闲座 → 二次确认，status pending → used）。
+     * {@code seatId} = 店员现场分配的物理座位（ADR-0016 §3）；新模型单必传，存量已绑座单可省。
+     */
     @SaCheckPermission("gz:bean:booking:verify")
     @Log(title = "拼豆预约核销", businessType = BusinessType.UPDATE)
     @PostMapping("/{id}/verify")
-    public R<GzBeanBookingVO> verify(@PathVariable Long id) {
+    public R<GzBeanBookingVO> verify(@PathVariable Long id, @RequestParam(required = false) Long seatId) {
         String adminUsername = LoginHelper.getUsername();
-        log.info("[bean-booking-admin] verify id={} by={}", id, adminUsername);
-        return R.ok(bookingService.verify(id, adminUsername));
+        log.info("[bean-booking-admin] verify id={} seatId={} by={}", id, seatId, adminUsername);
+        return R.ok(bookingService.verify(id, seatId, adminUsername));
     }
 
     /**
@@ -105,9 +108,9 @@ public class GzBeanBookingController extends BaseController {
     @PostMapping("/verify-scan")
     public R<GzBeanBookingVO> verifyScan(@Validated @RequestBody GzBeanBookingVerifyScanBo bo) {
         String adminUsername = LoginHelper.getUsername();
-        log.info("[bean-booking-admin] verify-scan by={} payloadLen={}",
-            adminUsername, bo.getQrPayload() == null ? 0 : bo.getQrPayload().length());
-        return R.ok(bookingService.verifyByQrPayload(bo.getQrPayload(), adminUsername));
+        log.info("[bean-booking-admin] verify-scan by={} seatId={} payloadLen={}",
+            adminUsername, bo.getSeatId(), bo.getQrPayload() == null ? 0 : bo.getQrPayload().length());
+        return R.ok(bookingService.verifyByQrPayload(bo.getQrPayload(), bo.getSeatId(), adminUsername));
     }
 
     /** admin 代取消（status pending → cancelled） */
@@ -141,6 +144,19 @@ public class GzBeanBookingController extends BaseController {
     public R<List<GzBeanBoardRowVO>> board(@RequestParam Long storeId,
                                            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate sessDate) {
         return R.ok(bookingService.selectBoard(storeId, sessDate));
+    }
+
+    /**
+     * 看板②待分座区（ADR-0016 §3/§5/§6）：某门店某日已付款待核销但<b>尚未分配物理座位</b>的预约列表
+     * （{@code seat_id IS NULL AND status=pending AND pay_status=paid}）。店员从本列表挑一笔 → 给它分一个
+     * ①区空闲座（{@code POST /{id}/verify?seatId=}）完成核销分座。下单选桌型模型下（ADR-0016 §1）所有新单核销前都在此。
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @GetMapping("/board/pending-assign")
+    public R<List<GzBeanBookingVO>> boardPendingAssign(
+            @RequestParam Long storeId,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate sessDate) {
+        return R.ok(bookingService.selectPendingAssignList(storeId, sessDate));
     }
 
     /**

@@ -69,6 +69,9 @@ public class GzBeanStoreVO implements Serializable {
     /** 可预约最大提前天数 */
     private Integer maxAdvanceDays;
 
+    /** 计时看板临近结束提前提醒分钟数（ADR-0016 §6，默认 30） */
+    private Integer nearEndMinutes;
+
     /** 创建时间（公共字段） */
     private LocalDateTime createTime;
 

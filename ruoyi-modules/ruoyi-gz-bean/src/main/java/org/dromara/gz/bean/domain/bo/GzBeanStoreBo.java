@@ -1,6 +1,8 @@
 package org.dromara.gz.bean.domain.bo;
 
 import io.github.linpeilie.annotations.AutoMapper;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
@@ -85,6 +87,11 @@ public class GzBeanStoreBo extends BaseEntity {
 
     /** 可预约最大提前天数（默认 14） */
     private Integer maxAdvanceDays;
+
+    /** 计时看板临近结束提前提醒分钟数（ADR-0016 §6，默认 30；范围 5-120） */
+    @Min(value = 5, message = "临近提醒分钟数不能小于 5", groups = {AddGroup.class, EditGroup.class})
+    @Max(value = 120, message = "临近提醒分钟数不能超过 120", groups = {AddGroup.class, EditGroup.class})
+    private Integer nearEndMinutes;
 
     /** 备注（覆盖 BaseEntity 缺失的 remark；admin 表单可填） */
     @Size(max = 500, message = "备注长度不能超过 500", groups = {AddGroup.class, EditGroup.class})

@@ -70,13 +70,14 @@ public interface IGzBeanBookingService {
     /**
      * admin 手动核销预约（status pending → used，doc/10 §3.N11）。
      *
-     * <p>底层与扫码核销共用 {@code doVerify}（事务 + status 守卫 + UPDATE + booking_log）。</p>
+     * <p>底层与扫码核销共用 {@code doVerify}（事务 + status 守卫 + 现场分座 + UPDATE + booking_log）。</p>
      *
      * @param bookingId   预约 ID
+     * @param seatId      店员现场分配的物理座位 id（ADR-0016 §3）；新模型单必传，存量已绑座单可传 null 沿用原座
      * @param verifiedBy  核销操作人（admin username）
      * @return 核销后 VO
      */
-    GzBeanBookingVO verify(Long bookingId, String verifiedBy);
+    GzBeanBookingVO verify(Long bookingId, Long seatId, String verifiedBy);
 
     /**
      * admin 扫码核销预约（GZ-BEAN-008 AC4，doc/10 §3.N11）。
@@ -91,10 +92,11 @@ public interface IGzBeanBookingService {
      * </ol>
      *
      * @param qrPayload  mp 端二维码内的字符串（{@code BK|{bookingNo}|{verifyCode}}）
+     * @param seatId     店员现场分配的物理座位 id（ADR-0016 §3）；新模型单必传，存量已绑座单可传 null 沿用原座
      * @param verifiedBy 核销操作人（admin username）
      * @return 核销后 VO
      */
-    GzBeanBookingVO verifyByQrPayload(String qrPayload, String verifiedBy);
+    GzBeanBookingVO verifyByQrPayload(String qrPayload, Long seatId, String verifiedBy);
 
     /**
      * admin 预约分页列表（GZ-BEAN-008 store_id 权限隔离版）。
@@ -311,6 +313,17 @@ public interface IGzBeanBookingService {
      * @return 按桌型 / table_no / seatNo 升序的座位单元看板行列表（空店 / 无启用座 → 空列表）
      */
     List<GzBeanBoardRowVO> selectBoard(Long storeId, LocalDate sessDate);
+
+    /**
+     * 看板②待分座区（ADR-0016 §3/§5）：某门店某日已付款待核销但<b>尚未分配物理座位</b>的预约
+     * （{@code seat_id IS NULL AND status='pending' AND pay_status='paid'}），按时段升序。
+     * 店员从本列表挑单 → 调 {@code verify(bookingId, seatId, ...)} 给它分一个空闲座完成核销分座。
+     *
+     * @param storeId  门店 ID
+     * @param sessDate 看板日期
+     * @return 待分座预约列表（空店 / 无待分座 → 空列表）
+     */
+    List<GzBeanBookingVO> selectPendingAssignList(Long storeId, LocalDate sessDate);
 
     /**
      * 提前放座（GZ-BEAN-026，ADR-0015 §5 / doc/11 §3.12 / doc/10 §11）。

@@ -54,6 +54,10 @@ public class GzBeanBookingVO implements Serializable {
     /** V1.2 座位类型中文名快照 */
     private String seatTypeSnapshot;
 
+    /** 桌型档 id（ADR-0016；看板②待分座区按 id 精确匹配候选空闲座，string 防 JS 精度丢失） */
+    @JsonSerialize(using = ToStringSerializer.class)
+    private Long seatTypeConfigId;
+
     @JsonFormat(pattern = "yyyy-MM-dd")
     private LocalDate sessDate;
 

@@ -131,6 +131,20 @@ public final class GzBeanErrorCode {
     public static final int CANCEL_WINDOW_CLOSED = 4020;
     public static final String CANCEL_WINDOW_CLOSED_MSG = "距开始不足 20 分钟，不可取消";
 
+    /**
+     * 核销时未分配物理座位（ADR-0016 §3）：新模型单下单不绑座，核销必须由店员现场分配一个空闲座；
+     * 该单 seat_id 仍为 NULL 且本次核销未传 seatId → 拒。存量已绑座单不触发本码。
+     */
+    public static final int SEAT_REQUIRED = 4021;
+    public static final String SEAT_REQUIRED_MSG = "请先为该预约分配座位再核销";
+
+    /**
+     * 核销分配的座位桌型与预约桌型不符（ADR-0016 §3）：店员分到的物理座位所属
+     * seat_type_config_id ≠ 预约的 seat_type_config_id（如把双人桌单分给单人预约）→ 拒。
+     */
+    public static final int SEAT_TYPE_MISMATCH = 4022;
+    public static final String SEAT_TYPE_MISMATCH_MSG = "所选座位的桌型与预约桌型不符，请重选座位";
+
     private GzBeanErrorCode() {
     }
 }

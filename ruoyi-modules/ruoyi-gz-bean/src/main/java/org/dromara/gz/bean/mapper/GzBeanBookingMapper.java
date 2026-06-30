@@ -92,22 +92,26 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
      * 每一个 1h 格各占 1 配额，service 层对区间内每格各调一次本查询（按格升序加锁防交叠区间死锁，ADR-0011 §3）。</p>
      *
      * <p><b>「覆盖 gi」= 区间重叠，不是 slot_start 相等</b>（ADR-0011 §3）：一个 14:00–17:00 的活跃单确实占了
-     * 15:00 这格，但它的 slot_start≠15:00。重叠条件钉死为 {@code slot_start <= gi AND slot_end > gi}
-     * （gi 为格起整点，左闭右开）。</p>
+     * 15:00 这格，但它的 slot_start≠15:00。重叠条件 = {@code slot_start <= gi AND COALESCE(actual_end_slot, slot_end) > gi}
+     * （gi 为格起整点，左闭右开；止界用 COALESCE 与座位互斥一致，提前放座后该格立即释放）。</p>
      *
-     * <p><b>活跃定义（doc/11 §3.6 钉死，不变）</b>：{@code status='pending' AND pay_status IN ('paying','paid')}
-     * —— 付款中 / 已付的待核销单占名额；{@code used / cancelled / no_show / pay_closed / refunded} 全部释放不计数。</p>
+     * <p><b>活跃定义（ADR-0016 §2 修正，与具体座位互斥 {@link #selectActiveSeatOverlapForUpdate} 对齐）</b>：
+     * {@code status IN ('pending','used') AND pay_status IN ('paying','paid')} —— pending（待到店占计划格）
+     * 与 used（已核销占走 1 个物理座）<b>都计配额</b>；{@code cancelled / no_show / pay_closed / refunded} 全部释放不计。
+     * <b>⚠️ 反转后铁律</b>：ADR-0016 下「核销才占物理座」，若配额只数 pending（漏 used），used 单退出配额却仍占物理座
+     * → 下单层超卖（付款后无座可分）。故配额口径必须含 used，与座位互斥同口径（取代 GZ-BEAN-017 旧 pending-only 口径，
+     * 旧口径仅在「具体座位互斥防超卖、配额只作展示」的 ADR-0015 下成立）。</p>
      *
      * <p><b>tenant_id 显式传</b>：mp 下单事务用户态 JWT 无 tenant，不依赖 ruoyi 拦截器自动注入
      * （同 submit 注释），由 service 从 store / user 取 tenant 显式传入。</p>
      *
      * @param slot 1h 格起整点 gi（service 把下单区间按 1h 展开后逐格传入）
-     * @return 覆盖该格的当前活跃 booking 数（与 gz_bean_seat_type_config.quantity 比对）
+     * @return 覆盖该格的当前活跃 booking 数（与 slotCapacity = 物理座位数 比对）
      */
     @Select("SELECT COUNT(*) FROM gz_bean_booking " +
         "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_type_config_id = #{seatTypeConfigId} " +
-        "  AND sess_date = #{sessDate} AND slot_start <= #{slot} AND slot_end > #{slot} " +
-        "  AND status = 'pending' AND pay_status IN ('paying','paid') AND del_flag = '0' " +
+        "  AND sess_date = #{sessDate} AND slot_start <= #{slot} AND COALESCE(actual_end_slot, slot_end) > #{slot} " +
+        "  AND status IN ('pending','used') AND pay_status IN ('paying','paid') AND del_flag = '0' " +
         "FOR UPDATE")
     long countActiveCoveringSlotForUpdate(@Param("tenantId") String tenantId,
                                           @Param("storeId") Long storeId,
@@ -127,8 +131,8 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
      */
     @Select("SELECT COUNT(*) FROM gz_bean_booking " +
         "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_type_config_id = #{seatTypeConfigId} " +
-        "  AND sess_date = #{sessDate} AND slot_start <= #{slot} AND slot_end > #{slot} " +
-        "  AND status = 'pending' AND pay_status IN ('paying','paid') AND del_flag = '0'")
+        "  AND sess_date = #{sessDate} AND slot_start <= #{slot} AND COALESCE(actual_end_slot, slot_end) > #{slot} " +
+        "  AND status IN ('pending','used') AND pay_status IN ('paying','paid') AND del_flag = '0'")
     long countActiveCoveringSlot(@Param("tenantId") String tenantId,
                                  @Param("storeId") Long storeId,
                                  @Param("seatTypeConfigId") Long seatTypeConfigId,
@@ -215,6 +219,26 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
                                 @Param("sessDate") LocalDate sessDate,
                                 @Param("reqStart") LocalTime reqStart,
                                 @Param("reqEnd") LocalTime reqEnd);
+
+    /**
+     * 同用户同 (<b>桌型档</b>,日期) 已有与 {@code [reqStart, reqEnd)} <b>区间重叠</b>的活跃 booking 数（幂等校验，ADR-0016 §1）。
+     *
+     * <p>下单选桌型模型（ADR-0016）下幂等维度 = <b>seat_type_config_id</b>（下单无具体座位）：同一用户同时段
+     * 重复提交同一桌型档且区间重叠 → {@code >0} 拒（防误连点重复下单）。区间重叠 / 活跃口径同
+     * {@link #countActiveUserOverlap}，仅维度从 seat_id 换成 seat_type_config_id。</p>
+     */
+    @Select("SELECT COUNT(*) FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND user_id = #{userId} AND store_id = #{storeId} " +
+        "  AND seat_type_config_id = #{seatTypeConfigId} AND sess_date = #{sessDate} " +
+        "  AND slot_start < #{reqEnd} AND COALESCE(actual_end_slot, slot_end) > #{reqStart} " +
+        "  AND status = 'pending' AND pay_status IN ('paying','paid') AND del_flag = '0'")
+    long countActiveUserOverlapByConfig(@Param("tenantId") String tenantId,
+                                        @Param("userId") Long userId,
+                                        @Param("storeId") Long storeId,
+                                        @Param("seatTypeConfigId") Long seatTypeConfigId,
+                                        @Param("sessDate") LocalDate sessDate,
+                                        @Param("reqStart") LocalTime reqStart,
+                                        @Param("reqEnd") LocalTime reqEnd);
 
     // ============================================================
     //  GZ-BEAN-025 前 N 名免费促销周期桶计数（ADR-0015 §4 / doc/11 §3.11）

@@ -109,4 +109,11 @@ public class GzBeanBoardRowVO implements Serializable {
      * 其余状态 null。near_end 判定即 {@code remainingMinutes ≤ 阈值}。
      */
     private Long remainingMinutes;
+
+    /**
+     * 该座当前单是否可延时（ADR-0016 §6 排满收尾信号）：紧邻后续 1h 格 {@code [slot_end, slot_end+1h)}
+     * 未被本座别的活跃单占 → {@code true}（admin 提示「可问客人是否延时」）；已占 → {@code false}
+     * （admin 提示「请客人收尾」）。仅 in_use / near_end / overtime 回填，其余 null。
+     */
+    private Boolean canExtend;
 }

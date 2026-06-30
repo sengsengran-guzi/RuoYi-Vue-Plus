@@ -1,6 +1,8 @@
 package org.dromara.gz.bean.domain.vo;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+import com.fasterxml.jackson.databind.ser.std.ToStringSerializer;
 import lombok.Builder;
 import lombok.Data;
 
@@ -26,7 +28,8 @@ public class GzBeanTypeSlotAvailabilityVO implements Serializable {
     @Serial
     private static final long serialVersionUID = 1L;
 
-    /** 座位类型 config id（mp 提交时回传后端作 seatTypeConfigId，ADR-0014 §5） */
+    /** 座位类型 config id（mp 提交时回传后端作 seatTypeConfigId；string 防 JS 精度丢失，对齐跨层契约 #1） */
+    @JsonSerialize(using = ToStringSerializer.class)
     private Long seatTypeConfigId;
 
     /** 座位类型 code（兼容/调试用；mp 不依赖） */
