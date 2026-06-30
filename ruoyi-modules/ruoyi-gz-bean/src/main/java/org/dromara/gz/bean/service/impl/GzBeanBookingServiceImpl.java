@@ -17,6 +17,7 @@ import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
 import org.dromara.gz.bean.domain.entity.GzBeanBooking;
 import org.dromara.gz.bean.domain.entity.GzBeanBookingLog;
 import org.dromara.gz.bean.domain.entity.GzBeanSeat;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatVO;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypePrice;
 import org.dromara.gz.bean.domain.entity.GzBeanStore;
@@ -1801,6 +1802,34 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         }
     }
 
+    @Override
+    public List<GzBeanSeatVO> selectAssignableSeats(Long bookingId) {
+        GzBeanBooking booking = requireBookingForBoardOp(bookingId);
+        String tenantId = booking.getTenantId();
+        Long storeId = booking.getStoreId();
+        // 本店 + 该预约桌型档 + 启用 的座位（核销分座只能选同桌型）
+        List<GzBeanSeatVO> seats = seatMapper.selectVoList(Wrappers.<GzBeanSeat>lambdaQuery()
+            .eq(GzBeanSeat::getTenantId, tenantId)
+            .eq(GzBeanSeat::getStoreId, storeId)
+            .eq(GzBeanSeat::getSeatTypeConfigId, booking.getSeatTypeConfigId())
+            .eq(GzBeanSeat::getEnabled, 1)
+            .orderByAsc(GzBeanSeat::getTableNo)
+            .orderByAsc(GzBeanSeat::getSortNo)
+            .orderByAsc(GzBeanSeat::getSeatNo));
+        if (seats.isEmpty()) {
+            return List.of();
+        }
+        // 排除该日该时段已被占用的座（与防超卖同口径：活跃单 + 区间重叠 + 占用止界 COALESCE(actual_end_slot, slot_end)）
+        java.util.Set<Long> occupied = new java.util.HashSet<>(bookingMapper.selectOccupiedSeatIds(
+            tenantId, storeId, booking.getSessDate(), booking.getSlotStart(), booking.getSlotEnd()));
+        // 排除该日该时段按星期关闭的座
+        java.util.Set<Long> closed = new java.util.HashSet<>(seatClosureService.findClosedSeatIds(
+            tenantId, storeId, booking.getSessDate(), booking.getSlotStart(), booking.getSlotEnd()));
+        return seats.stream()
+            .filter(s -> !occupied.contains(s.getId()) && !closed.contains(s.getId()))
+            .toList();
+    }
+
     // ============================================================
     //  GZ-BEAN-039 admin 代客预定（kevin-test §4）
     // ============================================================
@@ -1855,12 +1884,11 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         Long userId = resolveProxyBookingUserId(tenantId, bo.getMobile());
         String mobileSnapshot = StrUtil.isNotBlank(bo.getMobile()) ? bo.getMobile() : "00000000000";
 
-        // ⑥ 建单（一步 used + 线下已付）：source=admin、out_trade_no=NULL（不进微信对账 GMV）。
+        // ⑥ 建单（pending 待分座 + 线下已付）：source=admin、out_trade_no=NULL（不进微信对账 GMV）。
+        //    代客预定不在此分座——座位留到核销时店员现场分（与普通客户流 + 看板待分座统一，ADR-0016 §3）：
+        //    建成 status=pending + pay_status=paid + seat_id=NULL，进「待分座」列；店员点核销时选座 → used。
+        //    防超卖：上面 ③ 逐格配额已按桌型档计数（pending 计入活跃），核销分座时 assignSeatAtVerify 再做座位区间互斥。
         //    verify_code 用 seat_type 签（ADR-0016 §4，下单无具体座位维度）。
-        //    ★ 先 assignSeatAtVerify 校验+绑座再「一次 INSERT」（seat_id 随首插落库）——
-        //    tenant_id 显式赋（assignSeatAtVerify 需要，同 GzDashboard/GzReconBatch 建表数据前 setTenantId 的既有模式；
-        //    INSERT 前 id 仍 null，overlap removeIf(null) 为 no-op、且本单尚未入库不会命中自身）。
-        //    不再用「insert 后 updateById 补座」——@Version 实体 insert 后内存 version 仍 null，updateById 可能不落座。
         LocalDateTime now = LocalDateTime.now();
         String bookingNo = generateBookingNo(now.toLocalDate());
         String seatTypeName = StrUtil.isNotBlank(config.getName()) ? config.getName() : config.getSeatType();
@@ -1878,33 +1906,29 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .mobileSnapshot(mobileSnapshot)
             .amountCent(amountCent)
             .discountAmountCent(0L)
-            .status(STATUS_USED)
+            .status(STATUS_PENDING)
             .payStatus(PAY_STATUS_PAID)
             .verifyCode(qrCodeSigner.signByType(bookingNo, bo.getSessDate(), config.getSeatType()))
-            .verifyTime(now)
-            .verifiedBy(operator)
             .isFree(0)
             .source(SOURCE_ADMIN)
             .remark(StrUtil.isNotBlank(bo.getCustomerName()) ? "代客预定：" + bo.getCustomerName() : "代客预定")
             .delFlag("0")
             .build();
         entity.setTenantId(tenantId);
-        // ⑦ 分配具体座位（复用核销分座校验链：存在/本店/启用/桌型匹配/关闭/区间互斥 → 写 seat_id/seat_no_snapshot）
-        assignSeatAtVerify(entity, bo.getSeatId());
         bookingMapper.insert(entity);
 
         bookingLogMapper.insert(GzBeanBookingLog.builder()
             .bookingId(entity.getId())
             .fromStatus(null)
-            .toStatus(STATUS_USED)
+            .toStatus(STATUS_PENDING)
             .operatorType(OPERATOR_ADMIN)
             .operatorId(operator)
-            .note("店员代客预定（线下已付，座位 " + entity.getSeatNoSnapshot()
+            .note("店员代客预定（线下已付，待核销分座"
                 + (StrUtil.isNotBlank(bo.getCustomerName()) ? "，顾客 " + bo.getCustomerName() : "") + "）")
             .delFlag("0")
             .build());
-        log.info("[bean-admin-create] OK bookingNo={} storeId={} seatId={} amount={} userId={} by={}",
-            bookingNo, bo.getStoreId(), bo.getSeatId(), amountCent, userId, operator);
+        log.info("[bean-admin-create] OK bookingNo={} storeId={} amount={} userId={} by={} → pending待分座",
+            bookingNo, bo.getStoreId(), amountCent, userId, operator);
         return selectVoById(entity.getId());
     }
 

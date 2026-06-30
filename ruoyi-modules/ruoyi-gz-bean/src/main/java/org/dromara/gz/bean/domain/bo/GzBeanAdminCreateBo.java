@@ -32,10 +32,6 @@ public class GzBeanAdminCreateBo implements Serializable {
     @NotNull
     private Long seatTypeConfigId;
 
-    /** 店员代分配的<b>具体座位</b> id（gz_bean_seat.id；须属本店、启用、桌型匹配、区间未被占） */
-    @NotNull
-    private Long seatId;
-
     /** 预约日期（yyyy-MM-dd） */
     @NotNull
     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)

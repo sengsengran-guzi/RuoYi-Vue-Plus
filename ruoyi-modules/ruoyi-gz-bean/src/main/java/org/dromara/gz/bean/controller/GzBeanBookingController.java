@@ -30,6 +30,8 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatVO;
+
 import java.util.List;
 import java.util.Set;
 
@@ -95,6 +97,16 @@ public class GzBeanBookingController extends BaseController {
         String adminUsername = LoginHelper.getUsername();
         log.info("[bean-booking-admin] verify id={} seatId={} by={}", id, seatId, adminUsername);
         return R.ok(bookingService.verify(id, seatId, adminUsername));
+    }
+
+    /**
+     * 某预约核销分座时<b>可分配的空闲座</b>（ADR-0016 §3）：本店 + 该预约桌型 + 启用，且排除该日该时段
+     * 已被占用 / 按星期关闭的座。核销弹窗座位下拉据此只列「点了不报 SEAT_TAKEN」的座，避免店员撞占。
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @GetMapping("/{id}/assignable-seats")
+    public R<List<GzBeanSeatVO>> assignableSeats(@PathVariable Long id) {
+        return R.ok(bookingService.selectAssignableSeats(id));
     }
 
     /**
@@ -208,16 +220,16 @@ public class GzBeanBookingController extends BaseController {
     }
 
     /**
-     * admin 代客预定（GZ-BEAN-039 / kevin-test §4）：现场没带手机的用户，店员代为选具体座位锁座，
-     * 一步 used + 线下已付。仍走逐格配额防超卖 + 座位区间互斥。
+     * admin 代客预定（GZ-BEAN-039 / kevin-test §4）：现场散客，店员代建单（线下已付），
+     * 建成 pending 待分座 —— 不在此选座，座位留到核销时现场分（ADR-0016 §3）。走逐格配额防超卖。
      */
     @SaCheckPermission("gz:bean:booking:verify")
     @Log(title = "拼豆代客预定", businessType = BusinessType.INSERT)
     @PostMapping("/admin-create")
     public R<GzBeanBookingVO> adminCreate(@Validated @RequestBody GzBeanAdminCreateBo bo) {
         String adminUsername = LoginHelper.getUsername();
-        log.info("[bean-admin-create] storeId={} seatId={} slot={}-{} by={}",
-            bo.getStoreId(), bo.getSeatId(), bo.getSlotStart(), bo.getSlotEnd(), adminUsername);
+        log.info("[bean-admin-create] storeId={} type={} slot={}-{} by={}",
+            bo.getStoreId(), bo.getSeatTypeConfigId(), bo.getSlotStart(), bo.getSlotEnd(), adminUsername);
         return R.ok(bookingService.adminCreateBooking(bo, adminUsername));
     }
 

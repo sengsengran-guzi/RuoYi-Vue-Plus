@@ -5,6 +5,7 @@ import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
 import org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
 import org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatMapVO;
@@ -337,6 +338,16 @@ public interface IGzBeanBookingService {
      * @return 待分座预约列表（空店 / 无待分座 → 空列表）
      */
     List<GzBeanBookingVO> selectPendingAssignList(Long storeId, LocalDate sessDate);
+
+    /**
+     * 某预约「核销分座」时可分配的空闲座（ADR-0016 §3）：本店 + 该预约桌型档 + 启用，且排除该日该时段
+     * <b>已被占用</b>（防超卖同口径：活跃单区间重叠）与<b>按星期关闭</b>的座 —— 用于核销弹窗座位下拉，
+     * 只列点了不会报 SEAT_TAKEN 的座。
+     *
+     * @param bookingId 预约 id（取其 storeId / sessDate / slot / seatTypeConfigId 算可用座）
+     * @return 可分配空闲座（按 table_no / sortNo / seatNo 升序；无则空列表）
+     */
+    List<GzBeanSeatVO> selectAssignableSeats(Long bookingId);
 
     /**
      * 提前放座（GZ-BEAN-026，ADR-0015 §5 / doc/11 §3.12 / doc/10 §11）。

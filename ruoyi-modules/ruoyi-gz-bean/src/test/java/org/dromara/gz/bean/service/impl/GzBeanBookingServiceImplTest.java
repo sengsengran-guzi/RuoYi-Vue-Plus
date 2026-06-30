@@ -2055,6 +2055,39 @@ class GzBeanBookingServiceImplTest {
             eq(LocalTime.of(10, 0)), eq(LocalTime.of(12, 0)));
     }
 
+    @Test
+    @DisplayName("selectAssignableSeats · 本店同桌型启用座中排除该时段已占 + 已关闭 → 只回真正可分配座")
+    void selectAssignableSeats_excludesOccupiedAndClosed() {
+        GzBeanBooking booking = boardBooking(900L, null, "pending",
+            LocalDate.of(2099, 1, 1), LocalTime.of(10, 0), LocalTime.of(11, 0));
+        when(bookingMapper.selectById(900L)).thenReturn(booking);
+        // 本店同桌型启用座 S1(301)/S2(302)/S3(303)
+        when(seatMapper.selectVoList(any())).thenReturn(new java.util.ArrayList<>(java.util.List.of(
+            assignableSeatVo(301L, "S1"), assignableSeatVo(302L, "S2"), assignableSeatVo(303L, "S3"))));
+        // S2(302) 该时段已占
+        when(bookingMapper.selectOccupiedSeatIds(eq("1001"), eq(1L), any(), any(), any()))
+            .thenReturn(new java.util.ArrayList<>(java.util.List.of(302L)));
+        // S3(303) 该时段按星期关闭
+        when(seatClosureService.findClosedSeatIds(eq("1001"), eq(1L), any(), any(), any()))
+            .thenReturn(new java.util.ArrayList<>(java.util.List.of(303L)));
+
+        var seats = service.selectAssignableSeats(900L);
+
+        assertEquals(1, seats.size(), "排除已占 S2 + 已关闭 S3，只剩 S1");
+        assertEquals(301L, seats.get(0).getId());
+        assertEquals("S1", seats.get(0).getSeatNo());
+    }
+
+    private org.dromara.gz.bean.domain.vo.GzBeanSeatVO assignableSeatVo(Long id, String seatNo) {
+        org.dromara.gz.bean.domain.vo.GzBeanSeatVO v = new org.dromara.gz.bean.domain.vo.GzBeanSeatVO();
+        v.setId(id);
+        v.setSeatNo(seatNo);
+        v.setStoreId(1L);
+        v.setSeatTypeConfigId(10L);
+        v.setEnabled(1);
+        return v;
+    }
+
     /* ---------- GZ-BEAN-041 过期单结单 / 补核销（kevin-test §6） ---------- */
 
     @Test
