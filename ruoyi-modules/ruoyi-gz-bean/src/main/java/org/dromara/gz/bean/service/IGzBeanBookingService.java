@@ -99,6 +99,19 @@ public interface IGzBeanBookingService {
     GzBeanBookingVO verifyByQrPayload(String qrPayload, Long seatId, String verifiedBy);
 
     /**
+     * 扫码预解析（GZ-BEAN-038，ADR-0016 §3 现场分座前置）：店员扫顾客核销码后、分座前先解析本单信息。
+     *
+     * <p><b>只读、不改状态</b>：解析 payload + 回表 + HMAC 校签（复用 {@link #verifyByQrPayload} 同款），
+     * 再校 {@code status='pending'} + {@code pay_status='paid'}（无效码即时反馈，店员不必选完座才发现不能核销）。
+     * 返回本单桌型 / 门店 / 日期 / 时段 → mp 据此拉该桌型空座列表给店员手选，再带 {@code seatId} 调
+     * verify-scan 完成核销分座。已绑座的存量单也会返回其座位，mp 可直接核销不必选座。</p>
+     *
+     * @param qrPayload mp 扫码拿到的二维码内容（{@code BK|{bookingNo}|{verifyCode}}）
+     * @return 预解析出的预约 VO（含 seatTypeConfigId / storeId / sessDate / slotStart / slotEnd / seatId）
+     */
+    GzBeanBookingVO resolveByQrPayload(String qrPayload);
+
+    /**
      * admin 预约分页列表（GZ-BEAN-008 store_id 权限隔离版）。
      *
      * <p>{@code staffStoreId != null} 时（staff 角色绑定门店）强制 {@code WHERE store_id = staffStoreId}，

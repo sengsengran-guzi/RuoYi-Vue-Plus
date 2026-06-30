@@ -248,12 +248,44 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     @Override
     @Transactional(rollbackFor = Exception.class)
     public GzBeanBookingVO verifyByQrPayload(String qrPayload, Long seatId, String verifiedBy) {
-        // ① 解析 payload "BK|{bookingNo}|{verifyCode}"（doc/10 §3 E8 — 格式非法直接拒）
+        // ①②③ 解析 + 回表 + HMAC 校签（与扫码预解析共用，下同）
+        GzBeanBooking booking = parsePayloadAndVerifySign(qrPayload);
+
+        // ④ 校签通过 → 复用与手动核销同一底层（含现场分座）。注意：本单 seat_id 此刻仍 NULL（核销才分座），
+        //    上面 ③ 自然走 verifyByType 校签；分座写 seat_id 发生在 doVerify 内、校签之后，顺序安全（ADR-0016 §3/§4）。
+        log.info("[bean-verify-scan] signature ok bookingNo={} by={}", booking.getBookingNo(), verifiedBy);
+        return doVerify(booking, seatId, verifiedBy, "店员扫码核销");
+    }
+
+    @Override
+    public GzBeanBookingVO resolveByQrPayload(String qrPayload) {
+        // 扫码预解析（GZ-BEAN-038，ADR-0016 §3）：店员扫码后、分座前先解析出本单桌型/门店/时段，
+        //   mp 据此拉该桌型空座列表给店员手选，再带 seatId 调 verify-scan 完成核销分座。
+        //   只读、不改状态：解析 + 回表 + 校签（复用 verify 同款），再校 status/pay_status 让无效码即时反馈
+        //   （已核销 / 已取消 / 未支付不必再选座）。校验链与 doVerify 前置一致，避免选完座才发现不能核销。
+        GzBeanBooking booking = parsePayloadAndVerifySign(qrPayload);
+        if (!STATUS_PENDING.equals(booking.getStatus())) {
+            throw new ServiceException(GzBeanErrorCode.INVALID_STATUS_MSG + "（当前状态：" + booking.getStatus() + "）",
+                GzBeanErrorCode.INVALID_STATUS);
+        }
+        if (booking.getPayStatus() != null && !PAY_STATUS_PAID.equals(booking.getPayStatus())) {
+            throw new ServiceException(GzBeanErrorCode.NOT_PAID_MSG + "（当前支付状态：" + booking.getPayStatus() + "）",
+                GzBeanErrorCode.NOT_PAID);
+        }
+        return selectVoById(booking.getId());
+    }
+
+    /**
+     * 扫码核销前置：解析 payload {@code "BK|{bookingNo}|{verifyCode}"} + 回表 + HMAC 校签（GZ-BEAN-008，
+     * 扫码核销 / 扫码预解析共用，只读不改状态）。格式非法 → QR_PAYLOAD_MALFORMED；查无 → BOOKING_NOT_FOUND；
+     * 校签不过 → QR_SIGNATURE_INVALID。校签因子判别真源 = {@code seat_id} 是否非空（旧单 seat_id 签 / 新付费单 seat_type 签）。
+     */
+    private GzBeanBooking parsePayloadAndVerifySign(String qrPayload) {
+        // ① 解析 payload（doc/10 §3 E8 — 格式非法直接拒）
         if (StrUtil.isBlank(qrPayload)) {
             throw new ServiceException(GzBeanErrorCode.QR_PAYLOAD_MALFORMED_MSG, GzBeanErrorCode.QR_PAYLOAD_MALFORMED);
         }
         String[] parts = qrPayload.split("\\|", -1);
-        // 期望 3 段：["BK", bookingNo, verifyCode]
         if (parts.length != 3 || !"BK".equals(parts[0])
             || StrUtil.isBlank(parts[1]) || StrUtil.isBlank(parts[2])) {
             log.warn("[bean-verify-scan] malformed qrPayload (masked len={})", qrPayload.length());
@@ -269,9 +301,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             throw new ServiceException(GzBeanErrorCode.BOOKING_NOT_FOUND_MSG, GzBeanErrorCode.BOOKING_NOT_FOUND);
         }
 
-        // ③ HMAC 校签：核销码持久化时用什么因子签的就用什么校。判别真源 = seat_id 是否非空：
-        //    - 旧 booking（seat_id 非空，含迁移后补了 seat_type 的旧免费单）：verify_code 当年用 seat_id 签 → verify(seat_id)
-        //    - V1.2 新付费单（seat_id NULL，seat_type 非空）：onPaid 时用 seat_type 签（doc/11 §3.8）→ verifyByType
+        // ③ HMAC 校签（判别真源 = seat_id 非空）
         boolean signOk;
         if (booking.getSeatId() != null) {
             signOk = qrCodeSigner.verify(
@@ -284,11 +314,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             log.warn("[bean-verify-scan] signature mismatch bookingNo={} (篡改 / 非本店码)", bookingNo);
             throw new ServiceException(GzBeanErrorCode.QR_SIGNATURE_INVALID_MSG, GzBeanErrorCode.QR_SIGNATURE_INVALID);
         }
-
-        // ④ 校签通过 → 复用与手动核销同一底层（含现场分座）。注意：本单 seat_id 此刻仍 NULL（核销才分座），
-        //    上面 ③ 自然走 verifyByType 校签；分座写 seat_id 发生在 doVerify 内、校签之后，顺序安全（ADR-0016 §3/§4）。
-        log.info("[bean-verify-scan] signature ok bookingNo={} by={}", bookingNo, verifiedBy);
-        return doVerify(booking, seatId, verifiedBy, "店员扫码核销");
+        return booking;
     }
 
     /**

@@ -291,4 +291,26 @@ public class GzBeanBookingMpController {
             operator, bo.getSeatId(), bo.getQrPayload() == null ? 0 : bo.getQrPayload().length());
         return R.ok(bookingService.verifyByQrPayload(bo.getQrPayload(), bo.getSeatId(), operator));
     }
+
+    /**
+     * mp 店员扫码核销前置：扫码预解析（GZ-BEAN-038，ADR-0016 §3 现场分座）。
+     *
+     * <p>店员扫顾客核销码后先调本端点解析出本单<b>桌型 / 门店 / 日期 / 时段</b>（只读、不改状态，
+     * 复用 {@code verifyByQrPayload} 同款解析 + 校签 + status/pay 校验）→ mp 据此调 {@code GET /seat-map}
+     * 拉该桌型当前空座给店员手选 → 再带 {@code seatId} 调 {@code POST /verify-scan} 完成核销分座。
+     * 已绑座的存量单直接返回其座位，mp 可跳过选座直接核销。</p>
+     *
+     * <pre>
+     * POST /app/gz/bean/booking/scan-resolve   Body: { "qrPayload": "BK|BK...|<verifyCode>" }
+     * 200 OK { "code":200, "data": { ...BookingVO，含 seatTypeConfigId/storeId/sessDate/slotStart/slotEnd/seatId... } }
+     * 业务错误同 verify-scan：4007/4008/4009/4010/4015(NOT_PAID)（店员不必选完座才发现不能核销）
+     * </pre>
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @PostMapping("/scan-resolve")
+    public R<GzBeanBookingVO> scanResolve(@Validated @RequestBody GzBeanBookingVerifyScanBo bo) {
+        log.info("[bean-booking-mp] scan-resolve by={} payloadLen={}",
+            LoginHelper.getUsername(), bo.getQrPayload() == null ? 0 : bo.getQrPayload().length());
+        return R.ok(bookingService.resolveByQrPayload(bo.getQrPayload()));
+    }
 }
