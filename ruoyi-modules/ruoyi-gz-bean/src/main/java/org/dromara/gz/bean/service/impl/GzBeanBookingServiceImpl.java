@@ -1754,18 +1754,27 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         if (seatBookings == null || seatBookings.isEmpty()) {
             return null;
         }
+        // 已提前放座的单（actual_end_time 有值）= 客人已离场、店员已释放该座 → 不参与「当前占用」判定，
+        //   看板即刻显空闲（GZ-BEAN-026 修：放座后座位不再卡在「使用中」）。actual_end_slot 仅供防超卖按整点格回收，
+        //   看板展示按真实离场（actual_end_time 非空）即视为已结束、该座空闲。
+        List<GzBeanBooking> live = seatBookings.stream()
+            .filter(b -> b.getActualEndTime() == null)
+            .toList();
+        if (live.isEmpty()) {
+            return null;
+        }
         boolean isToday = sessDate.equals(now.toLocalDate());
         if (isToday) {
             LocalTime nowTime = now.toLocalTime();
-            for (GzBeanBooking b : seatBookings) {
+            for (GzBeanBooking b : live) {
                 LocalTime occEnd = occupiedEnd(b);
                 if (!b.getSlotStart().isAfter(nowTime) && nowTime.isBefore(occEnd)) {
                     return b; // 覆盖当前时刻
                 }
             }
         }
-        // 无覆盖当前（或非今天）→ 取最早一笔（列表已按 slot_start 升序）展示该座当日活跃单
-        return seatBookings.get(0);
+        // 无覆盖当前（或非今天）→ 取最早一笔未放座单（列表已按 slot_start 升序）展示该座当日活跃单
+        return live.get(0);
     }
 
     /** 占用止界（看板/防超卖一致）：已放座按 actual_end_slot，否则计划 slot_end。 */
