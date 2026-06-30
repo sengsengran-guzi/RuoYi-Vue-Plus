@@ -151,6 +151,12 @@ public class GzBeanBooking extends TenantEntity {
     /** 去重 token（方案 C） — UNIQUE(tenant_id, store_id, dedup_token) */
     private String dedupToken;
 
+    /**
+     * 下单来源（GZ-BEAN-039 / kevin-test §4）：{@code mp}=小程序用户下单（默认）/ {@code admin}=店员代客预定
+     * （线下已付、out_trade_no 为 NULL，默认不进微信对账 GMV）。便于对账 / 看板辨识来源。
+     */
+    private String source;
+
     /** 乐观锁版本（mybatis-plus @Version） */
     @Version
     private Integer version;

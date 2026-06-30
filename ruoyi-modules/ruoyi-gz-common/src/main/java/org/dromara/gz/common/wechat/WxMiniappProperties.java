@@ -41,6 +41,26 @@ public class WxMiniappProperties {
     /** 小程序 AppSecret，默认空（mock 通道不需要）。 */
     private String secret = "";
 
+    /**
+     * dev 本地手机号回落开关：真通道（真 AppID）下也跳过微信 getuserphonenumber，直接返默认测试号。
+     *
+     * <p>仅 application-dev.yml 置 true（默认 false）。用途：本地保留真登录（真 appid + 真 secret），
+     * 但开发者工具模拟器拿不到可换取明文号的真实 code 时，用固定号 {@code 13800000000} 走通拼豆 / 资料
+     * 页的手机号绑定，与 appid 模式解耦。staging/prod 不配 → false → 走真实换号。</p>
+     */
+    private boolean mockPhoneFallback = false;
+
+    /**
+     * dev 本地稳定 mock 用户：mock 登录通道（{@link #isMock()}）下忽略 wx.login 的 code，固定返回
+     * {@code mock-<本值>} 作 openid，使本地所有登录（含 token 静默续期换新 code）恒为同一个测试用户。
+     *
+     * <p>仅 application-dev.yml 置非空（默认空 → 沿用 {@code mock-<code前8位>} 派生、换 code 即新用户的
+     * 多用户测试口径）。背景：真 AppID 前端在开发者工具每次 {@code uni.login} 拿到的 code 都不同 → mock
+     * 后端据 code 派生出不同 openid → 同一测试者被当成多个用户（续坐/同人判定按 user_id 全失灵）。置一个
+     * 稳定值即可让 dev 单测试者 = 单用户，贴近生产「同设备 openid 稳定」。需多用户测试时置空。</p>
+     */
+    private String mockStableOpenid = "";
+
     /** session_key 在 Redis 中的 TTL（秒），默认 24h（仅解密手机号等微信能力用，与登录态解耦）。 */
     private long sessionKeyTtlSeconds = 86400L;
 

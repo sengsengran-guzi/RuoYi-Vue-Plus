@@ -279,6 +279,14 @@ wx:
     # 真实 AppID 接入后改为 wx.xxxxxx，自动切换 WxRealLoginAdapter
     appid: ${WX_MA_APPID:wxMOCK}
     secret: ${WX_MA_SECRET:}
+    # dev 本地回落：true 时真手机号通道（真 appid）也直接返默认测试号 13800000000，绕过真实
+    # getuserphonenumber —— 本地用真 appid 测真登录、但模拟器拿不到可换号的真 code 时仍能走通绑定。
+    # 与 appid 解耦（真登录 + 假手机号）。staging/prod 不配此项 → 默认 false → 走真实微信换号。
+    mock-phone-fallback: ${WX_MA_MOCK_PHONE:true}
+    # dev 稳定 mock 用户：mock 登录恒返 openid=mock-dev-tester，忽略 wx.login 的 code，使本地所有登录
+    # （含 token 静默续期换新 code）都是同一个测试用户 —— 否则真 appid 前端每次拿到的 code 不同 → mock
+    # 后端派生出不同 openid → 同一测试者被当多个用户（续坐/同人判定失灵）。需多用户测试时置空（WX_MA_MOCK_OPENID=）。
+    mock-stable-openid: ${WX_MA_MOCK_OPENID:dev-tester}
     # session_key Redis TTL（秒），默认 24h（doc/10 §1.N6；仅解密手机号用，与登录态解耦）
     session-key-ttl-seconds: 86400
     # 业务 token TTL（秒），30 天（ADR-0009 登录态长效；失效由 mp 静默 wx.login 续期，用户无感）

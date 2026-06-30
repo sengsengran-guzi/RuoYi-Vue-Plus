@@ -133,4 +133,35 @@ public class GzBeanBookingVO implements Serializable {
 
     /** 门店地址（mp 详情页顶部展示；service join gz_bean_store 填充） */
     private String storeAddress;
+
+    // ============================================================
+    //  GZ-BEAN-037 看板待分座区「同用户连续时段」高亮 + 提前核销（kevin-test §2，service 填充）
+    // ============================================================
+
+    /**
+     * 该待分座单是否与同用户当前在店（used 未放座）单<b>时段相连</b>（kevin-test §2）：
+     * true → 看板高亮 + 提示「同一用户连续时段」，店员可一键提前核销（默认沿用当前座位）。
+     */
+    private Boolean consecutiveWithActive;
+
+    /** 建议沿用的座位 id（= 同用户相连 used 单的 seat_id；仅 consecutiveWithActive=true 时有值，弹窗默认预选） */
+    @JsonSerialize(using = ToStringSerializer.class)
+    private Long suggestedSeatId;
+
+    /** 建议沿用的座位号（展示用，如 D5） */
+    private String suggestedSeatNo;
+
+    /** 同用户相连 used 单的占用止界（= 本待分座单时段的开始，展示「接续 14:00 后」用） */
+    @JsonFormat(pattern = "HH:mm:ss")
+    private LocalTime activeSlotEnd;
+
+    // ============================================================
+    //  GZ-BEAN-041 看板过期单批量结单 / 补核销（kevin-test §6，service 填充）
+    // ============================================================
+
+    /**
+     * 时段已过的分钟数（{@code NOW() − TIMESTAMP(sess_date, slot_end)} 的分钟，&gt;0 即过期）。
+     * 看板「过期待处理」区据此显「已过期 N 分钟/小时」红标。selectExpiredUnsettled 才填充。
+     */
+    private Long expiredMinutes;
 }

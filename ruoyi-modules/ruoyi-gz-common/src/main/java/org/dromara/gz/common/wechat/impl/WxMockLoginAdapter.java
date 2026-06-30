@@ -1,10 +1,12 @@
 package org.dromara.gz.common.wechat.impl;
 
 import cn.hutool.core.util.StrUtil;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.exception.ServiceException;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
 import org.dromara.gz.common.wechat.WxLoginAdapter;
+import org.dromara.gz.common.wechat.WxMiniappProperties;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
@@ -31,6 +33,7 @@ import org.springframework.stereotype.Component;
  */
 @Slf4j
 @Component
+@RequiredArgsConstructor
 @ConditionalOnProperty(prefix = "wx.miniapp", name = "appid", havingValue = "wxMOCK", matchIfMissing = true)
 public class WxMockLoginAdapter implements WxLoginAdapter {
 
@@ -46,19 +49,25 @@ public class WxMockLoginAdapter implements WxLoginAdapter {
     /** code 取前 N 位用于派生 openid（足够区分，且短便于日志）。 */
     private static final int CODE_PREFIX_LEN = 8;
 
+    private final WxMiniappProperties miniappProperties;
+
     @Override
     public WxJscode2SessionResult code2Session(String code) {
         if (StrUtil.isBlank(code)) {
             throw new ServiceException("微信登录 code 不能为空");
         }
-        String prefix = code.length() > CODE_PREFIX_LEN ? code.substring(0, CODE_PREFIX_LEN) : code;
+        // dev 稳定 mock 用户：配了 mock-stable-openid 则忽略 code，恒返固定 openid（让本地换 code/续期仍是同一人）。
+        String stable = miniappProperties.getMockStableOpenid();
+        String prefix = StrUtil.isNotBlank(stable)
+            ? stable.trim()
+            : (code.length() > CODE_PREFIX_LEN ? code.substring(0, CODE_PREFIX_LEN) : code);
         WxJscode2SessionResult result = WxJscode2SessionResult.builder()
             .openid(MOCK_OPENID_PREFIX + prefix)
             .unionid(MOCK_UNIONID_PREFIX + prefix)
             .sessionKey(MOCK_SESSION_KEY_PREFIX + code)
             .build();
-        log.info("[wx-mock] code2Session code={} → openid={} unionid={}",
-            code, result.getOpenid(), result.getUnionid());
+        log.info("[wx-mock] code2Session code={} stable={} → openid={} unionid={}",
+            code, StrUtil.isNotBlank(stable), result.getOpenid(), result.getUnionid());
         return result;
     }
 

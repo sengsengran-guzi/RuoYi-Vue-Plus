@@ -2,6 +2,7 @@ package org.dromara.gz.common.wechat.impl;
 
 import org.dromara.common.core.exception.ServiceException;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
+import org.dromara.gz.common.wechat.WxMiniappProperties;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -25,7 +26,8 @@ import static org.junit.jupiter.api.Assertions.*;
 @Tag("dev")
 class WxMockLoginAdapterTest {
 
-    private final WxMockLoginAdapter adapter = new WxMockLoginAdapter();
+    /** 默认 props（mockStableOpenid 空）→ 沿用 code 派生口径，下方既有断言不变。 */
+    private final WxMockLoginAdapter adapter = new WxMockLoginAdapter(new WxMiniappProperties());
 
     @Test
     @DisplayName("AC 3: 标准 code → 派生 mock-{前8位} / mock-union-{前8位} / mock-session-{全 code}")
@@ -67,5 +69,20 @@ class WxMockLoginAdapterTest {
     @DisplayName("channel() 返回 'mock'")
     void channel_returnsMock() {
         assertEquals("mock", adapter.channel());
+    }
+
+    @Test
+    @DisplayName("配 mock-stable-openid（dev 稳定单用户）→ 忽略 code，换 code 仍恒为同一 openid")
+    void code2Session_stableOpenid_ignoresCode() {
+        WxMiniappProperties stableProps = new WxMiniappProperties();
+        stableProps.setMockStableOpenid("dev-tester");
+        WxMockLoginAdapter stableAdapter = new WxMockLoginAdapter(stableProps);
+
+        WxJscode2SessionResult r1 = stableAdapter.code2Session("code-AAAA1111");
+        WxJscode2SessionResult r2 = stableAdapter.code2Session("code-BBBB2222");
+
+        assertEquals("mock-dev-tester", r1.getOpenid());
+        assertEquals("mock-dev-tester", r2.getOpenid(), "换 code 仍同一 openid（本地单测试者=单用户）");
+        assertEquals("mock-union-dev-tester", r1.getUnionid());
     }
 }

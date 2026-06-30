@@ -1,9 +1,13 @@
 package org.dromara.gz.coupon.mapper;
 
 import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Select;
 import org.apache.ibatis.annotations.Update;
 import org.dromara.common.mybatis.core.mapper.BaseMapperPlus;
 import org.dromara.gz.coupon.domain.entity.GzCouponTemplate;
+
+import java.time.LocalDateTime;
+import java.util.List;
 
 /**
  * gz_coupon_template 数据层（GZ-COUPON-001）。
@@ -35,4 +39,31 @@ public interface GzCouponTemplateMapper extends BaseMapperPlus<GzCouponTemplate,
         + "WHERE id = #{id} AND version = #{version} AND del_flag = '0' AND status = 'active' "
         + "AND (total_quota IS NULL OR issued_count + #{n} <= total_quota)")
     int increaseIssuedCount(@Param("id") Long id, @Param("version") Integer version, @Param("n") int n);
+
+    // ============================================================
+    //  GZ-COUPON-003 自动发放（定时扫描）
+    // ============================================================
+
+    /**
+     * 查待自动发放模板（GZ-COUPON-003）：{@code status='active' AND auto_issue=1 AND issue_strategy='filtered'}。
+     *
+     * <p>cron 全租户扫（service 内 {@code TenantHelper.ignore} 包裹，与 expireBatch 同模式）。
+     * 只取 filtered + auto_issue 开 + 启用中模板：manual/event 不自动发，paused/archived 不发。</p>
+     *
+     * @return 待自动发放模板列表（无则空）
+     */
+    @Select("SELECT * FROM gz_coupon_template "
+        + "WHERE status = 'active' AND auto_issue = 1 AND issue_strategy = 'filtered' AND del_flag = '0'")
+    List<GzCouponTemplate> selectAutoIssueTemplates();
+
+    /**
+     * 写「上次自动发放时间」（GZ-COUPON-003）：仅更新 last_auto_issue_time，<b>不触碰 issued_count / version</b>
+     * （配额乐观锁由 {@code increaseIssuedCount} 单独管，此处只记审计时间，避免误改版本干扰并发发券）。
+     *
+     * @param id   模板主键
+     * @param time 本次自动发放时间
+     * @return 影响行数
+     */
+    @Update("UPDATE gz_coupon_template SET last_auto_issue_time = #{time} WHERE id = #{id} AND del_flag = '0'")
+    int updateLastAutoIssueTime(@Param("id") Long id, @Param("time") LocalDateTime time);
 }

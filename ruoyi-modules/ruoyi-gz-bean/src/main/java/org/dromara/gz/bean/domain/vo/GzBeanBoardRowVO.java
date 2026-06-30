@@ -116,4 +116,12 @@ public class GzBeanBoardRowVO implements Serializable {
      * （admin 提示「请客人收尾」）。仅 in_use / near_end / overtime 回填，其余 null。
      */
     private Boolean canExtend;
+
+    /**
+     * 续坐止界（GZ-BEAN-037 看板续坐角标）：当前单沿「同座 + 同用户 + back-to-back（前段 slot_end ==
+     * 后段 slot_start）」的活跃续单链向后走到的最末段计划 {@code slot_end}。仅当存在续坐（该值 &gt;
+     * 当前单 slot_end）时回填 → 前端显「续坐 → HH:mm」角标，提示该座由同一顾客连续占用至此刻；
+     * 无续坐 / idle 时 null。与待分座「连续·建议」同口径（同用户成链）。
+     */
+    private LocalTime continuousUntil;
 }

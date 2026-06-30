@@ -225,6 +225,9 @@ public class GzCouponTemplateServiceImpl implements IGzCouponTemplateService {
         e.setTotalQuota(bo.getTotalQuota());
         e.setIssueStrategy(bo.getIssueStrategy());
         e.setIssueConfigJson(bo.getIssueConfigJson());
+        // auto_issue 仅 filtered 策略有意义：非 filtered 强制归零（GZ-COUPON-003）；不传按 0
+        boolean isFiltered = FilteredIssuanceStrategy.STRATEGY.equals(bo.getIssueStrategy());
+        e.setAutoIssue(isFiltered && bo.getAutoIssue() != null && bo.getAutoIssue() == 1 ? 1 : 0);
         e.setRemark(bo.getRemark());
     }
 
@@ -300,6 +303,8 @@ public class GzCouponTemplateServiceImpl implements IGzCouponTemplateService {
         vo.setIssueStrategy(e.getIssueStrategy());
         vo.setIssueConfigJson(e.getIssueConfigJson());
         vo.setStatus(e.getStatus());
+        vo.setAutoIssue(e.getAutoIssue());
+        vo.setLastAutoIssueTime(e.getLastAutoIssueTime());
         vo.setVersion(e.getVersion());
         vo.setCreateTime(e.getCreateTime());
         vo.setUpdateTime(e.getUpdateTime());

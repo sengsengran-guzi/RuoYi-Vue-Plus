@@ -1857,13 +1857,13 @@ class GzBeanBookingServiceImplTest {
     /* ---------- 延时 extendBooking ---------- */
 
     @Test
-    @DisplayName("extendBooking happy · used 单新增格无占 → slot_end 推后 + 写 log（V1 不补付）")
+    @DisplayName("extendBooking happy · 延 120min（整点）→ slot_end 16:00→18:00 + 写 log（V1 不补付）")
     void extendBooking_happy() {
         GzBeanBooking booking = boardBooking(600L, 300L, "used",
             LocalDate.now(), LocalTime.of(10, 0), LocalTime.of(16, 0));
         booking.setVerifyTime(java.time.LocalDateTime.now());
         when(bookingMapper.selectById(600L)).thenReturn(booking);
-        // 新增格 [16:00, 18:00) 无冲突（除自身外）
+        // 新增格整点覆盖 [16:00, 18:00) 无冲突（除自身外）；延 120min → 18:00 整点，ceil=18:00
         when(bookingMapper.selectActiveSeatOverlapExcludingForUpdate(
             eq("1001"), eq(1L), eq(300L), any(), eq(600L), eq(LocalTime.of(16, 0)), eq(LocalTime.of(18, 0))))
             .thenReturn(java.util.List.of());
@@ -1872,13 +1872,36 @@ class GzBeanBookingServiceImplTest {
         when(seatTypeConfigMapper.selectById(10L)).thenReturn(boardConfig());
         when(configService.getConfigInt("gz.bean.board.near_end_minutes")).thenReturn(15);
 
-        org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO vo = service.extendBooking(600L, 2, "staff1");
+        org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO vo = service.extendBooking(600L, 120, "staff1");
 
         assertNotNull(vo);
         verify(bookingMapper).extendSlotEnd(eq(600L), eq(LocalTime.of(16, 0)), eq(LocalTime.of(18, 0)));
         verify(bookingLogMapper).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
-        // 回显 slot_end 已推后
         assertEquals(LocalTime.of(18, 0), vo.getSlotEnd());
+    }
+
+    @Test
+    @DisplayName("extendBooking · 延 15min（kevin-test §3a）→ slot_end 16:00→16:15（精确到分），撞占按整点格 [16:00,17:00) 校验")
+    void extendBooking_minutesGranular() {
+        GzBeanBooking booking = boardBooking(605L, 300L, "used",
+            LocalDate.now(), LocalTime.of(10, 0), LocalTime.of(16, 0));
+        booking.setVerifyTime(java.time.LocalDateTime.now());
+        when(bookingMapper.selectById(605L)).thenReturn(booking);
+        // 撞占校验用整点格上界 ceil(16:15)=17:00 → [16:00, 17:00)
+        when(bookingMapper.selectActiveSeatOverlapExcludingForUpdate(
+            eq("1001"), eq(1L), eq(300L), any(), eq(605L), eq(LocalTime.of(16, 0)), eq(LocalTime.of(17, 0))))
+            .thenReturn(java.util.List.of());
+        // slot_end 精确推到 16:15
+        when(bookingMapper.extendSlotEnd(eq(605L), eq(LocalTime.of(16, 0)), eq(LocalTime.of(16, 15)))).thenReturn(1);
+        when(seatMapper.selectById(300L)).thenReturn(boardSeat(300L, "Q1-1"));
+        when(seatTypeConfigMapper.selectById(10L)).thenReturn(boardConfig());
+        when(configService.getConfigInt("gz.bean.board.near_end_minutes")).thenReturn(15);
+
+        org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO vo = service.extendBooking(605L, 15, "staff1");
+
+        assertNotNull(vo);
+        verify(bookingMapper).extendSlotEnd(eq(605L), eq(LocalTime.of(16, 0)), eq(LocalTime.of(16, 15)));
+        assertEquals(LocalTime.of(16, 15), vo.getSlotEnd());
     }
 
     @Test
@@ -1898,10 +1921,18 @@ class GzBeanBookingServiceImplTest {
     }
 
     @Test
-    @DisplayName("extendBooking · addHours ≤ 0 → EXTEND_HOURS_INVALID")
-    void extendBooking_invalidHours() {
+    @DisplayName("extendBooking · addMinutes ≤ 0 → EXTEND_MINUTES_INVALID")
+    void extendBooking_invalidMinutes() {
         ServiceException ex = assertThrows(ServiceException.class, () -> service.extendBooking(602L, 0, "staff1"));
-        assertEquals(GzBeanErrorCode.EXTEND_HOURS_INVALID, ex.getCode());
+        assertEquals(GzBeanErrorCode.EXTEND_MINUTES_INVALID, ex.getCode());
+        verify(bookingMapper, never()).selectById(anyLong());
+    }
+
+    @Test
+    @DisplayName("extendBooking · addMinutes > 720（上限）→ EXTEND_MINUTES_INVALID")
+    void extendBooking_overMaxMinutes() {
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.extendBooking(606L, 721, "staff1"));
+        assertEquals(GzBeanErrorCode.EXTEND_MINUTES_INVALID, ex.getCode());
         verify(bookingMapper, never()).selectById(anyLong());
     }
 
@@ -1927,6 +1958,173 @@ class GzBeanBookingServiceImplTest {
         ServiceException ex = assertThrows(ServiceException.class, () -> service.extendBooking(604L, 1, "staff1"));
         assertEquals(GzBeanErrorCode.BOARD_OP_INVALID_STATUS, ex.getCode());
         verify(bookingMapper, never()).extendSlotEnd(anyLong(), any(), any());
+    }
+
+    /* ---------- GZ-BEAN-040 改派座位 reassignSeat（kevin-test §5） ---------- */
+
+    @Test
+    @DisplayName("reassignSeat happy · used 未放座单 → 改派新座（校验+写 seat_id/no + log）")
+    void reassignSeat_happy() {
+        GzBeanBooking booking = boardBooking(800L, 300L, "used",
+            LocalDate.of(2099, 1, 1), LocalTime.of(10, 0), LocalTime.of(11, 0));
+        booking.setSeatNoSnapshot("Q1-1");
+        booking.setVerifyTime(java.time.LocalDateTime.now());
+        when(bookingMapper.selectById(800L)).thenReturn(booking);
+        // 新座 777L 属本店、启用、桌型匹配（10L）
+        when(seatMapper.selectById(777L)).thenReturn(
+            org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
+                .id(777L).storeId(1L).seatTypeConfigId(10L).seatNo("Q2-1").tableNo("Q2").enabled(1).build());
+        when(bookingMapper.selectActiveSeatOverlapForUpdate(eq("1001"), eq(1L), eq(777L), any(), any(), any()))
+            .thenReturn(new java.util.ArrayList<>());
+        when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
+        when(seatTypeConfigMapper.selectById(10L)).thenReturn(boardConfig());
+        when(configService.getConfigInt("gz.bean.board.near_end_minutes")).thenReturn(15);
+
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        var vo = spy.reassignSeat(800L, 777L, "staff1");
+
+        assertNotNull(vo);
+        assertEquals(777L, booking.getSeatId(), "改派写入新 seat_id");
+        assertEquals("Q2-1", booking.getSeatNoSnapshot(), "改派写入新 seat_no_snapshot");
+        verify(bookingMapper).updateById(any(GzBeanBooking.class));
+        verify(bookingLogMapper).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
+    }
+
+    @Test
+    @DisplayName("reassignSeat · 已放座单（actual_end_time 非空）→ BOARD_OP_INVALID_STATUS，不改座")
+    void reassignSeat_rejectReleased() {
+        GzBeanBooking booking = boardBooking(801L, 300L, "used",
+            LocalDate.of(2099, 1, 1), LocalTime.of(10, 0), LocalTime.of(11, 0));
+        booking.setActualEndTime(java.time.LocalDateTime.now());
+        when(bookingMapper.selectById(801L)).thenReturn(booking);
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.reassignSeat(801L, 777L, "staff1"));
+        assertEquals(GzBeanErrorCode.BOARD_OP_INVALID_STATUS, ex.getCode());
+        verify(bookingMapper, never()).updateById(any(GzBeanBooking.class));
+    }
+
+    @Test
+    @DisplayName("reassignSeat · 非 used（pending）单 → BOARD_OP_INVALID_STATUS")
+    void reassignSeat_rejectNonUsed() {
+        GzBeanBooking booking = boardBooking(802L, null, "pending",
+            LocalDate.of(2099, 1, 1), LocalTime.of(10, 0), LocalTime.of(11, 0));
+        when(bookingMapper.selectById(802L)).thenReturn(booking);
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.reassignSeat(802L, 777L, "staff1"));
+        assertEquals(GzBeanErrorCode.BOARD_OP_INVALID_STATUS, ex.getCode());
+        verify(bookingMapper, never()).updateById(any(GzBeanBooking.class));
+    }
+
+    @Test
+    @DisplayName("reassignSeat · 续坐链（同人同座 10-11 + 11-12）→ 整条一起改派到新座（两单都改 seat + 各一条 log，合并时段一次互斥校验）")
+    void reassignSeat_continuousChainMovesTogether() {
+        // 锚单 = 抽屉触发的续坐后段 11-12（id 810，原座 300L=S1，user 9）
+        GzBeanBooking anchor = boardBooking(810L, 300L, "used",
+            LocalDate.of(2099, 1, 1), LocalTime.of(11, 0), LocalTime.of(12, 0));
+        anchor.setUserId(9L);
+        anchor.setSeatNoSnapshot("S1");
+        // 续坐前段 10-11（id 811，同座同人，back-to-back）
+        GzBeanBooking prev = boardBooking(811L, 300L, "used",
+            LocalDate.of(2099, 1, 1), LocalTime.of(10, 0), LocalTime.of(11, 0));
+        prev.setUserId(9L);
+        prev.setSeatNoSnapshot("S1");
+        when(bookingMapper.selectById(810L)).thenReturn(anchor);
+        // 同人同座 used 未放座链候选（含锚单本身）
+        when(bookingMapper.selectList(any()))
+            .thenReturn(new java.util.ArrayList<>(java.util.List.of(anchor, prev)));
+        // 新座 777L 启用、桌型匹配 10L
+        when(seatMapper.selectById(777L)).thenReturn(
+            org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
+                .id(777L).storeId(1L).seatTypeConfigId(10L).seatNo("S5").enabled(1).build());
+        when(bookingMapper.selectActiveSeatOverlapForUpdate(eq("1001"), eq(1L), eq(777L), any(), any(), any()))
+            .thenReturn(new java.util.ArrayList<>());
+        when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
+        when(seatTypeConfigMapper.selectById(10L)).thenReturn(boardConfig());
+        when(configService.getConfigInt("gz.bean.board.near_end_minutes")).thenReturn(15);
+
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        var vo = spy.reassignSeat(810L, 777L, "staff1");
+
+        assertNotNull(vo);
+        assertEquals(777L, anchor.getSeatId(), "锚单（后段）改到新座");
+        assertEquals(777L, prev.getSeatId(), "续坐前段也一起改到新座（不拆座）");
+        assertEquals("S5", anchor.getSeatNoSnapshot());
+        assertEquals("S5", prev.getSeatNoSnapshot());
+        verify(bookingMapper, times(2)).updateById(any(GzBeanBooking.class));
+        verify(bookingLogMapper, times(2)).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
+        // 合并时段 [10:00,12:00) 仅一次区间互斥校验（锁一次、不逐单重复加锁）
+        verify(bookingMapper).selectActiveSeatOverlapForUpdate(eq("1001"), eq(1L), eq(777L), any(),
+            eq(LocalTime.of(10, 0)), eq(LocalTime.of(12, 0)));
+    }
+
+    /* ---------- GZ-BEAN-041 过期单结单 / 补核销（kevin-test §6） ---------- */
+
+    @Test
+    @DisplayName("settleAsCompleted · pending 过期单 → used（补核销，无座历史结算）+ log")
+    void settleAsCompleted_pendingToUsed() {
+        GzBeanBooking booking = boardBooking(900L, null, "pending",
+            LocalDate.now(), LocalTime.of(10, 0), LocalTime.of(11, 0));
+        when(bookingMapper.selectById(900L)).thenReturn(booking);
+        when(bookingMapper.settleAsCompleted(eq(900L), any(), eq("staff1"))).thenReturn(1);
+
+        assertTrue(service.settleAsCompleted(900L, "staff1"));
+        verify(bookingMapper).settleAsCompleted(eq(900L), any(), eq("staff1"));
+        verify(bookingLogMapper).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
+    }
+
+    @Test
+    @DisplayName("settleAsCompleted · no_show 单翻案 → used（cron 误扫的实际接待单）")
+    void settleAsCompleted_noShowReversal() {
+        GzBeanBooking booking = boardBooking(901L, null, "no_show",
+            LocalDate.now(), LocalTime.of(10, 0), LocalTime.of(11, 0));
+        when(bookingMapper.selectById(901L)).thenReturn(booking);
+        when(bookingMapper.settleAsCompleted(eq(901L), any(), eq("staff1"))).thenReturn(1);
+
+        assertTrue(service.settleAsCompleted(901L, "staff1"));
+        verify(bookingMapper).settleAsCompleted(eq(901L), any(), eq("staff1"));
+    }
+
+    @Test
+    @DisplayName("settleAsCompleted · 已非 pending|no_show（affected=0）→ 幂等跳过返 false，不写 log")
+    void settleAsCompleted_idempotent() {
+        GzBeanBooking booking = boardBooking(902L, 300L, "used",
+            LocalDate.now(), LocalTime.of(10, 0), LocalTime.of(11, 0));
+        when(bookingMapper.selectById(902L)).thenReturn(booking);
+        when(bookingMapper.settleAsCompleted(eq(902L), any(), eq("staff1"))).thenReturn(0);
+
+        assertFalse(service.settleAsCompleted(902L, "staff1"));
+        verify(bookingLogMapper, never()).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
+    }
+
+    @Test
+    @DisplayName("markNoShowManual · pending 过期单 → no_show（人工标爽约）+ log")
+    void markNoShowManual_happy() {
+        GzBeanBooking booking = boardBooking(910L, null, "pending",
+            LocalDate.now(), LocalTime.of(10, 0), LocalTime.of(11, 0));
+        when(bookingMapper.selectById(910L)).thenReturn(booking);
+        when(bookingMapper.markNoShow(eq(910L), any())).thenReturn(1);
+
+        assertTrue(service.markNoShowManual(910L, "staff1"));
+        verify(bookingMapper).markNoShow(eq(910L), any());
+        verify(bookingLogMapper).insert(any(org.dromara.gz.bean.domain.entity.GzBeanBookingLog.class));
+    }
+
+    @Test
+    @DisplayName("batchSettle · completed 动作批量，单条失败隔离 → 统计 ok/skip/fail")
+    void batchSettle_completedMixed() {
+        // 920 成功(pending→used) / 921 幂等跳过(affected=0) / 922 抛异常(selectById null→ServiceException)
+        GzBeanBooking ok = boardBooking(920L, null, "pending",
+            LocalDate.now(), LocalTime.of(10, 0), LocalTime.of(11, 0));
+        GzBeanBooking skip = boardBooking(921L, 300L, "used",
+            LocalDate.now(), LocalTime.of(10, 0), LocalTime.of(11, 0));
+        when(bookingMapper.selectById(920L)).thenReturn(ok);
+        when(bookingMapper.selectById(921L)).thenReturn(skip);
+        when(bookingMapper.selectById(922L)).thenReturn(null);
+        when(bookingMapper.settleAsCompleted(eq(920L), any(), eq("staff1"))).thenReturn(1);
+        when(bookingMapper.settleAsCompleted(eq(921L), any(), eq("staff1"))).thenReturn(0);
+
+        var result = service.batchSettle(java.util.List.of(920L, 921L, 922L), "completed", "staff1");
+        assertEquals(1, result.succeeded());
+        assertEquals(1, result.skipped());
+        assertEquals(1, result.failed());
     }
 
     // ============================================================

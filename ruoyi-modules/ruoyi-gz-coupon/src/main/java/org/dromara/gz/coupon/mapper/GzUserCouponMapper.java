@@ -144,4 +144,19 @@ public interface GzUserCouponMapper extends BaseMapperPlus<GzUserCoupon, GzUserC
     @Select("SELECT id FROM gz_user_coupon "
         + "WHERE status = 'unused' AND expire_time < #{now} AND del_flag = '0' ORDER BY id")
     List<Long> selectExpiredUnusedIds(@Param("now") LocalDateTime now);
+
+    /**
+     * 查已持某模板券的用户 id（GZ-COUPON-003 自动发放去重）。
+     *
+     * <p><b>任一状态都算「已发」</b>（不限 status）—— 一人一模板只发一次：周期补发时减去这批 holder，
+     * 避免重复发券（{@link org.dromara.gz.coupon.service.internal.CouponIssueWriter#issueToUsers} 本身无去重）。
+     * 含 unused/locked/used/expired/revoked 全部活记录（del_flag='0'），不含软删（撤回作废走 revoked 而非软删，
+     * 已 revoked 仍算发过、不再补发）。多租户由拦截器自动 append；自动发放 cron 在
+     * {@code TenantHelper.ignore} 内逐租户语义生效（V1 仅 '1001'）。</p>
+     *
+     * @param templateId 模板主键
+     * @return 已持该模板券的去重 userId 列表（无则空）
+     */
+    @Select("SELECT DISTINCT user_id FROM gz_user_coupon WHERE template_id = #{templateId} AND del_flag = '0'")
+    List<Long> selectHolderUserIds(@Param("templateId") Long templateId);
 }

@@ -8,6 +8,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.exception.ServiceException;
 import org.dromara.gz.common.wechat.WxAccessTokenManager;
+import org.dromara.gz.common.wechat.WxMiniappProperties;
 import org.dromara.gz.common.wechat.WxPhoneAdapter;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.stereotype.Component;
@@ -44,10 +45,20 @@ public class WxRealPhoneAdapter implements WxPhoneAdapter {
     /** HTTP 超时（毫秒）。 */
     private static final int HTTP_TIMEOUT_MS = 5000;
 
+    /** dev 本地回落固定测试号（与 {@link WxMockPhoneAdapter} 一致）。 */
+    private static final String DEV_MOCK_PHONE = "13800000000";
+
     private final WxAccessTokenManager accessTokenManager;
+    private final WxMiniappProperties miniappProperties;
 
     @Override
     public String code2Phone(String code) {
+        // dev 本地回落：真 appid 下也跳过微信换号，返默认测试号（仅 application-dev.yml 置 true）。
+        if (miniappProperties.isMockPhoneFallback()) {
+            log.info("[wx-phone] dev mock-phone-fallback 开启 → 返默认测试号 {}（绕过 getuserphonenumber，code={}）",
+                DEV_MOCK_PHONE, code);
+            return DEV_MOCK_PHONE;
+        }
         if (StrUtil.isBlank(code)) {
             throw new ServiceException("手机号授权 code 不能为空");
         }

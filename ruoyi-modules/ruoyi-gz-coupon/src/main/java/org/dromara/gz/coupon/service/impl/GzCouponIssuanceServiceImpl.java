@@ -3,6 +3,7 @@ package org.dromara.gz.coupon.service.impl;
 import cn.hutool.core.util.StrUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.exception.ServiceException;
+import org.dromara.common.tenant.helper.TenantHelper;
 import org.dromara.gz.common.service.IGzUserService;
 import org.dromara.gz.coupon.domain.bo.CouponAudienceConditionDto;
 import org.dromara.gz.coupon.domain.bo.GzCouponIssueBo;
@@ -10,6 +11,7 @@ import org.dromara.gz.coupon.domain.entity.GzCouponTemplate;
 import org.dromara.gz.coupon.domain.vo.GzCouponIssueResultVO;
 import org.dromara.gz.coupon.mapper.GzCouponTemplateMapper;
 import org.dromara.gz.coupon.service.IGzCouponIssuanceService;
+import org.dromara.gz.coupon.service.internal.CouponAutoIssueExecutor;
 import org.dromara.gz.coupon.strategy.CouponAudienceResolver;
 import org.dromara.gz.coupon.strategy.CouponIssuanceContext;
 import org.dromara.gz.coupon.strategy.FilteredIssuanceStrategy;
@@ -41,19 +43,25 @@ public class GzCouponIssuanceServiceImpl implements IGzCouponIssuanceService {
 
     private static final String STATUS_ACTIVE = "active";
 
+    private static final String STRATEGY_FILTERED = FilteredIssuanceStrategy.STRATEGY;
+
     private final GzCouponTemplateMapper templateMapper;
     private final IGzUserService userService;
     private final CouponAudienceResolver audienceResolver;
+    /** 单模板自动发放执行器（GZ-COUPON-003，独立事务边界，批量逐模板隔离）。 */
+    private final CouponAutoIssueExecutor autoIssueExecutor;
     /** issue_strategy code → 策略实现（构造期建路由表，SPI 扩展自动注册）。 */
     private final Map<String, ICouponIssuanceStrategy> strategyRouter;
 
     public GzCouponIssuanceServiceImpl(GzCouponTemplateMapper templateMapper,
                                        IGzUserService userService,
                                        CouponAudienceResolver audienceResolver,
+                                       CouponAutoIssueExecutor autoIssueExecutor,
                                        List<ICouponIssuanceStrategy> strategies) {
         this.templateMapper = templateMapper;
         this.userService = userService;
         this.audienceResolver = audienceResolver;
+        this.autoIssueExecutor = autoIssueExecutor;
         this.strategyRouter = strategies.stream()
             .collect(Collectors.toMap(ICouponIssuanceStrategy::supports, Function.identity()));
     }
@@ -118,6 +126,53 @@ public class GzCouponIssuanceServiceImpl implements IGzCouponIssuanceService {
     public long previewAudience(List<CouponAudienceConditionDto> conditions) {
         // 与 filtered 发放共用 resolver（预览口径 = 实发口径）；conditions 非法即抛
         return audienceResolver.resolveByConditions(conditions).size();
+    }
+
+    @Override
+    public AutoIssueResult autoIssueBatch() {
+        // cron 无登录态 → 关多租户拦截器全租户扫（V1 仅 '1001'），与 expireBatch 同模式。
+        return TenantHelper.ignore(() -> {
+            List<GzCouponTemplate> templates = templateMapper.selectAutoIssueTemplates();
+            if (templates.isEmpty()) {
+                log.info("[gz-coupon-auto] no active filtered auto-issue templates, skip");
+                return new AutoIssueResult(0, 0);
+            }
+            int totalIssued = 0;
+            for (GzCouponTemplate t : templates) {
+                // 每模板独立事务 + try/catch 隔离：单模板配额满 / 条件解析异常不拖垮整批
+                try {
+                    totalIssued += autoIssueExecutor.issueOnce(t);
+                } catch (Exception ex) {
+                    log.error("[gz-coupon-auto] templateId={} templateNo={} auto-issue failed: {}",
+                        t.getId(), t.getTemplateNo(), ex.getMessage(), ex);
+                }
+            }
+            log.info("[gz-coupon-auto] done. templatesScanned={} totalIssued={}", templates.size(), totalIssued);
+            return new AutoIssueResult(templates.size(), totalIssued);
+        });
+    }
+
+    @Override
+    public int autoIssueOnce(Long templateId) {
+        if (templateId == null) {
+            throw new ServiceException("券模板 ID 不能为空");
+        }
+        GzCouponTemplate template = templateMapper.selectById(templateId);
+        if (template == null) {
+            throw new ServiceException("券模板不存在：" + templateId);
+        }
+        if (!STATUS_ACTIVE.equals(template.getStatus())) {
+            throw new ServiceException("模板非启用状态，不可自动发放：" + template.getStatus());
+        }
+        if (!STRATEGY_FILTERED.equals(template.getIssueStrategy())) {
+            throw new ServiceException("仅条件筛选（filtered）策略支持自动发放，当前策略：" + template.getIssueStrategy());
+        }
+        if (template.getAutoIssue() == null || template.getAutoIssue() != 1) {
+            throw new ServiceException("该模板未开启自动发放，无法试跑");
+        }
+        int issued = autoIssueExecutor.issueOnce(template);
+        log.info("[gz-coupon-auto] manual run-once templateId={} issued={}", templateId, issued);
+        return issued;
     }
 
     /**

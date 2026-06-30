@@ -1,5 +1,6 @@
 package org.dromara.gz.coupon.domain.bo;
 
+import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -72,6 +73,14 @@ public class GzCouponTemplateBo implements Serializable {
     /** 策略参数 JSON（manual 可空；service 校验为合法 JSON） */
     @Size(max = 2048, message = "策略参数长度不能超过 2048", groups = {AddGroup.class, EditGroup.class})
     private String issueConfigJson;
+
+    /**
+     * 是否自动发放（GZ-COUPON-003，仅 filtered 策略生效）：0=否 1=是；不传按 0 处理。
+     * 非 filtered 策略即便传 1，service 强制归零（自动发放只对条件筛选有意义）。
+     */
+    @Min(value = 0, message = "自动发放标志非法", groups = {AddGroup.class, EditGroup.class})
+    @Max(value = 1, message = "自动发放标志非法", groups = {AddGroup.class, EditGroup.class})
+    private Integer autoIssue;
 
     /** 备注 */
     @Size(max = 500, message = "备注长度不能超过 500", groups = {AddGroup.class, EditGroup.class})

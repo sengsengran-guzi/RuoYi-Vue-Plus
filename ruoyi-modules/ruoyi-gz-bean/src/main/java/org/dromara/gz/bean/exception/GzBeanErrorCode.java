@@ -117,9 +117,9 @@ public final class GzBeanErrorCode {
     public static final int EXTEND_CONFLICT = 4018;
     public static final String EXTEND_CONFLICT_MSG = "该座位后续时段已被预约，无法延时";
 
-    /** 延时小时数非法（须为正整数 1..N，doc/11 §3.12 延时按整点格推后） */
-    public static final int EXTEND_HOURS_INVALID = 4019;
-    public static final String EXTEND_HOURS_INVALID_MSG = "延时小时数非法，请输入正整数";
+    /** 延时分钟数非法（须为正整数 1..720，kevin-test §3a 延时改输入分钟；slot_end 精确到分、占用按整点格回收） */
+    public static final int EXTEND_MINUTES_INVALID = 4019;
+    public static final String EXTEND_MINUTES_INVALID_MSG = "延时分钟数非法，请输入 1-720 之间的正整数";
 
     /**
      * 距时段开始不足 {@code CANCEL_CUTOFF_MINUTES}（20）分钟，不可取消预约。

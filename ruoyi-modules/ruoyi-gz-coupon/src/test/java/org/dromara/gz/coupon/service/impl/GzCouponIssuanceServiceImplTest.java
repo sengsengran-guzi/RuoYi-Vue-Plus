@@ -6,6 +6,8 @@ import org.dromara.gz.coupon.domain.bo.GzCouponIssueBo;
 import org.dromara.gz.coupon.domain.entity.GzCouponTemplate;
 import org.dromara.gz.coupon.domain.vo.GzCouponIssueResultVO;
 import org.dromara.gz.coupon.mapper.GzCouponTemplateMapper;
+import org.dromara.gz.coupon.service.IGzCouponIssuanceService.AutoIssueResult;
+import org.dromara.gz.coupon.service.internal.CouponAutoIssueExecutor;
 import org.dromara.gz.coupon.strategy.CouponAudienceResolver;
 import org.dromara.gz.coupon.strategy.ICouponIssuanceStrategy;
 import org.dromara.gz.coupon.strategy.ManualIssuanceStrategy;
@@ -24,6 +26,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -50,6 +54,8 @@ class GzCouponIssuanceServiceImplTest {
     private IGzUserService userService;
     @Mock
     private CouponAudienceResolver audienceResolver;
+    @Mock
+    private CouponAutoIssueExecutor autoIssueExecutor;
 
     /** 用一个可控的 manual 策略 stub（避免依赖真实 ManualIssuanceStrategy 的 DB 行为）。 */
     private static class StubManualStrategy implements ICouponIssuanceStrategy {
@@ -83,7 +89,7 @@ class GzCouponIssuanceServiceImplTest {
     }
 
     private GzCouponIssuanceServiceImpl service(StubManualStrategy stub) {
-        return new GzCouponIssuanceServiceImpl(templateMapper, userService, audienceResolver, List.of(stub));
+        return new GzCouponIssuanceServiceImpl(templateMapper, userService, audienceResolver, autoIssueExecutor, List.of(stub));
     }
 
     @Test
@@ -210,7 +216,7 @@ class GzCouponIssuanceServiceImplTest {
             }
         };
         GzCouponIssuanceServiceImpl svc =
-            new GzCouponIssuanceServiceImpl(templateMapper, userService, audienceResolver, List.of(lastSeatStrategy));
+            new GzCouponIssuanceServiceImpl(templateMapper, userService, audienceResolver, autoIssueExecutor, List.of(lastSeatStrategy));
 
         // 两轮发放，第一轮入口 + 重读，第二轮入口（发放抛异常前不会重读）
         lenient().when(templateMapper.selectById(2001L))
@@ -229,5 +235,109 @@ class GzCouponIssuanceServiceImplTest {
         bo2.setUserIds(List.of(41L));
         // 第二单击穿配额 → 拒单（不超发）
         assertThrows(ServiceException.class, () -> svc.issue(bo2));
+    }
+
+    // ============================================================
+    //  GZ-COUPON-003 自动发放批量扫描
+    // ============================================================
+
+    private GzCouponTemplate filteredAutoTemplate(long id) {
+        GzCouponTemplate t = new GzCouponTemplate();
+        t.setId(id);
+        t.setTemplateNo("CPN-20260630-" + String.format("%06d", id));
+        t.setStatus("active");
+        t.setIssueStrategy("filtered");
+        t.setAutoIssue(1);
+        return t;
+    }
+
+    @Test
+    @DisplayName("autoIssueBatch：扫到 2 个 filtered+auto 模板 → 逐个发放、累计张数")
+    void autoIssueBatch_scansAndAccumulates() {
+        StubManualStrategy stub = new StubManualStrategy();
+        GzCouponIssuanceServiceImpl svc = service(stub);
+
+        GzCouponTemplate t1 = filteredAutoTemplate(3001L);
+        GzCouponTemplate t2 = filteredAutoTemplate(3002L);
+        when(templateMapper.selectAutoIssueTemplates()).thenReturn(List.of(t1, t2));
+        when(autoIssueExecutor.issueOnce(t1)).thenReturn(3); // 发 3 张
+        when(autoIssueExecutor.issueOnce(t2)).thenReturn(2); // 发 2 张
+
+        AutoIssueResult result = svc.autoIssueBatch();
+        assertEquals(2, result.templatesScanned());
+        assertEquals(5, result.issued());
+    }
+
+    @Test
+    @DisplayName("autoIssueBatch：单模板配额满抛异常被隔离，不拖垮其余模板")
+    void autoIssueBatch_oneFails_othersStillIssue() {
+        StubManualStrategy stub = new StubManualStrategy();
+        GzCouponIssuanceServiceImpl svc = service(stub);
+
+        GzCouponTemplate t1 = filteredAutoTemplate(3001L);
+        GzCouponTemplate t2 = filteredAutoTemplate(3002L); // 配额满
+        GzCouponTemplate t3 = filteredAutoTemplate(3003L);
+        when(templateMapper.selectAutoIssueTemplates()).thenReturn(List.of(t1, t2, t3));
+        when(autoIssueExecutor.issueOnce(t1)).thenReturn(4);
+        when(autoIssueExecutor.issueOnce(t2)).thenThrow(new ServiceException("发放失败：配额不足"));
+        when(autoIssueExecutor.issueOnce(t3)).thenReturn(1);
+
+        AutoIssueResult result = svc.autoIssueBatch();
+        // t2 失败被 try/catch 接住：scanned 仍计全部 3 个，issued = 4 + 0 + 1
+        assertEquals(3, result.templatesScanned());
+        assertEquals(5, result.issued());
+        // t3 在 t2 异常后仍被调用（隔离生效）
+        verify(autoIssueExecutor).issueOnce(t3);
+    }
+
+    @Test
+    @DisplayName("autoIssueBatch：无 filtered+auto 模板（manual/非auto 不入扫描）→ 0/0，executor 不被调")
+    void autoIssueBatch_noEligibleTemplates_noop() {
+        StubManualStrategy stub = new StubManualStrategy();
+        GzCouponIssuanceServiceImpl svc = service(stub);
+        // selectAutoIssueTemplates 的 SQL 已过滤 status=active AND auto_issue=1 AND filtered
+        // → manual / 非 auto / paused 模板根本不在返回集；空集即代表无可发模板
+        when(templateMapper.selectAutoIssueTemplates()).thenReturn(List.of());
+
+        AutoIssueResult result = svc.autoIssueBatch();
+        assertEquals(0, result.templatesScanned());
+        assertEquals(0, result.issued());
+        verify(autoIssueExecutor, never()).issueOnce(any());
+    }
+
+    @Test
+    @DisplayName("autoIssueOnce：非 filtered 模板 → 拒绝试跑")
+    void autoIssueOnce_notFiltered_rejected() {
+        StubManualStrategy stub = new StubManualStrategy();
+        GzCouponIssuanceServiceImpl svc = service(stub);
+        when(templateMapper.selectById(3001L)).thenReturn(template("active", "manual", 100, 0));
+
+        assertThrows(ServiceException.class, () -> svc.autoIssueOnce(3001L));
+        verify(autoIssueExecutor, never()).issueOnce(any());
+    }
+
+    @Test
+    @DisplayName("autoIssueOnce：filtered 但未开 auto_issue → 拒绝试跑")
+    void autoIssueOnce_autoFlagOff_rejected() {
+        StubManualStrategy stub = new StubManualStrategy();
+        GzCouponIssuanceServiceImpl svc = service(stub);
+        GzCouponTemplate t = filteredAutoTemplate(3001L);
+        t.setAutoIssue(0); // 未开
+        when(templateMapper.selectById(3001L)).thenReturn(t);
+
+        assertThrows(ServiceException.class, () -> svc.autoIssueOnce(3001L));
+        verify(autoIssueExecutor, never()).issueOnce(any());
+    }
+
+    @Test
+    @DisplayName("autoIssueOnce：filtered+auto+active 模板 → 委托 executor 返发放张数")
+    void autoIssueOnce_happyPath() {
+        StubManualStrategy stub = new StubManualStrategy();
+        GzCouponIssuanceServiceImpl svc = service(stub);
+        GzCouponTemplate t = filteredAutoTemplate(3001L);
+        when(templateMapper.selectById(3001L)).thenReturn(t);
+        when(autoIssueExecutor.issueOnce(t)).thenReturn(7);
+
+        assertEquals(7, svc.autoIssueOnce(3001L));
     }
 }

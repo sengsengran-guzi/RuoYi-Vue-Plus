@@ -65,3 +65,6 @@ apiclient_*.p12
 *_cert/
 secrets/
 gz-pay*.env
+
+# codebase-memory-mcp index artifact (local bootstrap; do not commit)
+.codebase-memory/

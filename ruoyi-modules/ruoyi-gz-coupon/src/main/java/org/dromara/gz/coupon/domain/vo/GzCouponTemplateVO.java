@@ -6,6 +6,7 @@ import lombok.Data;
 
 import java.io.Serial;
 import java.io.Serializable;
+import java.time.LocalDateTime;
 import java.util.Date;
 
 /**
@@ -57,6 +58,12 @@ public class GzCouponTemplateVO implements Serializable {
 
     /** 模板态 active/paused/archived */
     private String status;
+
+    /** 是否自动发放（仅 filtered 生效）：0=否 1=是（GZ-COUPON-003） */
+    private Integer autoIssue;
+
+    /** 上次自动发放时间（NULL=从未自动发放） */
+    private LocalDateTime lastAutoIssueTime;
 
     /** 乐观锁版本（admin 只读，发放并发调试用） */
     private Integer version;

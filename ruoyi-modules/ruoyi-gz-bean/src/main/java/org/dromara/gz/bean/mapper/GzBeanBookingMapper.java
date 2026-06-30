@@ -424,4 +424,24 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
         "WHERE pay_status IN ('unpaid','paying') AND status = 'pending' " +
         "  AND create_time < #{deadline} AND del_flag = '0' ORDER BY id")
     List<Long> selectExpiredUnpaidIds(@Param("deadline") LocalDateTime deadline);
+
+    // ============================================================
+    //  GZ-BEAN-041 看板过期单批量结单 / 补核销（kevin-test §6）
+    // ============================================================
+
+    /**
+     * 过期单补核销条件 UPDATE（GZ-BEAN-041 / kevin-test §6）：{@code status: pending|no_show → used}
+     * （no_show 翻案）+ 写 verify_time / verified_by + dedup_token 切 booking_no。<b>不绑 seat_id</b>
+     * （历史结算，不上看板座位、不撞后续预约）。
+     *
+     * <p>WHERE 守卫 {@code status IN ('pending','no_show')} → 天然幂等：已 used/cancelled 的单 affected=0。</p>
+     *
+     * @return 受影响行数（1 = 补核销成功 / 0 = 已非 pending|no_show，幂等跳过）
+     */
+    @Update("UPDATE gz_bean_booking " +
+        "SET status = 'used', verify_time = #{verifyTime}, verified_by = #{verifiedBy}, dedup_token = booking_no " +
+        "WHERE id = #{id} AND status IN ('pending','no_show') AND del_flag = '0'")
+    int settleAsCompleted(@Param("id") Long id,
+                          @Param("verifyTime") LocalDateTime verifyTime,
+                          @Param("verifiedBy") String verifiedBy);
 }

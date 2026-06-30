@@ -13,6 +13,7 @@ import lombok.NoArgsConstructor;
 import org.dromara.common.tenant.core.TenantEntity;
 
 import java.io.Serial;
+import java.time.LocalDateTime;
 
 /**
  * gz_coupon_template — 优惠券模板 entity（GZ-COUPON-001）。
@@ -78,6 +79,12 @@ public class GzCouponTemplate extends TenantEntity {
 
     /** 模板态 active/paused/archived（字典 gz_coupon_template_status） */
     private String status;
+
+    /** 是否自动发放（仅 filtered 策略生效）：0=否 1=是。SnailJob gzCouponAutoIssueTask 周期扫描补发（GZ-COUPON-003） */
+    private Integer autoIssue;
+
+    /** 上次自动发放时间（定时任务 / 试跑写入；NULL=从未自动发放过） */
+    private LocalDateTime lastAutoIssueTime;
 
     /** 乐观锁（issued_count 并发发券防超发） */
     @Version

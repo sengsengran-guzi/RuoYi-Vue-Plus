@@ -353,19 +353,108 @@ public interface IGzBeanBookingService {
     GzBeanBoardRowVO releaseSeatEarly(Long bookingId, String operatorId);
 
     /**
-     * 延时（GZ-BEAN-026，ADR-0015 §5 / doc/11 §3.12 / doc/10 §11）：把 {@code slot_end} 往后推
-     * {@code addHours} 个整点格。
+     * 延时（GZ-BEAN-026 / kevin-test §3a）：把 {@code slot_end} 往后推 {@code addMinutes} <b>分钟</b>。
+     *
+     * <p>客户口径：延时输入分钟更好记录，slot_end 精确到分（看板剩余/超时按真实时间），差额按门店政策线下结算。
+     * <b>占用/防超卖仍按整点格回收</b>：延时溢入下一整点格即占该格配额（{@code COALESCE(actual_end_slot,slot_end)>gi}
+     * 天然向上取整），故延 15min 进下一小时即让 mp 该桌型该格余量 −1（占满则置灰，kevin-test §3b）。</p>
      *
      * <p>对某在店使用中（{@code status='used'}）单：先按具体座位区间互斥校验该座新增格区间
-     * {@code [oldSlotEnd, oldSlotEnd+addHours)} 未被<b>除自身外</b>的活跃单占（占了拒绝 E4b
+     * {@code [oldSlotEnd, ceil(oldSlotEnd+addMinutes))} 未被<b>除自身外</b>的活跃单占（占了拒绝 E4b
      * {@link org.dromara.gz.bean.exception.GzBeanErrorCode#EXTEND_CONFLICT}）→ 通过则 UPDATE slot_end。
-     * <b>V1 延时不走线上补付</b>（差额线下结算 / 门店政策，amount_cent 不变）。已放过座
-     * （actual_end_time 非空）的单不可延时（座位已释放，延时无意义 → BOARD_OP_INVALID_STATUS）。</p>
+     * <b>V1 延时不走线上补付</b>。已放过座（actual_end_time 非空）的单不可延时（→ BOARD_OP_INVALID_STATUS）。</p>
      *
      * @param bookingId  预约 ID
-     * @param addHours   延后整点格数（正整数 1..N）
+     * @param addMinutes 延后分钟数（正整数 1..720）
      * @param operatorId 操作人（落 booking_log）
      * @return 延时后看板行 VO（含新 slotEnd）
      */
-    GzBeanBoardRowVO extendBooking(Long bookingId, int addHours, String operatorId);
+    GzBeanBoardRowVO extendBooking(Long bookingId, int addMinutes, String operatorId);
+
+    /**
+     * 已核销单改派座位（GZ-BEAN-040 / kevin-test §5）：店员核销时分错座 → 把<b>已 used 且未放座</b>单改派到
+     * 另一空闲座位。复用核销分座的校验链（存在/本店/启用/桌型匹配/关闭/区间互斥，排自身），通过则
+     * UPDATE seat_id/seat_no_snapshot；旧座占用随 seat_id 变更自动释放。已放座 / 非 used 单拒
+     * （{@link org.dromara.gz.bean.exception.GzBeanErrorCode#BOARD_OP_INVALID_STATUS}）。
+     *
+     * @param bookingId  预约 ID
+     * @param newSeatId  改派到的目标空闲座位 id
+     * @param operatorId 操作人（落 booking_log）
+     * @return 改派后看板行 VO（含新 seat 信息）
+     */
+    GzBeanBoardRowVO reassignSeat(Long bookingId, Long newSeatId, String operatorId);
+
+    /**
+     * admin 代客预定（GZ-BEAN-039 / kevin-test §4）：现场没带手机的用户，店员直接选门店/日期/时段/桌型/
+     * <b>具体座位</b>代下单，一步 {@code used + pay_status=paid}（线下已付），锁座给用户。
+     *
+     * <p>仍走<b>逐格配额防超卖</b>（不绕过超卖）+ 具体座位区间互斥校验（同核销分座）。{@code source='admin'}
+     * 标记，{@code out_trade_no=NULL}（线下无微信通道流水，默认不进微信对账 GMV）。用户身份：传 mobile 命中
+     * 既有 gz_user 则关联，否则用门店租户级「线下散客」占位用户。amount_cent 默认按区间逐格求和计价，
+     * 入参可覆盖。</p>
+     *
+     * @param bo       代客预定参数（storeId/sessDate/slotStart/slotEnd/seatTypeConfigId/seatId/mobile?/customerName?/amountCent?）
+     * @param operator 操作店员 username（落 verified_by / booking_log）
+     * @return 创建后预约 VO
+     */
+    GzBeanBookingVO adminCreateBooking(org.dromara.gz.bean.domain.bo.GzBeanAdminCreateBo bo, String operator);
+
+    // ============================================================
+    //  GZ-BEAN-041 看板过期单批量结单 / 补核销（kevin-test §6）
+    // ============================================================
+
+    /**
+     * 查某门店某日<b>时段已过仍未终结</b>的单（GZ-BEAN-041 / kevin-test §6）：
+     * {@code TIMESTAMP(sess_date, slot_end) <= NOW()} 且
+     * （{@code status='pending'}（待分座过期）∪ {@code status='no_show'}（已被 cron 扫走的，供翻案补核销）
+     * ∪ {@code status='used' AND actual_end_time IS NULL}（已超时未放座））。供看板「过期待处理」区批量结单。
+     *
+     * @param storeId  门店 ID
+     * @param sessDate 看板日期
+     * @return 过期未结单列表（VO 的 expiredMinutes &gt; 0），按 slot_start 升序
+     */
+    List<GzBeanBookingVO> selectExpiredUnsettled(Long storeId, LocalDate sessDate);
+
+    /**
+     * 过期单补核销为「已完成」（GZ-BEAN-041 / kevin-test §6）：店员线下接待了但没点核销 → 时段过后把单
+     * 推为 {@code used}。接受 {@code pending|no_show}（no_show 翻案），<b>不绑物理座位</b>（历史结算，不上看板
+     * 座位、不撞后续预约、不再校配额/互斥）。条件 UPDATE status 守卫保证幂等。
+     *
+     * @param bookingId  预约 ID
+     * @param operatorId 操作店员 username
+     * @return true=本次推成 used / false=已非 pending|no_show（幂等跳过）
+     */
+    boolean settleAsCompleted(Long bookingId, String operatorId);
+
+    /**
+     * 过期单手动标爽约（GZ-BEAN-041 / kevin-test §6）：确认没来的过期 pending 单 → {@code no_show}
+     * （人工归因，区别于 cron 的 system）。条件 UPDATE {@code status='pending'} 守卫。
+     *
+     * @param bookingId  预约 ID
+     * @param operatorId 操作店员 username
+     * @return true=本次标成 no_show / false=已非 pending（幂等跳过）
+     */
+    boolean markNoShowManual(Long bookingId, String operatorId);
+
+    /**
+     * 批量过期单结单（GZ-BEAN-041 / kevin-test §6）：对一批 booking 按 {@code action} 统一处理 ——
+     * {@code completed}（补核销 used）/ {@code no_show}（标爽约）/ {@code released}（已超时 used 单标已结束 = 放座）。
+     * 单条失败隔离不中断整批。
+     *
+     * @param bookingIds 预约 ID 列表
+     * @param action     "completed" / "no_show" / "released"
+     * @param operatorId 操作店员 username
+     * @return 批处理结果（处理成功 / 跳过 / 失败）
+     */
+    BatchSettleResult batchSettle(List<Long> bookingIds, String action, String operatorId);
+
+    /**
+     * 过期单批量结单结果（GZ-BEAN-041）。
+     *
+     * @param succeeded 处理成功数
+     * @param skipped   幂等跳过数（状态已变）
+     * @param failed    处理失败数
+     */
+    record BatchSettleResult(int succeeded, int skipped, int failed) {
+    }
 }

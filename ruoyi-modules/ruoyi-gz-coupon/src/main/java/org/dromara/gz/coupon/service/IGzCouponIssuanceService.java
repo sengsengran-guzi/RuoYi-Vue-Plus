@@ -35,4 +35,36 @@ public interface IGzCouponIssuanceService {
      * @return 命中用户数
      */
     long previewAudience(List<CouponAudienceConditionDto> conditions);
+
+    /**
+     * 自动发放扫描结果（GZ-COUPON-003，SnailJob 回传执行器记日志）。
+     *
+     * @param templatesScanned 本次扫到的待自动发放模板数（active + auto_issue=1 + filtered）
+     * @param issued           本次累计实际发放张数（已去重已持券用户）
+     */
+    record AutoIssueResult(int templatesScanned, int issued) {
+    }
+
+    /**
+     * 自动发放批量扫描（GZ-COUPON-003，SnailJob gzCouponAutoIssueTask）。
+     *
+     * <p>{@code TenantHelper.ignore} 全租户扫 {@code status='active' AND auto_issue=1 AND issue_strategy='filtered'}
+     * 的模板。每模板独立 try/catch 隔离（配额满 / 条件解析异常不拖垮整批）：按 issue_config_json 解析 audience，
+     * <b>减去已持本模板券的用户</b>（{@link org.dromara.gz.coupon.mapper.GzUserCouponMapper#selectHolderUserIds}
+     * 去重，一人一模板一次），剩余新增用户走配额乐观锁 + 批量 INSERT，成功后写 last_auto_issue_time。</p>
+     *
+     * @return 扫描模板数 + 累计发放张数
+     */
+    AutoIssueResult autoIssueBatch();
+
+    /**
+     * 单模板「立即试跑」自动发放（GZ-COUPON-003，admin 验证用 / 复用 autoIssueBatch 单模板分支）。
+     *
+     * <p>校验：模板存在 + active + filtered + auto_issue=1（非法即抛）。逻辑与批量扫描的单模板分支一致：
+     * 解析 audience → 减去已持券用户 → 发剩余 → 写 last_auto_issue_time。命中新用户为 0 时返回 0（非异常）。</p>
+     *
+     * @param templateId 模板主键
+     * @return 本次实际发放张数
+     */
+    int autoIssueOnce(Long templateId);
 }

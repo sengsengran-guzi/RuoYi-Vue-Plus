@@ -150,4 +150,17 @@ public class GzCouponTemplateController extends BaseController {
     public R<Long> previewAudience(@RequestBody CouponAudienceConfig config) {
         return R.ok(issuanceService.previewAudience(config.getConditions()));
     }
+
+    /**
+     * 自动发放「立即试跑」（GZ-COUPON-003）：对单个 filtered + auto_issue 模板手动跑一次自动发放逻辑
+     * （按条件圈人 → 去重已持券用户 → 配额乐观锁发剩余），返回本次发放张数。供 admin 验证规则配置是否符合预期，
+     * 定时调度逻辑与本端点共用 {@code autoIssueOnce}。
+     */
+    @SaCheckPermission("gz:coupon:issue")
+    @Log(title = "优惠券自动发放试跑", businessType = BusinessType.INSERT)
+    @RepeatSubmit()
+    @PostMapping("/{id}/auto-issue-once")
+    public R<Integer> autoIssueOnce(@NotNull @PathVariable Long id) {
+        return R.ok("发放成功", issuanceService.autoIssueOnce(id));
+    }
 }
