@@ -67,4 +67,12 @@ public class GzBeanSeatMapVO implements Serializable {
      * true → mp 灰显不可点；false → 可订高亮。区间未选（slotStart/slotEnd 任一为空）时恒 false（仅预览布局）。
      */
     private Boolean full;
+
+    /**
+     * 该座在 {@code [slotStart, slotEnd)} 内是否被「按星期 + 时段关闭」规则关闭（GZ-BEAN-036 Req3）。
+     *
+     * <p>独立于 {@code full}（full = 被别的预约占；closed = 后台规则关闭，周复发自动恢复）。true → mp 灰显
+     * 不可点（与 full 同视觉，可标注「已关闭」文案区分）；区间未选（slotStart/slotEnd 任一为空）时恒 false。</p>
+     */
+    private Boolean closed;
 }

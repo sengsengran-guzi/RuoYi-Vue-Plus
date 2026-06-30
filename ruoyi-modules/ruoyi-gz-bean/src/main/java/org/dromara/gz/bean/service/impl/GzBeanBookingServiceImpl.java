@@ -38,6 +38,7 @@ import org.dromara.gz.bean.mapper.GzBeanTimeSlotTemplateMapper;
 import org.dromara.gz.bean.service.IGzBeanBookingService;
 import org.dromara.gz.bean.service.IGzBeanFreePromoService;
 import org.dromara.gz.bean.service.IGzBeanFreePromoService.FreeGrantDecision;
+import org.dromara.gz.bean.service.IGzBeanSeatClosureService;
 import org.dromara.gz.bean.service.internal.QrCodeSigner;
 import org.dromara.gz.common.domain.entity.GzUser;
 import org.dromara.gz.common.mapper.GzUserMapper;
@@ -168,6 +169,11 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
      * promo service 仅依赖 bookingMapper / storeMapper（不反依赖本 service），无构造期循环依赖，直接注入。
      */
     private final IGzBeanFreePromoService freePromoService;
+    /**
+     * GZ-BEAN-036 按星期 + 时段关闭具体座位（Req3）— seat-map 标 closed + 核销分座 guard。
+     * closure service 仅依赖 closure / store / seat mapper（不反依赖本 service），无构造期循环依赖，直接注入。
+     */
+    private final IGzBeanSeatClosureService seatClosureService;
     /**
      * V1.2 支付建单服务（gz-common PAY-101）— 用 {@link ObjectProvider} 延迟解析打断构造期循环依赖：
      * 本类 → PindouPayCallbackHandler → 本类（handler 依赖本 service 回调）+
@@ -369,6 +375,16 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         if (booking.getSeatTypeConfigId() != null && seat.getSeatTypeConfigId() != null
             && !booking.getSeatTypeConfigId().equals(seat.getSeatTypeConfigId())) {
             throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_MISMATCH_MSG, GzBeanErrorCode.SEAT_TYPE_MISMATCH);
+        }
+        // 座位关闭校验（GZ-BEAN-036 Req3，fail fast 在区间互斥之前）：该座在该日 weekday 的预约区间
+        //   [slot_start, slot_end) 命中后台「按星期 + 时段关闭」规则 → 拒绝分座（整笔回滚），不让店员把已关闭
+        //   座位绑给新单。周复发关闭、自动恢复；只拦新分座，不动已存活预约。
+        List<Long> closedSeatIds = seatClosureService.findClosedSeatIds(
+            tenantId, booking.getStoreId(), booking.getSessDate(), booking.getSlotStart(), booking.getSlotEnd());
+        if (closedSeatIds.contains(seatId)) {
+            log.info("[bean-verify-assign] seat closed storeId={} seatId={} date={} req={}-{}",
+                booking.getStoreId(), seatId, booking.getSessDate(), booking.getSlotStart(), booking.getSlotEnd());
+            throw new ServiceException(GzBeanErrorCode.SEAT_CLOSED_MSG, GzBeanErrorCode.SEAT_CLOSED);
         }
         // 具体座位区间互斥（并发分座防物理超卖）：Redis seat 锁 + FOR UPDATE 区间重叠（止界 COALESCE(actual_end_slot, slot_end)）
         String seatLockKey = LOCK_SEAT_PREFIX + booking.getStoreId() + ":" + seatId + ":" + booking.getSessDate();
@@ -879,20 +895,26 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         //   事务内对区间每个 1h 格 FOR UPDATE 计该桌型档活跃单数，≥ slotCapacity(config) → QUOTA_FULL 整笔回滚。
         //   reqSlots 已按 1h 升序展开（④.5），逐格升序加锁 → 交叠区间锁顺序一致、无死锁（ADR-0011 §3）。
         //   FOR UPDATE 悲观锁串行化并发同格下单，无需额外 Redis 锁（座位锁已下沉到核销分座）。
+        //   GZ-BEAN-036（Req3 关闭通道）：有效配额 = slotCapacity − 该格被关闭的本桌型座位数（下限 0）。
+        //   甲方「关掉 N 桌 → 可订量 −N」；扣减后约满与未关闭一样走 QUOTA_FULL（mp 显「已约满」灰）。
         long slotCapacity = slotCapacity(config);
+        int weekday = bo.getSessDate().getDayOfWeek().getValue(); // 1=Mon..7=Sun
         for (LocalTime gi : reqSlots) {
             long active = bookingMapper.countActiveCoveringSlotForUpdate(
                 tenantId, bo.getStoreId(), config.getId(), bo.getSessDate(), gi);
-            if (active >= slotCapacity) {
-                log.info("[bean-paid-submit] quota full storeId={} configId={} date={} slot={} active={}/{}",
-                    bo.getStoreId(), config.getId(), bo.getSessDate(), gi, active, slotCapacity);
+            long closed = seatClosureService.countClosedSeatsCoveringSlot(
+                tenantId, bo.getStoreId(), config.getId(), weekday, gi);
+            long effectiveCap = Math.max(0L, slotCapacity - closed);
+            if (active >= effectiveCap) {
+                log.info("[bean-paid-submit] quota full storeId={} configId={} date={} slot={} active={}/{} closed={}",
+                    bo.getStoreId(), config.getId(), bo.getSessDate(), gi, active, effectiveCap, closed);
                 throw new ServiceException(GzBeanErrorCode.QUOTA_FULL_MSG, GzBeanErrorCode.QUOTA_FULL);
             }
         }
 
         // ⑦ 计费：区间逐格求和（ADR-0015 §3.1）—— amount = Σ_{格 gi ∈ reqSlots} 生效格价（桌型 × 星期 × 该 1h 格，
         //   3 级回退：格价 ?? 该星期整天默认价 ?? config 基础价）。各小时可不同价，<b>不再单价 × N</b>。
-        int weekday = bo.getSessDate().getDayOfWeek().getValue(); // 1=Mon..7=Sun
+        //   weekday 已在 ⑥ 配额扣减处声明，复用。
         List<GzBeanSeatTypePrice> priceRows = seatTypePriceMapper.selectByConfig(config.getId());
         long amountCent = intervalAmount(config, priceRows, weekday, reqSlots);
 
@@ -1160,8 +1182,13 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                 for (LocalTime slot : hourSlots) {
                     long activeCount = bookingMapper.countActiveCoveringSlot(
                         tenantId, storeId, cfg.getId(), sessDate, slot);
+                    // GZ-BEAN-036（Req3 关闭通道）：有效配额 = slotCapacity − 该格被关闭的本桌型座位数（下限 0）。
+                    //   甲方「关掉 N 桌 → 该桌型可订量 −N → 约满变灰」：扣减后 full → mp 桌型卡灰显「已约满」。
+                    long closed = seatClosureService.countClosedSeatsCoveringSlot(
+                        tenantId, storeId, cfg.getId(), weekday, slot);
+                    long effectiveCap = Math.max(0L, cap - closed);
                     // 内部算 full，不暴露 remaining 数字给 mp（doc/15a §A.1 铁律；每单恒占 1 不破铁律）
-                    boolean full = (cap - activeCount) <= 0L;
+                    boolean full = (effectiveCap - activeCount) <= 0L;
                     // 该 1h 格的生效价（格价 ?? 整天默认 ?? 基础价）
                     long slotPrice = hourPrice(cfg, priceRows, weekday, slot);
                     result.add(GzBeanTypeSlotAvailabilityVO.builder()
@@ -1228,11 +1255,15 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             // 区间已选 → 先校验连续性（同 submit 口径，不信任前端）并展开成 1h 格序列（逐格计价用），再算被占座 id 集合；
             //   区间未选 → 仅预览布局，occupied 空集（full 恒 false），priceCent 留 null（不显价，ADR-0015 §3.1）。
             java.util.Set<Long> occupiedSeatIds = java.util.Set.of();
+            java.util.Set<Long> closedSeatIds = java.util.Set.of();
             List<LocalTime> reqSlots = List.of();
             if (hasInterval) {
                 reqSlots = validateAndExpandInterval(tenantId, storeId, sessDate, slotStart, slotEnd);
                 occupiedSeatIds = new java.util.HashSet<>(
                     bookingMapper.selectOccupiedSeatIds(tenantId, storeId, sessDate, slotStart, slotEnd));
+                // 按星期 + 时段关闭（GZ-BEAN-036 Req3）：该日 weekday 在请求区间内被关闭的座位集合（独立于 occupied）
+                closedSeatIds = new java.util.HashSet<>(
+                    seatClosureService.findClosedSeatIds(tenantId, storeId, sessDate, slotStart, slotEnd));
             }
             int weekday = sessDate.getDayOfWeek().getValue(); // 1=Mon..7=Sun
 
@@ -1253,6 +1284,8 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                 }
                 String typeName = StrUtil.isNotBlank(cfg.getName()) ? cfg.getName() : cfg.getSeatType();
                 boolean full = hasInterval && occupiedSeatIds.contains(seat.getId());
+                // 按星期 + 时段关闭（GZ-BEAN-036 Req3）：独立于 full（full=被预约占 / closed=后台规则关闭）。
+                boolean closed = hasInterval && closedSeatIds.contains(seat.getId());
                 // 区间已选 → priceCent = 该座所选区间逐格求和总价；区间未选 → null（仅预览布局，不显价）
                 Long priceCent = hasInterval
                     ? intervalAmount(cfg, priceRowsByConfig.get(cfg.getId()), weekday, reqSlots)
@@ -1267,6 +1300,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                     .bookMode(cfg.getBookMode())
                     .priceCent(priceCent)
                     .full(full)
+                    .closed(closed)
                     .build());
             }
             return result;
@@ -1744,10 +1778,15 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             row.boardStatus(BOARD_RESERVED);
             return;
         }
-        // 已核销（used）→ 按计划 slot_end 与当前时刻比，分 使用中 / 临近结束 / 已超时
+        // 已核销（used）→ 计时窗 [slot_start, slot_end]：分 使用中 / 临近结束 / 已超时（ADR-0016 §3）。
+        LocalDateTime plannedStart = LocalDateTime.of(sessDate, b.getSlotStart());
         LocalDateTime plannedEnd = LocalDateTime.of(sessDate, b.getSlotEnd());
         if (now.isBefore(plannedEnd)) {
-            long remaining = java.time.temporal.ChronoUnit.MINUTES.between(now, plannedEnd);
+            // remaining 锚 slot_end，但起算点不早于 slot_start —— 核销早于时段开始时按预约时段算，剩余永不超过预约时长
+            //   （用户订 1h 显示 ≤ 60min，修掉「核销于 09:32、订 14:00-15:00 → 显 327min」的超发；晚到不顺延仍成立：
+            //    now > slot_start 时起算点即 now）。
+            LocalDateTime countFrom = now.isAfter(plannedStart) ? now : plannedStart;
+            long remaining = java.time.temporal.ChronoUnit.MINUTES.between(countFrom, plannedEnd);
             row.remainingMinutes(remaining);
             row.boardStatus(remaining <= nearEndMinutes ? BOARD_NEAR_END : BOARD_IN_USE);
         } else {

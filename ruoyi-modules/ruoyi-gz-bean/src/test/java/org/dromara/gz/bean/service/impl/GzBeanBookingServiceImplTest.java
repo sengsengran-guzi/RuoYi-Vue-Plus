@@ -29,6 +29,7 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -79,6 +80,7 @@ class GzBeanBookingServiceImplTest {
     @Mock private org.dromara.gz.bean.mapper.GzBeanSeatTypePriceMapper seatTypePriceMapper;
     @Mock private org.dromara.gz.bean.mapper.GzBeanTimeSlotTemplateMapper timeSlotTemplateMapper;
     @Mock private org.dromara.gz.bean.service.IGzBeanFreePromoService freePromoService;
+    @Mock private org.dromara.gz.bean.service.IGzBeanSeatClosureService seatClosureService;
     @Mock private org.springframework.beans.factory.ObjectProvider<org.dromara.gz.common.pay.service.IGzPayTransactionService> payServiceProvider;
     @Mock private org.dromara.gz.common.pay.service.IGzPayTransactionService payService;
     @Mock private org.springframework.beans.factory.ObjectProvider<org.dromara.gz.coupon.service.IGzUserCouponService> couponServiceProvider;
@@ -98,10 +100,13 @@ class GzBeanBookingServiceImplTest {
         service = new GzBeanBookingServiceImpl(
             bookingMapper, bookingLogMapper, storeMapper, gzUserMapper, qrCodeSigner,
             seatTypeConfigMapper, seatMapper, seatTypePriceMapper, timeSlotTemplateMapper, freePromoService,
-            payServiceProvider, couponServiceProvider, payRefundServiceProvider, configService
+            seatClosureService, payServiceProvider, couponServiceProvider, payRefundServiceProvider, configService
         );
         // 按星期价格：默认无覆盖 → effectivePrice 回退基础价（ADR-0014 §3）；个别用例自行覆盖 stub
         lenient().when(seatTypePriceMapper.selectByConfig(anyLong())).thenReturn(java.util.List.of());
+        // 座位关闭（GZ-BEAN-036）：默认无关闭规则（空集）→ 不拦分座 / seat-map closed=false；关闭用例自行覆盖 stub。
+        lenient().when(seatClosureService.findClosedSeatIds(anyString(), anyLong(), any(), any(), any()))
+            .thenReturn(java.util.List.of());
         // 前 N 名免费：默认不命中（promoFree=false 走正常计价）；促销用例自行覆盖 stub。releaseBucket 默认 no-op。
         lenient().when(freePromoService.evaluateAndLockBucket(anyLong(), anyString(), any()))
             .thenReturn(org.dromara.gz.bean.service.IGzBeanFreePromoService.FreeGrantDecision.notFree());
@@ -678,6 +683,26 @@ class GzBeanBookingServiceImplTest {
         when(bookingMapper.countActiveUserOverlapByConfig(anyString(), anyLong(), anyLong(), anyLong(), any(), any(), any())).thenReturn(0L);
         // 桶型档配额：quantity=2（whole→slotCapacity=2），第一格已有 2 个活跃单 → 满 → QUOTA_FULL
         when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(2L);
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("single"), 1L));
+        assertEquals(GzBeanErrorCode.QUOTA_FULL, ex.getCode());
+        verify(bookingMapper, never()).insert(any(GzBeanBooking.class));
+        verify(payServiceProvider, never()).getObject();
+    }
+
+    @Test
+    @DisplayName("submitPaid · 关闭通道扣减配额（GZ-BEAN-036 Req3）：cap=5 active=2，关掉 3 桌 → 有效配额 2 → QUOTA_FULL（未关闭则不满）")
+    void submitPaid_seatClosureReducesQuota_quotaFull() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        stubBusinessWindow();
+        when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
+        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
+        // quantity=5（whole→slotCapacity=5）；活跃 2 < 5 本不满，但关掉 3 桌后有效配额 = 5−3 = 2 → 2≥2 满
+        when(seatTypeConfigMapper.selectById(10L)).thenReturn(newConfig("single", 5, 1500));
+        when(bookingMapper.countActiveUserOverlapByConfig(anyString(), anyLong(), anyLong(), anyLong(), any(), any(), any())).thenReturn(0L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(2L);
+        // 该格关掉本桌型 3 个座位 → 有效配额扣减
+        when(seatClosureService.countClosedSeatsCoveringSlot(eq("1001"), eq(1L), eq(10L), org.mockito.ArgumentMatchers.anyInt(), any())).thenReturn(3L);
 
         ServiceException ex = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("single"), 1L));
         assertEquals(GzBeanErrorCode.QUOTA_FULL, ex.getCode());
@@ -1666,9 +1691,10 @@ class GzBeanBookingServiceImplTest {
         assertEquals("BK401", res.getBookingNo());
         var use = rows.stream().filter(r -> Long.valueOf(302L).equals(r.getSeatId())).findFirst().orElseThrow();
         assertEquals("in_use", use.getBoardStatus());
-        // 未来日 plannedEnd 远大于 now → remaining 巨大 → in_use（非 near_end），回填非空
+        // 核销但 now < slot_start（未来日）→ 计时窗起点钳到 slot_start → remaining = 预约时长(14:00-16:00=120min)，
+        // 不再 = slot_end−now 的超发值（Kevin 实测 1h 单显 327min 的修复：remaining 永不超过预约时长）
         assertNotNull(use.getRemainingMinutes());
-        assertTrue(use.getRemainingMinutes() > 15);
+        assertEquals(120L, use.getRemainingMinutes());
         assertEquals("四人共享桌", use.getTypeName());
         assertEquals("seat", use.getBookMode());
     }
@@ -2018,6 +2044,119 @@ class GzBeanBookingServiceImplTest {
             () -> spy.verify(703L, 557L, "staff1"));
         assertEquals(GzBeanErrorCode.SEAT_TAKEN, ex.getCode());
         verify(bookingMapper, never()).updateById(any(GzBeanBooking.class));
+    }
+
+    // ============================================================
+    //  GZ-BEAN-036 按星期 + 时段关闭具体座位（Req3）
+    // ============================================================
+
+    /**
+     * 核销分座：被关闭座位（findClosedSeatIds 命中本座）→ SEAT_CLOSED（GZ-BEAN-036，fail fast 在区间互斥之前）。
+     */
+    @Test
+    @DisplayName("verify · 分配的座位该日该时段被后台关闭 → SEAT_CLOSED（GZ-BEAN-036，整笔回滚，不写 seat_id）")
+    void verify_assignSeat_closed() {
+        GzBeanBooking booking = new GzBeanBooking();
+        booking.setId(704L);
+        booking.setStatus("pending");
+        booking.setPayStatus("paid");
+        booking.setBookingNo("BK20260701000704");
+        booking.setSeatTypeConfigId(10L);
+        booking.setStoreId(1L);
+        booking.setTenantId("1001");
+        booking.setSessDate(LocalDate.of(2099, 1, 1));
+        booking.setSlotStart(LocalTime.of(10, 0));
+        booking.setSlotEnd(LocalTime.of(11, 0));
+        when(bookingMapper.selectById(704L)).thenReturn(booking);
+
+        org.dromara.gz.bean.domain.entity.GzBeanSeat seat =
+            org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
+                .id(558L).storeId(1L).seatTypeConfigId(10L).seatNo("Q4-1").tableNo("Q4").enabled(1).build();
+        when(seatMapper.selectById(558L)).thenReturn(seat);
+        // 该座该日 weekday 该区间被关闭 → findClosedSeatIds 命中 558L
+        when(seatClosureService.findClosedSeatIds(eq("1001"), eq(1L), any(), any(), any()))
+            .thenReturn(java.util.List.of(558L));
+
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        ServiceException ex = assertThrows(ServiceException.class,
+            () -> spy.verify(704L, 558L, "staff1"));
+        assertEquals(GzBeanErrorCode.SEAT_CLOSED, ex.getCode());
+        // fail fast 在区间互斥之前：不查 DB 互斥、不更新、不写 seat_id
+        verify(bookingMapper, never()).selectActiveSeatOverlapForUpdate(anyString(), anyLong(), anyLong(), any(), any(), any());
+        verify(bookingMapper, never()).updateById(any(GzBeanBooking.class));
+        assertNull(booking.getSeatId(), "命中关闭 → 不写 seat_id");
+    }
+
+    /**
+     * 关闭不影响已存活预约（GZ-BEAN-036 只拦新分座）：存量已绑座单（seat_id 非空）核销不传 seatId →
+     * 走「已绑座沿用」分支，不触 assignSeatAtVerify → 即便该座该时段被关闭也不重新校验 → 照常核销成功。
+     */
+    @Test
+    @DisplayName("verify · 关闭规则不影响已绑座的存活预约（seatId 已绑 + verify(null) → 沿用原座核销成功，不查 closure）")
+    void verify_closure_doesNotAffectExistingBooking() {
+        GzBeanBooking booking = new GzBeanBooking();
+        booking.setId(705L);
+        booking.setStatus("pending");
+        booking.setPayStatus("paid");
+        booking.setBookingNo("BK20260701000705");
+        booking.setSeatId(900L); // 存量已绑座单（下单时已绑 900L）
+        booking.setStoreId(1L);
+        booking.setTenantId("1001");
+        booking.setSessDate(LocalDate.of(2099, 1, 1));
+        booking.setSlotStart(LocalTime.of(10, 0));
+        booking.setSlotEnd(LocalTime.of(11, 0));
+        when(bookingMapper.selectById(705L)).thenReturn(booking);
+        when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
+        when(bookingMapper.selectVoById(705L)).thenReturn(new GzBeanBookingVO());
+
+        // verify(id, null, by)：seatId=null + booking.seatId 非空 → 走沿用分支，assignSeatAtVerify 不被调
+        GzBeanBookingVO vo = service.verify(705L, null, "staff1");
+
+        assertNotNull(vo);
+        assertEquals("used", booking.getStatus(), "已绑座存活单照常核销 → used，不被关闭规则拦");
+        // 沿用分支不触 assignSeatAtVerify → closure 校验根本不执行（已存活预约不受新关闭规则影响）
+        verify(seatClosureService, never()).findClosedSeatIds(anyString(), anyLong(), any(), any(), any());
+        verify(bookingMapper).updateById(any(GzBeanBooking.class));
+    }
+
+    /**
+     * seat-map：被关闭座位返 closed=true（GZ-BEAN-036），与 full（被预约占）独立。
+     */
+    @Test
+    @DisplayName("selectSeatMap · 被后台关闭的座位返 closed=true（独立于 full，GZ-BEAN-036）")
+    void selectSeatMap_closedSeat() {
+        GzBeanStore store = newOpenStore(1L);
+        store.setTenantId("1001");
+        when(storeMapper.selectById(1L)).thenReturn(store);
+        stubBusinessWindow();
+
+        // 两座：910L 正常 / 911L 被关闭。均属店 1L、桌型 10L、启用。
+        org.dromara.gz.bean.domain.entity.GzBeanSeat seatA =
+            org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
+                .id(910L).storeId(1L).seatTypeConfigId(10L).seatNo("Q5-1").tableNo("Q5").enabled(1).build();
+        org.dromara.gz.bean.domain.entity.GzBeanSeat seatB =
+            org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
+                .id(911L).storeId(1L).seatTypeConfigId(10L).seatNo("Q5-2").tableNo("Q5").enabled(1).build();
+        when(seatMapper.selectList(any())).thenReturn(java.util.List.of(seatA, seatB));
+        when(seatTypeConfigMapper.selectByIds(any())).thenReturn(java.util.List.of(newConfig("单人桌", 1, 1500)));
+        // 无预约占座 → full=false；关闭规则命中 911L → 仅 911L closed=true
+        when(bookingMapper.selectOccupiedSeatIds(eq("1001"), eq(1L), any(), any(), any()))
+            .thenReturn(java.util.List.of());
+        when(seatClosureService.findClosedSeatIds(eq("1001"), eq(1L), any(), any(), any()))
+            .thenReturn(java.util.List.of(911L));
+
+        java.util.List<org.dromara.gz.bean.domain.vo.GzBeanSeatMapVO> map =
+            service.selectSeatMap(1L, LocalDate.of(2099, 1, 1), LocalTime.of(10, 0), LocalTime.of(11, 0));
+
+        assertEquals(2, map.size());
+        org.dromara.gz.bean.domain.vo.GzBeanSeatMapVO voA = map.stream()
+            .filter(v -> v.getSeatId().equals(910L)).findFirst().orElseThrow();
+        org.dromara.gz.bean.domain.vo.GzBeanSeatMapVO voB = map.stream()
+            .filter(v -> v.getSeatId().equals(911L)).findFirst().orElseThrow();
+        assertFalse(voA.getClosed(), "910L 未被关闭 → closed=false");
+        assertFalse(voA.getFull(), "910L 无占座 → full=false");
+        assertTrue(voB.getClosed(), "911L 被关闭 → closed=true");
+        assertFalse(voB.getFull(), "911L 无占座 → full=false（closed 与 full 独立）");
     }
 
     /**

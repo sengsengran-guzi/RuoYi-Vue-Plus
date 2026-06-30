@@ -145,6 +145,19 @@ public final class GzBeanErrorCode {
     public static final int SEAT_TYPE_MISMATCH = 4022;
     public static final String SEAT_TYPE_MISMATCH_MSG = "所选座位的桌型与预约桌型不符，请重选座位";
 
+    // ============================================================
+    //  GZ-BEAN-036 按星期 + 时段关闭具体座位（Req3）
+    // ============================================================
+
+    /**
+     * 该座位该时段被后台「按星期 + 时段关闭」规则关闭（GZ-BEAN-036 Req3）。
+     *
+     * <p>下单分座 / 核销分座时按 {@code (store, seatId, weekday(sessDate), [reqStart, reqEnd))} 查关闭区间重叠，
+     * 命中即拒（整笔回滚）。周复发关闭、自动恢复；只拦新单，不动已存活预约。4001-4022 已占，4023 是下一空号。</p>
+     */
+    public static final int SEAT_CLOSED = 4023;
+    public static final String SEAT_CLOSED_MSG = "该座位该时段已关闭，请重选";
+
     private GzBeanErrorCode() {
     }
 }
