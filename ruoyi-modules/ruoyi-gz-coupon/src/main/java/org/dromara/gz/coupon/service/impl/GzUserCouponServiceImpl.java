@@ -325,4 +325,27 @@ public class GzUserCouponServiceImpl implements IGzUserCouponService {
             return new CouponExpireResult(scanned, expired);
         });
     }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public RevokeResult revokeBatch(java.util.Collection<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return new RevokeResult(0, 0);
+        }
+        // 逐条 CAS（status='unused' 守卫）作废：仅 unused 翻 revoked，locked/used/expired/已 revoked affected=0 跳过。
+        // admin 登录态 tenant 可靠 → 多租户由拦截器自动 scope，不跨租户作废他店券。
+        int revoked = 0;
+        for (Long id : ids) {
+            if (id == null) {
+                continue;
+            }
+            if (baseMapper.revokeUnused(id) > 0) {
+                revoked++;
+            }
+        }
+        int skipped = ids.size() - revoked;
+        log.info("[gz-coupon] revokeBatch done. requested={} revoked={} skipped(non-unused)={}",
+            ids.size(), revoked, skipped);
+        return new RevokeResult(revoked, skipped);
+    }
 }

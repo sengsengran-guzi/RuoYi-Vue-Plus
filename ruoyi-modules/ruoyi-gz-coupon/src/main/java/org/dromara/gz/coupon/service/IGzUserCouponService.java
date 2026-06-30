@@ -133,4 +133,21 @@ public interface IGzUserCouponService {
      * @return 扫描数 + 实际过期数
      */
     CouponExpireResult expireBatch();
+
+    /** 发错撤回统计：实际作废数 + 跳过数（非 unused 的 locked/used/expired/已作废）。 */
+    record RevokeResult(int revoked, int skipped) {
+    }
+
+    /**
+     * 发错撤回：批量作废未使用券（admin 发放记录侧，{@code unused → revoked}）。
+     *
+     * <p>甲方诉求「发错可直接反悔」：把已发出但<b>未使用</b>的券作废、使其不可再用。<b>仅 unused 可作废</b>，
+     * locked（下单占用中）/ used（已核销）/ expired（已过期）/ 已 revoked 一律跳过计入 {@code skipped}
+     * （逐条 CAS {@code status='unused'} 守卫，幂等、误选非 unused 券无害）。作废后券终态 revoked，不再进 mp
+     * 可用列表、也不会被下单 {@code lockForBooking} 锁住。</p>
+     *
+     * @param ids 用户券主键集合（admin 列表勾选 / 单条作废）
+     * @return 实际作废数 + 跳过数
+     */
+    RevokeResult revokeBatch(java.util.Collection<Long> ids);
 }

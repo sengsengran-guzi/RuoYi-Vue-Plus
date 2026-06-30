@@ -1789,6 +1789,33 @@ class GzBeanBookingServiceImplTest {
     }
 
     @Test
+    @DisplayName("releaseSeatEarly · 超时单放座 actual_end_slot 收敛到 slot_end，绝不外延占用（防放座后反堵下一格）")
+    void releaseSeatEarly_overtime_clampsToSlotEnd() {
+        // Kevin 现场 bug：14-15 点单已超时（now 已过 slot_end），店员放座本应空出 15 点后的格给下一位，
+        //   旧实现 actual_end_slot = ceil(now) → 把占用从 15:00 外延到 16:00，反而堵住 15-16 点 → SEAT_TAKEN。
+        // 构造「超时」：slot_end = 当前整点（≤ now），now 过了整点即 overtime；放座 actual_end_slot 必须 ≤ slot_end。
+        LocalTime slotEnd = LocalTime.now().truncatedTo(java.time.temporal.ChronoUnit.HOURS);
+        LocalTime slotStart = LocalTime.of(0, 0); // 仅占位，断言只看 markSeatReleased 的 actual_end_slot 入参
+        GzBeanBooking booking = boardBooking(510L, 300L, "used", LocalDate.now(), slotStart, slotEnd);
+        booking.setVerifyTime(java.time.LocalDateTime.now());
+        when(bookingMapper.selectById(510L)).thenReturn(booking);
+        org.mockito.ArgumentCaptor<LocalTime> slotCap = org.mockito.ArgumentCaptor.forClass(LocalTime.class);
+        when(bookingMapper.markSeatReleased(eq(510L), any(), slotCap.capture())).thenReturn(1);
+        when(seatMapper.selectById(300L)).thenReturn(boardSeat(300L, "Q1-1"));
+        when(seatTypeConfigMapper.selectById(10L)).thenReturn(boardConfig());
+        when(configService.getConfigInt("gz.bean.board.near_end_minutes")).thenReturn(15);
+
+        service.releaseSeatEarly(510L, "staff1");
+
+        LocalTime captured = slotCap.getValue();
+        // 不变式：放座占用止界绝不超过计划 slot_end（修复前 ceil(now) 会 > slot_end）
+        assertTrue(captured.compareTo(slotEnd) <= 0,
+            "actual_end_slot(" + captured + ") 不得超过 slot_end(" + slotEnd + ")，否则放座反而延长占用");
+        // 超时单：收敛到 slot_end
+        assertEquals(slotEnd, captured);
+    }
+
+    @Test
     @DisplayName("releaseSeatEarly · 非 used（pending）→ BOARD_OP_INVALID_STATUS，不写库")
     void releaseSeatEarly_notUsed() {
         GzBeanBooking booking = boardBooking(501L, 300L, "pending",

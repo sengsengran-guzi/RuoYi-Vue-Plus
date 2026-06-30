@@ -104,6 +104,21 @@ public interface GzUserCouponMapper extends BaseMapperPlus<GzUserCoupon, GzUserC
     int returnUsedCoupon(@Param("id") Long id);
 
     /**
+     * 发错撤回：作废未使用券（admin 发放记录侧，{@code unused → revoked}）。
+     *
+     * <p>WHERE 含 {@code status='unused'} 守卫 → <b>仅作废未使用券</b>：locked（下单占用中）/ used（已核销）/
+     * expired（已过期）一律不动，affected=0 幂等跳过（重复点 / 误选非 unused 券无害）。作废后券态终态 revoked，
+     * 既不在 mp 可用列表（仅查 unused）、也不会被 {@code lockForBooking}（CAS unused 守卫）锁住。
+     * tenant_id 由 ruoyi TenantLineInnerInterceptor 自动追加（admin 登录态 tenant 可靠）。</p>
+     *
+     * @param id 用户券主键
+     * @return 受影响行数（1 = 作废成功 / 0 = 券非 unused，幂等跳过）
+     */
+    @Update("UPDATE gz_user_coupon SET status = 'revoked', update_time = now() "
+        + "WHERE id = #{id} AND status = 'unused' AND del_flag = '0'")
+    int revokeUnused(@Param("id") Long id);
+
+    /**
      * 过期扫描批量推进（SnailJob gzCouponExpireTask）：{@code unused → expired}，doc/11 §11.2 / doc/10 §12.N8。
      *
      * <p>WHERE 含 {@code status='unused'}（<b>仅扫 unused，locked 态不被误伤</b>——已锁定即在用，

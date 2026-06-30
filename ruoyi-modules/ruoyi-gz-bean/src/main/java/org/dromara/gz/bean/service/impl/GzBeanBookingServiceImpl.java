@@ -1889,8 +1889,12 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                 + "（当前状态：" + booking.getStatus() + "）", GzBeanErrorCode.BOARD_OP_INVALID_STATUS);
         }
         LocalDateTime now = LocalDateTime.now();
-        LocalTime actualEndSlot = ceilToHour(now.toLocalTime());
-        // actual_end_slot 向上取整到整点格的占用止界（放座后该座该格之后立即可再约，ADR-0015 §2）
+        // 占用止界 = min(ceil(now→整点), slot_end)：放座后该座该格之后立即可再约（ADR-0015 §2）。
+        //   ★ 必须 clamp 到 slot_end，绝不外延 —— 否则超时单（now > slot_end）放座时 ceil(now) > slot_end，
+        //   会把占用从计划结束点往后延一格，反而堵住紧邻的下一格（如 14-15 点超时单放座变成占到 16:00），
+        //   下一位客人核销到该座/该时段被误判 SEAT_TAKEN。提前离场单（now < slot_end）仍按 ceil(now) 释放剩余整点格。
+        LocalTime ceil = ceilToHour(now.toLocalTime());
+        LocalTime actualEndSlot = ceil.isAfter(booking.getSlotEnd()) ? booking.getSlotEnd() : ceil;
         int affected = bookingMapper.markSeatReleased(bookingId, now, actualEndSlot);
         if (affected == 0) {
             // 已放过座（actual_end_time 非空）/ 并发改态 → 幂等：回当前看板行（不报错，运营重复点放座无害）
@@ -1903,7 +1907,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .toStatus(STATUS_USED)
             .operatorType(OPERATOR_ADMIN)
             .operatorId(operatorId)
-            .note("店员提前放座（actual_end_slot=" + actualEndSlot + "，该座该格后立即可再约）")
+            .note("店员放座（actual_end_slot=" + actualEndSlot + "，该座该格后立即可再约）")
             .delFlag("0")
             .build());
         log.info("[bean-board] releaseSeatEarly OK bookingId={} actualEndSlot={} by={}",
