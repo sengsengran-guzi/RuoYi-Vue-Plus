@@ -73,6 +73,9 @@ public class GzBeanBookingVO implements Serializable {
     /** V1.2 付款前采集微信号快照（admin 看全） */
     private String wechatIdSnapshot;
 
+    /** 包天单标记（GZ-BEAN-042）：1=包天套餐（全天占该座）/ 0=小时单。admin 列表/看板/待分座 tag + mp 详情用 */
+    private Integer isDayPass;
+
     /** V1.2 本笔金额（分）= 座位类型单价 */
     private Long amountCent;
 

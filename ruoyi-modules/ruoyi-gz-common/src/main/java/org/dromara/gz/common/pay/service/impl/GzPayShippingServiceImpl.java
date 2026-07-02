@@ -1,12 +1,17 @@
 package org.dromara.gz.common.pay.service.impl;
 
 import cn.hutool.core.util.StrUtil;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.dromara.common.mybatis.core.page.PageQuery;
+import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.tenant.helper.TenantHelper;
 import org.dromara.gz.common.pay.domain.entity.GzPayShippingOrder;
 import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
+import org.dromara.gz.common.pay.domain.vo.GzPayShippingOrderVO;
 import org.dromara.gz.common.pay.mapper.GzPayShippingOrderMapper;
 import org.dromara.gz.common.pay.service.IGzPayShippingService;
 import org.dromara.gz.common.pay.shipping.ShippingInfo;
@@ -42,6 +47,16 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
 
     /** 上报窗口（小时）：微信要求支付后 48h 内发货，留 1h 余量，超窗不再重试。 */
     private static final int WINDOW_HOURS = 47;
+
+    /**
+     * 即时上报的尝试延迟（毫秒）：第 1 次立刻、第 2 次 +12s。
+     * 支付回调后微信订单索引常尚未就绪（errcode 10060001），隔一小段再报即可自愈 —— 生产未部署 SnailJob，
+     * 靠本自愈把绝大多数单在下单当时收敛，少数漏网留 owner 手动补报。
+     */
+    private static final long[] INSTANT_ATTEMPT_DELAYS_MS = {0L, 12_000L};
+
+    /** 手动补报单次最多处理条数（同步等微信，控 HTTP 时延在前端 axios 50s 超时内）。 */
+    private static final int BACKFILL_MAX_PER_CALL = 50;
 
     private final GzPayShippingOrderMapper shippingMapper;
     private final WxShippingClient shippingClient;
@@ -96,16 +111,44 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
     @Async
     @Override
     public void tryUploadAsync(Long shippingId) {
+        if (shippingId == null) {
+            return;
+        }
         try {
             TenantHelper.ignore(() -> {
-                GzPayShippingOrder row = shippingMapper.selectById(shippingId);
-                if (row != null) {
-                    doUpload(row);
+                // 时序竞态自愈：微信订单索引未就绪时隔 12s 再报一次（生产无 SnailJob 兜底，尽量当场收敛）
+                for (long delayMs : INSTANT_ATTEMPT_DELAYS_MS) {
+                    if (delayMs > 0 && !sleepQuietly(delayMs)) {
+                        return null; // 被中断 → 放弃后续重试，留手动补报
+                    }
+                    GzPayShippingOrder row = shippingMapper.selectById(shippingId);
+                    if (row == null || GzPayShippingOrder.STATUS_SUCCESS.equals(row.getUploadStatus())) {
+                        return null; // 单没了 / 已被其它路径推成功
+                    }
+                    try {
+                        if (doUpload(row)) {
+                            return null; // 成功即止
+                        }
+                    } catch (Exception e) {
+                        // 单次异常隔离，不阻断后续延迟重试
+                        log.error("[gz-shipping] 即时上报单次异常（继续重试）shippingId={}", shippingId, e);
+                    }
                 }
                 return null;
             });
         } catch (Exception e) {
-            log.error("[gz-shipping] 即时上报异常（已忽略，等 SnailJob 重试）shippingId={}", shippingId, e);
+            log.error("[gz-shipping] 即时上报异常（已忽略，等手动补报）shippingId={}", shippingId, e);
+        }
+    }
+
+    /** 睡眠 ms；被中断返 false（恢复中断标志，让上层放弃重试）。 */
+    private boolean sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
         }
     }
 
@@ -140,6 +183,59 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
             }
             return new UploadStats(rows.size(), success, failed);
         });
+    }
+
+    @Override
+    public UploadStats backfillPending() {
+        return TenantHelper.ignore(() -> {
+            // 手动补报：不设 48h 窗口 / 尝试上限（历史卡单可能超窗，靠微信幂等码收敛已发货单）；单次限量避免长阻塞
+            List<GzPayShippingOrder> rows = shippingMapper.selectList(Wrappers.<GzPayShippingOrder>lambdaQuery()
+                .in(GzPayShippingOrder::getUploadStatus,
+                    List.of(GzPayShippingOrder.STATUS_PENDING, GzPayShippingOrder.STATUS_FAILED))
+                .orderByAsc(GzPayShippingOrder::getId)
+                .last("LIMIT " + BACKFILL_MAX_PER_CALL));
+            int success = 0;
+            int failed = 0;
+            for (GzPayShippingOrder row : rows) {
+                try {
+                    if (doUpload(row)) {
+                        success++;
+                    } else {
+                        failed++;
+                    }
+                } catch (Exception e) {
+                    failed++;
+                    log.error("[gz-shipping] 手动补报单条失败 id={}", row.getId(), e);
+                }
+            }
+            log.info("[gz-shipping] 手动补报完成：扫描 {} / 成功 {} / 失败 {}", rows.size(), success, failed);
+            return new UploadStats(rows.size(), success, failed);
+        });
+    }
+
+    @Override
+    public boolean retryOne(Long shippingId) {
+        if (shippingId == null) {
+            return false;
+        }
+        return Boolean.TRUE.equals(TenantHelper.ignore(() -> {
+            GzPayShippingOrder row = shippingMapper.selectById(shippingId);
+            if (row == null) {
+                return false;
+            }
+            return doUpload(row);
+        }));
+    }
+
+    @Override
+    public TableDataInfo<GzPayShippingOrderVO> selectPageList(String uploadStatus, String businessType, String outTradeNo, PageQuery pageQuery) {
+        LambdaQueryWrapper<GzPayShippingOrder> wrapper = Wrappers.<GzPayShippingOrder>lambdaQuery()
+            .eq(StrUtil.isNotBlank(uploadStatus), GzPayShippingOrder::getUploadStatus, uploadStatus)
+            .eq(StrUtil.isNotBlank(businessType), GzPayShippingOrder::getBusinessType, businessType)
+            .eq(StrUtil.isNotBlank(outTradeNo), GzPayShippingOrder::getOutTradeNo, outTradeNo)
+            .orderByDesc(GzPayShippingOrder::getId);
+        Page<GzPayShippingOrderVO> page = shippingMapper.selectVoPage(pageQuery.build(), wrapper);
+        return TableDataInfo.build(page);
     }
 
     /**

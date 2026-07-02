@@ -13,9 +13,11 @@ import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.web.core.BaseController;
 import org.dromara.gz.recon.domain.excel.ReconExportRowVo;
+import org.dromara.gz.recon.domain.vo.GzPindouBoardVo;
 import org.dromara.gz.recon.domain.vo.GzReconDailyVo;
 import org.dromara.gz.recon.domain.vo.GzReconMonthlyVo;
 import org.dromara.gz.recon.domain.vo.GzReconSettleVo;
+import org.dromara.gz.recon.domain.vo.GzRecycleBoardVo;
 import org.dromara.gz.recon.domain.vo.ReconSummaryVo;
 import org.dromara.gz.recon.service.IGzReconBatchService;
 import org.dromara.gz.recon.service.IGzReconQueryService;
@@ -78,6 +80,34 @@ public class GzReconReconcileAdminController extends BaseController {
                                              @RequestParam(value = "startMonth", required = false) String startMonth,
                                              @RequestParam(value = "endMonth", required = false) String endMonth) {
         return R.ok(queryService.monthlyList(businessType, startMonth, endMonth));
+    }
+
+    /**
+     * 拼豆记账台账（<b>纯展示，不计 4% 分成</b>）：收款 / 退款 / 通道费 / 净额 + 逐月台账。
+     * 实时查 gz_pay_transaction(business_type='pindou') + gz_pay_refund，不落分成表。
+     *
+     * @param startMonth 起始月 yyyy-MM
+     * @param endMonth   截止月 yyyy-MM
+     */
+    @SaCheckPermission("gz:recon:reconcile:list")
+    @GetMapping("/reconcile/pindou-board")
+    public R<GzPindouBoardVo> pindouBoard(@NotBlank @RequestParam("startMonth") String startMonth,
+                                          @NotBlank @RequestParam("endMonth") String endMonth) {
+        return R.ok(queryService.pindouBoard(startMonth, endMonth));
+    }
+
+    /**
+     * 回收反向打款台账（<b>纯展示，独立核算不计分成</b>）：成功打款金额 / 笔数 + 处理中 / 失败 + 逐月台账。
+     * 实时查 gz_pay_payout_transaction(business_type='recycle')。
+     *
+     * @param startMonth 起始月 yyyy-MM
+     * @param endMonth   截止月 yyyy-MM
+     */
+    @SaCheckPermission("gz:recon:reconcile:list")
+    @GetMapping("/reconcile/recycle-board")
+    public R<GzRecycleBoardVo> recycleBoard(@NotBlank @RequestParam("startMonth") String startMonth,
+                                            @NotBlank @RequestParam("endMonth") String endMonth) {
+        return R.ok(queryService.recycleBoard(startMonth, endMonth));
     }
 
     /**

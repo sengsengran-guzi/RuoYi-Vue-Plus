@@ -69,8 +69,14 @@ public class GzBeanSeatTypeConfig extends TenantEntity {
     /** 数量（每 1h 格物理单位数 = 桌/单位数；分母按 book_mode 推导，ADR-0014 §2） */
     private Integer quantity;
 
+    /** 包天名额（GZ-BEAN-042 / ADR-0017）：该桌型开放几个包天套餐（0=不开放；≤ slotCapacity） */
+    private Integer dayPassQuota;
+
     /** 单价（分） */
     private Long priceCent;
+
+    /** 包天固定价（分，GZ-BEAN-042 / ADR-0017）：非逐格求和，下单直接 snapshot 进 booking.amount_cent */
+    private Long dayPassPriceCent;
 
     /** 0=停用 / 1=启用 */
     private Integer enabled;

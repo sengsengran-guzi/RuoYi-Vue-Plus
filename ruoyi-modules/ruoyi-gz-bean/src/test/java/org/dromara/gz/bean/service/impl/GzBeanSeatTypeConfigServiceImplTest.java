@@ -98,6 +98,38 @@ class GzBeanSeatTypeConfigServiceImplTest {
     }
 
     @Test
+    @DisplayName("insertByBo 包天名额 > slotCapacity（GZ-BEAN-042）→ ServiceException，不 insert（whole: quota 6 > quantity 5）")
+    void insertByBo_dayPassQuotaExceedsCapacity_throws() {
+        GzBeanSeatTypeConfigBo bo = validBo(); // whole, quantity=5 → slotCapacity=5
+        bo.setDayPassQuota(6);
+        bo.setDayPassPriceCent(8000L);
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.insertByBo(bo));
+        assertTrue(ex.getMessage().contains("包天名额"));
+        verify(baseMapper, never()).insert(any(GzBeanSeatTypeConfig.class));
+    }
+
+    @Test
+    @DisplayName("insertByBo 包天名额 ≤ slotCapacity + 包天价（GZ-BEAN-042）→ insert 落库 day_pass_quota / day_pass_price_cent")
+    void insertByBo_dayPass_ok_persistsFields() {
+        GzBeanSeatTypeConfigBo bo = validBo(); // whole, quantity=5 → slotCapacity=5
+        bo.setDayPassQuota(3);
+        bo.setDayPassPriceCent(8000L);
+        when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
+        when(baseMapper.insert(any(GzBeanSeatTypeConfig.class))).thenAnswer(inv -> {
+            GzBeanSeatTypeConfig e = inv.getArgument(0);
+            e.setId(88L);
+            return 1;
+        });
+
+        assertTrue(service.insertByBo(bo));
+        ArgumentCaptor<GzBeanSeatTypeConfig> cap = ArgumentCaptor.forClass(GzBeanSeatTypeConfig.class);
+        verify(baseMapper).insert(cap.capture());
+        assertEquals(3, cap.getValue().getDayPassQuota());
+        assertEquals(8000L, cap.getValue().getDayPassPriceCent());
+    }
+
+    @Test
     @DisplayName("insertByBo 同门店同名 UNIQUE 冲突 → ServiceException，不 insert")
     void insertByBo_nameConflict_throws() {
         GzBeanSeatTypeConfigBo bo = validBo();

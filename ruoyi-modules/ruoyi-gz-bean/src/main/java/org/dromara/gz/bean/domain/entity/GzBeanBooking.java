@@ -148,6 +148,14 @@ public class GzBeanBooking extends TenantEntity {
      */
     private Integer isFree;
 
+    /**
+     * 包天单标记（GZ-BEAN-042 / ADR-0017）：{@code 1}=包天套餐单（slot_start=开店/slot_end=闭店 全天范围，
+     * 当天占该座；核销时店员现场分座，确定后全天买断，早退可放座释放剩余格）/ {@code 0}=普通小时单。
+     * 全天单被现有逐格配额计数（{@code countActiveCoveringSlotForUpdate}）自动逐格计入；名额 cap 由
+     * {@code countActiveDayPassForUpdate} 按本列过滤计数。
+     */
+    private Integer isDayPass;
+
     /** 去重 token（方案 C） — UNIQUE(tenant_id, store_id, dedup_token) */
     private String dedupToken;
 

@@ -92,6 +92,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
     @Transactional(rollbackFor = Exception.class)
     public boolean insertByBo(GzBeanSeatTypeConfigBo bo) {
         validateBookMode(bo.getBookMode());
+        validateDayPass(bo);
         if (!checkNameUnique(bo)) {
             throw new ServiceException("该门店已存在同名座位类型：" + bo.getName());
         }
@@ -124,6 +125,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
             throw new ServiceException("配置 ID 不能为空");
         }
         validateBookMode(bo.getBookMode());
+        validateDayPass(bo);
         if (!checkNameUnique(bo)) {
             throw new ServiceException("该门店已存在同名座位类型：" + bo.getName());
         }
@@ -257,7 +259,10 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         e.setBookMode(bo.getBookMode());
         e.setCapacity(bo.getCapacity());
         e.setQuantity(bo.getQuantity());
+        // 包天名额 / 包天价（GZ-BEAN-042）：空视作 0（不开放包天）
+        e.setDayPassQuota(bo.getDayPassQuota() == null ? 0 : bo.getDayPassQuota());
         e.setPriceCent(bo.getPriceCent());
+        e.setDayPassPriceCent(bo.getDayPassPriceCent() == null ? 0L : bo.getDayPassPriceCent());
         e.setEnabled(bo.getEnabled());
         e.setSortNo(bo.getSortNo());
         e.setRemark(bo.getRemark());
@@ -268,6 +273,25 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
     private void validateBookMode(String bookMode) {
         if (StrUtil.isBlank(bookMode) || !VALID_BOOK_MODES.contains(bookMode)) {
             throw new ServiceException("订法无效（应为 whole 整桌 / seat 按座 之一）：" + bookMode);
+        }
+    }
+
+    /**
+     * 包天名额上界校验（GZ-BEAN-042 / ADR-0017）：{@code day_pass_quota ≤ slotCapacity}
+     * （whole=quantity / seat=quantity*capacity）。超界无意义（包天卖光即占满所有 1h 格，quota 上界失效）。
+     * 空 day_pass_quota 视作 0（不开放包天）；day_pass_price_cent 非负由 Bo @Min 兜底。
+     */
+    private void validateDayPass(GzBeanSeatTypeConfigBo bo) {
+        int quota = bo.getDayPassQuota() == null ? 0 : bo.getDayPassQuota();
+        if (quota <= 0) {
+            return;
+        }
+        long quantity = bo.getQuantity() == null ? 0L : bo.getQuantity();
+        long slotCapacity = "seat".equals(bo.getBookMode())
+            ? quantity * (bo.getCapacity() == null ? 1L : Math.max(1L, bo.getCapacity()))
+            : quantity;
+        if (quota > slotCapacity) {
+            throw new ServiceException("包天名额（" + quota + "）不能超过该桌型总座位数（" + slotCapacity + "）");
         }
     }
 
@@ -294,13 +318,16 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         return !exist;
     }
 
-    /** VO 派生字段回填：priceYuan（分 → 元）。name/bookMode/capacity 由 AutoMapper 直接映射。 */
+    /** VO 派生字段回填：priceYuan / dayPassPriceYuan（分 → 元）。其余字段由 AutoMapper 直接映射。 */
     private void fillDerived(GzBeanSeatTypeConfigVO vo) {
         if (vo == null) {
             return;
         }
         if (vo.getPriceCent() != null) {
             vo.setPriceYuan(new BigDecimal(vo.getPriceCent()).divide(CENT_PER_YUAN, 2, RoundingMode.HALF_UP));
+        }
+        if (vo.getDayPassPriceCent() != null) {
+            vo.setDayPassPriceYuan(new BigDecimal(vo.getDayPassPriceCent()).divide(CENT_PER_YUAN, 2, RoundingMode.HALF_UP));
         }
     }
 

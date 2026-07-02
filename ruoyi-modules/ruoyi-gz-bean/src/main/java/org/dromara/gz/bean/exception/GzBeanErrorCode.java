@@ -158,6 +158,25 @@ public final class GzBeanErrorCode {
     public static final int SEAT_CLOSED = 4023;
     public static final String SEAT_CLOSED_MSG = "该座位该时段已关闭，请重选";
 
+    // ============================================================
+    //  GZ-BEAN-042 包天套餐（Day-Pass，ADR-0017）
+    // ============================================================
+
+    /**
+     * 该桌型当日包天名额已售罄（GZ-BEAN-042，ADR-0017）。
+     *
+     * <p>下单事务内 {@code countActiveDayPassForUpdate(...) ≥ day_pass_quota}（FOR UPDATE 串行化并发包天下单）
+     * → 拒单整笔回滚。4023 已占，4024 是下一空号。mp 端按本码提示改约小时或选其它桌型。</p>
+     */
+    public static final int DAY_PASS_FULL = 4024;
+    public static final String DAY_PASS_FULL_MSG = "今日包天名额已满，请改约小时或选其它桌型";
+
+    /**
+     * 该桌型未开放包天（GZ-BEAN-042，ADR-0017）：{@code day_pass_quota ≤ 0} → 不可下包天单。
+     */
+    public static final int DAY_PASS_NOT_OPEN = 4025;
+    public static final String DAY_PASS_NOT_OPEN_MSG = "该桌型暂未开放包天套餐，请重选";
+
     private GzBeanErrorCode() {
     }
 }

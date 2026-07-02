@@ -7,15 +7,19 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import lombok.RequiredArgsConstructor;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
+import org.dromara.gz.common.pay.enums.PayBusinessType;
 import org.dromara.gz.recon.domain.entity.GzReconDaily;
 import org.dromara.gz.recon.domain.entity.GzReconMonthly;
 import org.dromara.gz.recon.domain.entity.GzReconSettle;
 import org.dromara.gz.recon.domain.excel.ReconExportRowVo;
+import org.dromara.gz.recon.domain.vo.GzPindouBoardVo;
 import org.dromara.gz.recon.domain.vo.GzReconDailyVo;
 import org.dromara.gz.recon.domain.vo.GzReconMonthlyVo;
 import org.dromara.gz.recon.domain.vo.GzReconSettleVo;
+import org.dromara.gz.recon.domain.vo.GzRecycleBoardVo;
 import org.dromara.gz.recon.domain.vo.ReconDetailRowVo;
 import org.dromara.gz.recon.domain.vo.ReconSummaryVo;
+import org.dromara.gz.recon.mapper.GzReconBoardMapper;
 import org.dromara.gz.recon.mapper.GzReconDailyMapper;
 import org.dromara.gz.recon.mapper.GzReconMonthlyMapper;
 import org.dromara.gz.recon.mapper.GzReconSettleMapper;
@@ -27,7 +31,10 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.YearMonth;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 对账中心 admin 查询 service 实现（GZ-ADMIN-105）。
@@ -42,6 +49,7 @@ public class GzReconQueryServiceImpl implements IGzReconQueryService {
     private final GzReconMonthlyMapper monthlyMapper;
     private final GzReconSettleMapper settleMapper;
     private final GzReconSourceMapper sourceMapper;
+    private final GzReconBoardMapper boardMapper;
 
     @Override
     public ReconSummaryVo monthlySummary(String businessType, String startMonth, String endMonth) {
@@ -118,6 +126,68 @@ public class GzReconQueryServiceImpl implements IGzReconQueryService {
         total.setRefundedTimeText("");
         rows.add(total);
         return rows;
+    }
+
+    // ====================================================================
+    //  记账台账（拼豆收款 / 回收打款）—— 纯展示、不计 4% 分成、不落分成表
+    // ====================================================================
+
+    @Override
+    public GzPindouBoardVo pindouBoard(String startMonth, String endMonth) {
+        LocalDate startDate = YearMonth.parse(startMonth).atDay(1);
+        LocalDate endDate = YearMonth.parse(endMonth).atEndOfMonth();
+        // 收款按 paid_time 归月、退款按 refunded_time 归月，按月 key 合并到同一行（C4 口径）
+        Map<String, GzPindouBoardVo.MonthRow> byMonth = new HashMap<>();
+        for (GzPindouBoardVo.MonthRow paid : boardMapper.sumPaidByMonth(PayBusinessType.PINDOU, startDate, endDate)) {
+            GzPindouBoardVo.MonthRow row = byMonth.computeIfAbsent(paid.getMonth(), GzReconQueryServiceImpl::newPindouMonth);
+            row.setGmvCent(paid.getGmvCent());
+            row.setChannelFeeCent(paid.getChannelFeeCent());
+            row.setPaidCount(paid.getPaidCount());
+        }
+        for (GzPindouBoardVo.MonthRow refund : boardMapper.sumRefundByMonth(PayBusinessType.PINDOU, startDate, endDate)) {
+            GzPindouBoardVo.MonthRow row = byMonth.computeIfAbsent(refund.getMonth(), GzReconQueryServiceImpl::newPindouMonth);
+            row.setRefundCent(refund.getRefundCent());
+            row.setRefundCount(refund.getRefundCount());
+        }
+
+        GzPindouBoardVo vo = new GzPindouBoardVo();
+        List<GzPindouBoardVo.MonthRow> months = new ArrayList<>(byMonth.values());
+        for (GzPindouBoardVo.MonthRow row : months) {
+            row.setNetCent(row.getGmvCent() - row.getRefundCent() - row.getChannelFeeCent());
+            vo.setGmvCent(vo.getGmvCent() + row.getGmvCent());
+            vo.setRefundCent(vo.getRefundCent() + row.getRefundCent());
+            vo.setChannelFeeCent(vo.getChannelFeeCent() + row.getChannelFeeCent());
+            vo.setPaidCount(vo.getPaidCount() + row.getPaidCount());
+            vo.setRefundCount(vo.getRefundCount() + row.getRefundCount());
+        }
+        vo.setNetCent(vo.getGmvCent() - vo.getRefundCent() - vo.getChannelFeeCent());
+        months.sort(Comparator.comparing(GzPindouBoardVo.MonthRow::getMonth).reversed());
+        vo.setMonths(months);
+        return vo;
+    }
+
+    private static GzPindouBoardVo.MonthRow newPindouMonth(String month) {
+        GzPindouBoardVo.MonthRow r = new GzPindouBoardVo.MonthRow();
+        r.setMonth(month);
+        return r;
+    }
+
+    @Override
+    public GzRecycleBoardVo recycleBoard(String startMonth, String endMonth) {
+        LocalDate startDate = YearMonth.parse(startMonth).atDay(1);
+        LocalDate endDate = YearMonth.parse(endMonth).atEndOfMonth();
+        List<GzRecycleBoardVo.MonthRow> months = boardMapper.sumPayoutSuccessByMonth(startDate, endDate);
+        GzRecycleBoardVo vo = boardMapper.countPayoutBacklog(startDate, endDate);
+        if (vo == null) {
+            vo = new GzRecycleBoardVo();
+        }
+        for (GzRecycleBoardVo.MonthRow row : months) {
+            vo.setPayoutSuccessCent(vo.getPayoutSuccessCent() + row.getPayoutCent());
+            vo.setPayoutSuccessCount(vo.getPayoutSuccessCount() + row.getPayoutCount());
+        }
+        months.sort(Comparator.comparing(GzRecycleBoardVo.MonthRow::getMonth).reversed());
+        vo.setMonths(months);
+        return vo;
     }
 
     // --------------------------------------------------------------------

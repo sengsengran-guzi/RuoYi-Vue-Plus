@@ -10,8 +10,10 @@ import org.dromara.common.log.annotation.Log;
 import org.dromara.common.log.enums.BusinessType;
 import org.dromara.common.satoken.utils.LoginHelper;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingVerifyScanBo;
+import org.dromara.gz.bean.domain.bo.GzBeanDayPassSubmitBo;
 import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
+import org.dromara.gz.bean.domain.vo.GzBeanDayPassOptionVO;
 import org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatMapVO;
 import org.dromara.gz.bean.domain.vo.GzBeanStaffOverviewVO;
@@ -84,7 +86,6 @@ public class GzBeanBookingMpController {
      *   4012 SEAT_TYPE_NOT_CONFIGURED→ 「该座位暂未开放」（座未挂桌型 / 桌型缺失）
      *   4013 SEAT_TYPE_DISABLED      → 「该座位所属桌型已停用」
      *   4014 WECHAT_ID_REQUIRED      → 弹填微信号
-     *   4003 DUPLICATE_USER_BOOKING  → 「您该时段已有预约」
      *   4004 SUBMIT_TOO_FAST         → 「操作过快」
      * </pre>
      */
@@ -98,6 +99,59 @@ public class GzBeanBookingMpController {
         log.info("[bean-booking-mp] paid-submit userId={} storeId={} seatTypeConfigId={} sessDate={} slotStart={} couponId={}",
             userId, bo.getStoreId(), bo.getSeatTypeConfigId(), bo.getSessDate(), bo.getSlotStart(), bo.getCouponId());
         return R.ok(bookingService.submitPaid(bo, userId));
+    }
+
+    /**
+     * 包天套餐下单（GZ-BEAN-042 / ADR-0017）。
+     *
+     * <pre>
+     * POST /app/gz/bean/booking/day-pass-submit
+     * Body:    { storeId, seatTypeConfigId, sessDate, dedupClientToken? }   （无时段、无券 —— 全天 + 固定价）
+     *
+     * 200 OK（付费单）：{ ...GzBeanPaidSubmitVO，amountCent=固定包天价，payParams=五参... }
+     *
+     * 业务错误（R.code，mp 端按 code 提示）：
+     *   4001 PHONE_REQUIRED / 4014 WECHAT_ID_REQUIRED → 弹授权
+     *   4012 SEAT_TYPE_NOT_CONFIGURED / 4013 SEAT_TYPE_DISABLED
+     *   4025 DAY_PASS_NOT_OPEN        → 「该桌型暂未开放包天」
+     *   4024 DAY_PASS_FULL            → 「今日包天名额已满」
+     *   4011 QUOTA_FULL               → 「该桌型当日已约满」（含小时单占用）
+     *   4016 SLOT_RANGE_INVALID       → 「当日无营业时段」
+     *   4003 DUPLICATE_USER_BOOKING   → 「您当日该桌型已有预约」
+     *   4004 SUBMIT_TOO_FAST          → 「操作过快」
+     * </pre>
+     */
+    @PostMapping("/day-pass-submit")
+    @Log(title = "拼豆包天套餐下单(mp)", businessType = BusinessType.INSERT)
+    public R<GzBeanPaidSubmitVO> dayPassSubmit(@Valid @RequestBody GzBeanDayPassSubmitBo bo) {
+        Long userId = LoginHelper.getUserId();
+        if (userId == null) {
+            return R.fail(401, "未登录");
+        }
+        log.info("[bean-booking-mp] day-pass-submit userId={} storeId={} seatTypeConfigId={} sessDate={}",
+            userId, bo.getStoreId(), bo.getSeatTypeConfigId(), bo.getSessDate());
+        return R.ok(bookingService.submitDayPass(bo, userId));
+    }
+
+    /**
+     * 包天可用性查询（GZ-BEAN-042 / ADR-0017）。
+     *
+     * <pre>
+     * GET /app/gz/bean/booking/day-pass-options?storeId=1&sessDate=2026-07-06
+     * 200 OK { "code":200, "data": [
+     *   { "seatTypeConfigId":"...","name":"单人","bookMode":"whole",
+     *     "dayPassPriceCent":8000,"dayPassPriceYuan":80.00,"full":false },
+     *   ...（每个开放包天且启用的桌型档一档；full=true → 「已满」灰显）
+     * ] }
+     * 只给 full 布尔，不下发剩余名额数字（对齐 type-slots 铁律）。
+     * </pre>
+     */
+    @SaIgnore
+    @GetMapping("/day-pass-options")
+    public R<List<GzBeanDayPassOptionVO>> dayPassOptions(
+        @RequestParam Long storeId,
+        @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate sessDate) {
+        return R.ok(bookingService.selectDayPassOptions(storeId, sessDate));
     }
 
     /**

@@ -309,3 +309,8 @@ gz:
   # Kevin 真机测试窗口临时注入 GZ_TEST_ENABLED=true 重启开，测完关回。
   test:
     enabled: ${GZ_TEST_ENABLED:false}
+  # 本地补偿定时任务（路 C）—— 未部署 SnailJob 时用 Spring @Scheduled 直接跑影响资金/预约正确性的关键补偿任务
+  # （拼豆未付占位回收 / 支付主动查单 / 发货上传兜底 / 支付单超时）。prod 默认开；
+  # 日后部署 SnailJob 集群（路 A）→ 注入 GZ_LOCAL_SCHEDULER_ENABLED=false 关掉本地版避免与控制台 cron 双跑。
+  local-scheduler:
+    enabled: ${GZ_LOCAL_SCHEDULER_ENABLED:true}

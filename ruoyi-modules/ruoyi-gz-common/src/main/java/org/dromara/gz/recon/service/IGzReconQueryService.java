@@ -3,9 +3,11 @@ package org.dromara.gz.recon.service;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.recon.domain.excel.ReconExportRowVo;
+import org.dromara.gz.recon.domain.vo.GzPindouBoardVo;
 import org.dromara.gz.recon.domain.vo.GzReconDailyVo;
 import org.dromara.gz.recon.domain.vo.GzReconMonthlyVo;
 import org.dromara.gz.recon.domain.vo.GzReconSettleVo;
+import org.dromara.gz.recon.domain.vo.GzRecycleBoardVo;
 import org.dromara.gz.recon.domain.vo.ReconSummaryVo;
 
 import java.util.List;
@@ -46,4 +48,16 @@ public interface IGzReconQueryService {
      * 金额 cent → 元字符串；不透视 / 不合并单元格 / 不做月度小计。
      */
     List<ReconExportRowVo> buildExportRows(String businessType, String startMonth, String endMonth);
+
+    /**
+     * 拼豆记账台账（<b>纯展示，不计 4% 分成</b>）：实时聚合 gz_pay_transaction(business_type='pindou')
+     * + gz_pay_refund，返回收款 / 退款 / 通道费 / 净额 + 逐月台账。<b>不落分成表</b>。
+     */
+    GzPindouBoardVo pindouBoard(String startMonth, String endMonth);
+
+    /**
+     * 回收反向打款台账（<b>纯展示，独立核算不计分成</b>）：实时聚合 gz_pay_payout_transaction
+     * (business_type='recycle')，返回成功打款金额 / 笔数 + 处理中 / 失败笔数 + 逐月台账。
+     */
+    GzRecycleBoardVo recycleBoard(String startMonth, String endMonth);
 }

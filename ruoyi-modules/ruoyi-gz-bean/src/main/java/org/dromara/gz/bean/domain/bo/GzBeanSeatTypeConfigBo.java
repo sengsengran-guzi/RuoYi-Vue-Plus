@@ -68,10 +68,22 @@ public class GzBeanSeatTypeConfigBo extends BaseEntity {
     @Min(value = 0, message = "数量不能小于 0", groups = {AddGroup.class, EditGroup.class})
     private Integer quantity;
 
+    /**
+     * 包天名额（GZ-BEAN-042 / ADR-0017），≥ 0；0=不开放包天。
+     * 上界 ≤ slotCapacity（whole=quantity / seat=quantity*capacity）由 Service 兜底校验（超界无意义）。
+     * 可空（旧客户端不传 → Service 视作 0）。
+     */
+    @Min(value = 0, message = "包天名额不能小于 0", groups = {AddGroup.class, EditGroup.class})
+    private Integer dayPassQuota;
+
     /** 单价（分），≥ 0 */
     @NotNull(message = "单价不能为空", groups = {AddGroup.class, EditGroup.class})
     @Min(value = 0, message = "单价不能小于 0", groups = {AddGroup.class, EditGroup.class})
     private Long priceCent;
+
+    /** 包天固定价（分，GZ-BEAN-042 / ADR-0017），≥ 0；可空（Service 视作 0） */
+    @Min(value = 0, message = "包天价不能小于 0", groups = {AddGroup.class, EditGroup.class})
+    private Long dayPassPriceCent;
 
     /** 0=停用 / 1=启用 */
     @Min(value = 0, message = "enabled 取值仅 0/1", groups = {AddGroup.class, EditGroup.class})

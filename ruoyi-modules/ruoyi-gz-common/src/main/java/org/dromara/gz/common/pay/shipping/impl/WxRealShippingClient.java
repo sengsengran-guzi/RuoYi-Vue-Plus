@@ -23,7 +23,15 @@ import java.time.format.DateTimeFormatter;
  * 调用链：access_token（{@link WxAccessTokenManager} 全局缓存）→ POST upload_shipping_info。</p>
  *
  * <p><b>容错</b>：本类不抛异常 —— 网络/微信错误落 {@link UploadResult#fail}；access_token 失效
- * （40001/42001/40014）强刷一次重试；微信判「已发货」（268440065 / errmsg 含「已发货」）视为幂等成功。</p>
+ * （40001/42001/40014）强刷一次重试。</p>
+ *
+ * <p><b>幂等成功判定</b>（{@link #interpret}）：微信侧已登记发货即视为成功、不再重试 ——
+ * {@code 268440065}「订单已发货」、{@code 10060023}「已上传该订单物流信息（发货信息未更新）」、
+ * 或 errmsg 含「已发货」。此判定是 74 单历史卡单的根因修复：过去 {@code 10060023} 被误判为失败，
+ * 即便店家已在小程序订单中心手动发货、重试仍永远回写 {@code failed}，状态永不收敛。</p>
+ *
+ * <p><b>时序竞态</b>：支付回调后即时上报常撞 {@code 10060001}「支付单不存在」（微信订单索引尚未就绪），
+ * 归类为<b>可重试失败</b>，由 {@code GzPayShippingServiceImpl#tryUploadAsync} 短延迟重试自愈。</p>
  *
  * @author kevin-coder (sensenran-guzi)
  */
@@ -56,6 +64,15 @@ public class WxRealShippingClient implements WxShippingClient {
     /** 「订单已发货」幂等错误码（微信重复发货保护）。 */
     private static final int ERR_ALREADY_SHIPPED = 268440065;
 
+    /**
+     * 「已上传该订单的物流信息」幂等错误码（errmsg 为「发货信息未更新」，措辞误导）。
+     * 订单已被（手动或本服务）登记发货后重复上报即返此码 —— 视为成功，避免历史卡单永卡 failed。
+     */
+    private static final int ERR_SHIPPING_NOT_UPDATED = 10060023;
+
+    /** 「支付单不存在」—— 支付后微信订单索引尚未就绪的时序竞态，可重试（非终态失败）。 */
+    private static final int ERR_ORDER_NOT_READY = 10060001;
+
     private final WxAccessTokenManager accessTokenManager;
 
     @Override
@@ -69,16 +86,35 @@ public class WxRealShippingClient implements WxShippingClient {
             errcode = resp.getInt("errcode");
         }
         String errmsg = resp.getStr("errmsg");
+        UploadResult result = interpret(errcode, errmsg);
+        if (result.success()) {
+            log.info("[wx-shipping] 发货信息上报成功（含幂等）transaction_id={} errcode={}", cmd.transactionId(), errcode);
+        } else if (errcode != null && errcode == ERR_ORDER_NOT_READY) {
+            log.warn("[wx-shipping] 微信订单索引未就绪，稍后重试 transaction_id={} errcode={}", cmd.transactionId(), errcode);
+        } else {
+            log.warn("[wx-shipping] 发货信息上报失败 transaction_id={} errcode={} errmsg={}", cmd.transactionId(), errcode, errmsg);
+        }
+        return result;
+    }
+
+    /**
+     * 把微信响应错误码/描述归类为成功 / 失败。抽成纯函数便于单测（不触网）。
+     *
+     * <p>成功：{@code errcode==0} 或 null（正常）；{@code 268440065} / {@code 10060023}（微信侧已登记发货，
+     * 幂等）；errmsg 含「已发货」。其余（含 {@code 10060001} 时序竞态）→ 失败，交上层重试。</p>
+     *
+     * @param errcode 微信错误码（可能为 null = 成功）
+     * @param errmsg  微信错误描述
+     * @return 上报结果
+     */
+    UploadResult interpret(Integer errcode, String errmsg) {
         if (errcode == null || errcode == 0) {
-            log.info("[wx-shipping] 发货信息上报成功 transaction_id={}", cmd.transactionId());
             return UploadResult.ok();
         }
-        // 微信侧已登记发货 → 幂等成功（避免无意义重试）
-        if (errcode == ERR_ALREADY_SHIPPED || (errmsg != null && (errmsg.contains("已发货") || errmsg.contains("已经发货")))) {
-            log.info("[wx-shipping] 发货信息已存在视为成功 transaction_id={} errcode={}", cmd.transactionId(), errcode);
+        if (errcode == ERR_ALREADY_SHIPPED || errcode == ERR_SHIPPING_NOT_UPDATED
+            || (errmsg != null && (errmsg.contains("已发货") || errmsg.contains("已经发货")))) {
             return UploadResult.ok();
         }
-        log.warn("[wx-shipping] 发货信息上报失败 transaction_id={} errcode={} errmsg={}", cmd.transactionId(), errcode, errmsg);
         return UploadResult.fail(errcode, errmsg);
     }
 

@@ -13,6 +13,7 @@ import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.redis.utils.RedisUtils;
 import org.dromara.common.tenant.helper.TenantHelper;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingQueryBo;
+import org.dromara.gz.bean.domain.bo.GzBeanDayPassSubmitBo;
 import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
 import org.dromara.gz.bean.domain.entity.GzBeanBooking;
 import org.dromara.gz.bean.domain.entity.GzBeanBookingLog;
@@ -24,6 +25,7 @@ import org.dromara.gz.bean.domain.entity.GzBeanStore;
 import org.dromara.gz.bean.domain.entity.GzBeanTimeSlotTemplate;
 import org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
+import org.dromara.gz.bean.domain.vo.GzBeanDayPassOptionVO;
 import org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatMapVO;
 import org.dromara.gz.bean.domain.vo.GzBeanStaffOverviewVO;
@@ -59,6 +61,8 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -402,6 +406,10 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
      */
     private void assignSeatAtVerify(GzBeanBooking booking, Long seatId) {
         String tenantId = booking.getTenantId();
+        // 座位关闭校验的区间起算点（GZ-BEAN-042 / ADR-0017 店员自主）：从「当下整点」起，而非 booking 名义 slot_start。
+        //   小时单 slot_start≈now → 恒 = slot_start；整天/长区间包天单午后核销时 = 当前整点。仅用于「按星期时段关闭」判定。
+        LocalTime effectiveStart = effectiveAssignStart(booking);
+        LocalTime now = LocalTime.now();
         GzBeanSeat seat = seatMapper.selectById(seatId);
         if (seat == null || seat.getStoreId() == null || !seat.getStoreId().equals(booking.getStoreId())) {
             throw new ServiceException(GzBeanErrorCode.SEAT_TAKEN_MSG, GzBeanErrorCode.SEAT_TAKEN);
@@ -418,13 +426,15 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         //   [slot_start, slot_end) 命中后台「按星期 + 时段关闭」规则 → 拒绝分座（整笔回滚），不让店员把已关闭
         //   座位绑给新单。周复发关闭、自动恢复；只拦新分座，不动已存活预约。
         List<Long> closedSeatIds = seatClosureService.findClosedSeatIds(
-            tenantId, booking.getStoreId(), booking.getSessDate(), booking.getSlotStart(), booking.getSlotEnd());
+            tenantId, booking.getStoreId(), booking.getSessDate(), effectiveStart, booking.getSlotEnd());
         if (closedSeatIds.contains(seatId)) {
             log.info("[bean-verify-assign] seat closed storeId={} seatId={} date={} req={}-{}",
-                booking.getStoreId(), seatId, booking.getSessDate(), booking.getSlotStart(), booking.getSlotEnd());
+                booking.getStoreId(), seatId, booking.getSessDate(), effectiveStart, booking.getSlotEnd());
             throw new ServiceException(GzBeanErrorCode.SEAT_CLOSED_MSG, GzBeanErrorCode.SEAT_CLOSED);
         }
-        // 具体座位区间互斥（并发分座防物理超卖）：Redis seat 锁 + FOR UPDATE 区间重叠（止界 COALESCE(actual_end_slot, slot_end)）
+        // 当下物理占用判定（GZ-BEAN-043，并发分座防物理超卖）：Redis seat 锁 + FOR UPDATE「此刻是否有人在坐」。
+        //   判定不再走区间/配额止界（那是逐格防超卖的活），只问「这张椅子当下空不空」——放座即空、到点即空、分钟精度，
+        //   让店员把刚空出的座立刻分给到店客人（ADR-0017 §店员自主，消灭「限制太死」）。
         String seatLockKey = LOCK_SEAT_PREFIX + booking.getStoreId() + ":" + seatId + ":" + booking.getSessDate();
         if (!tryAcquireRedisLock(seatLockKey)) {
             log.info("[bean-verify-assign] seat lock taken storeId={} seatId={} date={}",
@@ -432,20 +442,38 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             throw new ServiceException(GzBeanErrorCode.SEAT_TAKEN_MSG, GzBeanErrorCode.SEAT_TAKEN);
         }
         // 事务结束（提交 / 回滚）即释放 seat 锁，避免回滚后残留误锁 ≤TTL（与 freePromo releaseBucket 同模式）。
-        // FOR UPDATE 行锁是并发正确性真源，本 Redis 锁仅快速前置；正确性不依赖其释放时机。
+        // Redis seat 锁（tryLock，第二个店员直接 false→SEAT_TAKEN）是并发串行化真源；FOR UPDATE 锁住在座行做双保险。
         registerLockReleaseOnTxEnd(seatLockKey);
         // 包一层可变 ArrayList：避免依赖 mapper 返回列表的可变性（不可变列表 removeIf 会抛 UOE）
-        List<Long> overlap = new ArrayList<>(bookingMapper.selectActiveSeatOverlapForUpdate(
-            tenantId, booking.getStoreId(), seatId, booking.getSessDate(), booking.getSlotStart(), booking.getSlotEnd()));
+        List<Long> occupiedNow = new ArrayList<>(bookingMapper.selectSeatOccupiedNowForUpdate(
+            tenantId, booking.getStoreId(), seatId, booking.getSessDate(), now));
         // 排除本单自身（存量已绑该座的重核销场景；新单本单 seat_id 仍 NULL 不会命中）
-        overlap.removeIf(id -> id.equals(booking.getId()));
-        if (!overlap.isEmpty()) {
-            log.info("[bean-verify-assign] seat taken storeId={} seatId={} date={} req={}-{} overlapIds={}",
-                booking.getStoreId(), seatId, booking.getSessDate(), booking.getSlotStart(), booking.getSlotEnd(), overlap);
+        occupiedNow.removeIf(id -> id.equals(booking.getId()));
+        if (!occupiedNow.isEmpty()) {
+            log.info("[bean-verify-assign] seat occupied now storeId={} seatId={} date={} now={} occupiedIds={}",
+                booking.getStoreId(), seatId, booking.getSessDate(), now, occupiedNow);
             throw new ServiceException(GzBeanErrorCode.SEAT_TAKEN_MSG, GzBeanErrorCode.SEAT_TAKEN);
         }
         booking.setSeatId(seatId);
         booking.setSeatNoSnapshot(seat.getSeatNo());
+    }
+
+    /**
+     * 座位「按星期时段关闭」校验的区间起算点（GZ-BEAN-042 / ADR-0017）：{@code max(slot_start, 当前整点)}，clamp ≤ slot_end。
+     *
+     * <p>只用于关闭规则命中判定——整天/长区间单午后核销时只需校验「从现在到 slot_end」是否落在关闭时段，
+     * 早上的关闭时段与当下分座无关。<b>仅当 {@code sessDate = 今天}</b> 才引入当前时钟（避免用今天的时钟错误裁剪
+     * 其它日期的区间）。当下物理占用（SEAT_TAKEN）已改由 {@code selectSeatOccupiedNowForUpdate} 判定，不再用本值。</p>
+     */
+    private LocalTime effectiveAssignStart(GzBeanBooking booking) {
+        LocalTime slotStart = booking.getSlotStart();
+        if (!LocalDate.now().equals(booking.getSessDate())) {
+            return slotStart;
+        }
+        LocalTime nowFloor = LocalTime.of(LocalTime.now().getHour(), 0);
+        LocalTime eff = nowFloor.isAfter(slotStart) ? nowFloor : slotStart;
+        LocalTime slotEnd = booking.getSlotEnd();
+        return (slotEnd != null && eff.isAfter(slotEnd)) ? slotEnd : eff;
     }
 
     // ============================================================
@@ -922,12 +950,9 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         List<LocalTime> reqSlots = validateAndExpandInterval(tenantId, bo.getStoreId(), bo.getSessDate(),
             bo.getSlotStart(), bo.getSlotEnd());
 
-        // ⑤ 幂等：同用户重复提交同一桌型档且区间重叠 → 拒单（ADR-0016 §1，按 seat_type_config 维度，防误连点重复下单）
-        long userActive = bookingMapper.countActiveUserOverlapByConfig(
-            tenantId, userId, bo.getStoreId(), config.getId(), bo.getSessDate(), bo.getSlotStart(), bo.getSlotEnd());
-        if (userActive > 0) {
-            throw new ServiceException(GzBeanErrorCode.DUPLICATE_USER_BOOKING_MSG, GzBeanErrorCode.DUPLICATE_USER_BOOKING);
-        }
+        // ⑤ 防误连点：仅靠 ② 的用户提交锁（Redis 5s + dedupClientToken 合并 key，同一次点击的网络重试幂等）。
+        //    不再限制「同用户同桌型同时段只能 1 张」—— 店主明确允许一人同时段订同桌型多个座位（如给小孩各定一座）；
+        //    超卖由 ⑥ 逐格配额独立保证，与下单人身份无关。
 
         // ⑥ 桌型档逐格配额防超卖（ADR-0016 §2 / ADR-0011 §3：回到配额计数，具体座位互斥下沉到核销分座）：
         //   事务内对区间每个 1h 格 FOR UPDATE 计该桌型档活跃单数，≥ slotCapacity(config) → QUOTA_FULL 整笔回滚。
@@ -1103,6 +1128,212 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             head = "用户提交付费预约（待支付）";
         }
         return head + couponPart;
+    }
+
+    // ============================================================
+    //  GZ-BEAN-042 包天套餐下单事务（ADR-0017）
+    // ============================================================
+
+    @Override
+    @Transactional(rollbackFor = Exception.class, isolation = Isolation.REPEATABLE_READ)
+    public GzBeanPaidSubmitVO submitDayPass(GzBeanDayPassSubmitBo bo, Long userId) {
+        // 防超卖前提同 submitPaid（ADR-0017）：包天名额 cap + 逐格配额 COUNT(*) FOR UPDATE 靠 InnoDB 间隙锁
+        //   串行化并发下单（命中 0 行也锁索引区段挡并发 INSERT），<b>仅 REPEATABLE_READ 成立</b>，此处显式声明。
+        if (userId == null) {
+            throw new ServiceException("未登录");
+        }
+
+        // ① 用户存在 + 手机号 + 微信号已采集（同 submitPaid）
+        GzUser user = gzUserMapper.selectById(userId);
+        if (user == null) {
+            throw new ServiceException("user.notFound");
+        }
+        if (StrUtil.isBlank(user.getMobile())) {
+            throw new ServiceException(GzBeanErrorCode.PHONE_REQUIRED_MSG, GzBeanErrorCode.PHONE_REQUIRED);
+        }
+        if (StrUtil.isBlank(user.getWechatId())) {
+            throw new ServiceException(GzBeanErrorCode.WECHAT_ID_REQUIRED_MSG, GzBeanErrorCode.WECHAT_ID_REQUIRED);
+        }
+        String tenantId = user.getTenantId();
+
+        // ② Redis 用户提交锁（防连点，5s；含 dedupClientToken 合并 key）
+        String userLockKey = LOCK_USER_SUBMIT_PREFIX + userId
+            + (StrUtil.isNotBlank(bo.getDedupClientToken()) ? ":" + bo.getDedupClientToken() : "");
+        if (!tryAcquireRedisLock(userLockKey)) {
+            throw new ServiceException(GzBeanErrorCode.SUBMIT_TOO_FAST_MSG, GzBeanErrorCode.SUBMIT_TOO_FAST);
+        }
+
+        // ③ 门店
+        GzBeanStore store = storeMapper.selectById(bo.getStoreId());
+        if (store == null) {
+            throw new ServiceException("门店不存在");
+        }
+
+        // ④ 桌型档存在 + 属本店 + 启用
+        GzBeanSeatTypeConfig config = seatTypeConfigMapper.selectById(bo.getSeatTypeConfigId());
+        if (config == null || config.getStoreId() == null || !config.getStoreId().equals(bo.getStoreId())) {
+            throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_NOT_CONFIGURED_MSG, GzBeanErrorCode.SEAT_TYPE_NOT_CONFIGURED);
+        }
+        if (config.getEnabled() == null || config.getEnabled() != 1) {
+            throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_DISABLED_MSG, GzBeanErrorCode.SEAT_TYPE_DISABLED);
+        }
+
+        // ⑤ 该桌型开放包天（day_pass_quota > 0）
+        int dayPassQuota = config.getDayPassQuota() == null ? 0 : config.getDayPassQuota();
+        if (dayPassQuota <= 0) {
+            throw new ServiceException(GzBeanErrorCode.DAY_PASS_NOT_OPEN_MSG, GzBeanErrorCode.DAY_PASS_NOT_OPEN);
+        }
+
+        // ⑥ 营业窗口 → 全天范围 [open, close)（open=首格起、close=末格 end=末格起+1h）+ 营业格集合
+        //   该日无营业窗口 → 抛 SLOT_RANGE_INVALID（不静默降级）。多窗口含午休：daySlots 天然不含午休格，
+        //   全天范围覆盖午休但午休格不参与逐格 count（无格可数，正确）。
+        List<GzBeanTimeSlotTemplate> windows = selectEnabledSlotsForDate(tenantId, bo.getStoreId(), bo.getSessDate());
+        List<LocalTime> daySlots = sliceWindowsToHourSlots(windows);
+        if (daySlots.isEmpty()) {
+            throw new ServiceException(GzBeanErrorCode.SLOT_RANGE_INVALID_MSG, GzBeanErrorCode.SLOT_RANGE_INVALID);
+        }
+        LocalTime openSlot = daySlots.get(0);
+        LocalTime closeSlot = daySlots.get(daySlots.size() - 1).plusHours(1);
+
+        // ⑦ 防误连点：仅靠 ② 的用户提交锁（Redis 5s + dedupClientToken）。不再限制「一人一日一桌型一张包天」——
+        //    店主明确允许一人订多张（如给多个小孩各定一张全天）；总量由 ⑧ 包天名额 cap 独立保证，与下单人无关。
+
+        // ⑧ 包天名额 cap（FOR UPDATE，放逐格 count 之前，统一加锁顺序）
+        long activeDayPass = bookingMapper.countActiveDayPassForUpdate(
+            tenantId, bo.getStoreId(), config.getId(), bo.getSessDate());
+        if (activeDayPass >= dayPassQuota) {
+            log.info("[bean-day-pass] cap full storeId={} configId={} date={} active={}/{}",
+                bo.getStoreId(), config.getId(), bo.getSessDate(), activeDayPass, dayPassQuota);
+            throw new ServiceException(GzBeanErrorCode.DAY_PASS_FULL_MSG, GzBeanErrorCode.DAY_PASS_FULL);
+        }
+
+        // ⑨ 逐格配额（全天每营业格 FOR UPDATE；已售包天单已被本 count 逐格计入，防包天+小时总量超卖）
+        long slotCapacity = slotCapacity(config);
+        int weekday = bo.getSessDate().getDayOfWeek().getValue();
+        for (LocalTime gi : daySlots) {
+            long active = bookingMapper.countActiveCoveringSlotForUpdate(
+                tenantId, bo.getStoreId(), config.getId(), bo.getSessDate(), gi);
+            long closed = seatClosureService.countClosedSeatsCoveringSlot(
+                tenantId, bo.getStoreId(), config.getId(), weekday, gi);
+            long effectiveCap = Math.max(0L, slotCapacity - closed);
+            if (active >= effectiveCap) {
+                log.info("[bean-day-pass] quota full storeId={} configId={} date={} slot={} active={}/{} closed={}",
+                    bo.getStoreId(), config.getId(), bo.getSessDate(), gi, active, effectiveCap, closed);
+                throw new ServiceException(GzBeanErrorCode.QUOTA_FULL_MSG, GzBeanErrorCode.QUOTA_FULL);
+            }
+        }
+
+        // ⑩ 定价：固定包天价（ADR-0017，非逐格求和）；包天不锁券、不评前 N 名免费（is_free=0）
+        long amountCent = config.getDayPassPriceCent() == null ? 0L : config.getDayPassPriceCent();
+        long payAmountCent = Math.max(0L, amountCent);
+        boolean free = payAmountCent <= 0L; // 包天价>0 恒付费；价=0 时走免费兜底（与 submitPaid 一致）
+
+        // ⑪ booking_no + 名快照
+        LocalDateTime now = LocalDateTime.now();
+        String bookingNo = generateBookingNo(now.toLocalDate());
+        String seatTypeName = StrUtil.isNotBlank(config.getName()) ? config.getName() : config.getSeatType();
+
+        // ⑫ INSERT 全天范围 booking（is_day_pass=1；seat_id/seat_no_snapshot=NULL 核销分座才写；
+        //    dedup_token 不写 = NULL，同 V1.2 submitPaid 口径，防超卖由 cap+逐格 count 保证；
+        //    免费单直接 paid + verify_code；付费单 pay_status=paying、verify_code 待 onPaid）
+        GzBeanBooking entity = GzBeanBooking.builder()
+            .bookingNo(bookingNo)
+            .userId(userId)
+            .storeId(bo.getStoreId())
+            .seatType(config.getSeatType())
+            .seatTypeSnapshot(seatTypeName)
+            .seatTypeConfigId(config.getId())
+            .bookModeSnapshot(config.getBookMode())
+            .sessDate(bo.getSessDate())
+            .slotStart(openSlot)
+            .slotEnd(closeSlot)
+            .mobileSnapshot(user.getMobile())
+            .wechatIdSnapshot(user.getWechatId())
+            .amountCent(amountCent)
+            .discountAmountCent(0L)
+            .couponId(null)
+            .status(STATUS_PENDING)
+            .payStatus(free ? PAY_STATUS_PAID : PAY_STATUS_PAYING)
+            .verifyCode(free ? qrCodeSigner.signByType(bookingNo, bo.getSessDate(), config.getSeatType()) : null)
+            .isFree(0)
+            .isDayPass(1)
+            .delFlag("0")
+            .build();
+        bookingMapper.insert(entity);
+
+        // ⑬ 首条 booking_log
+        bookingLogMapper.insert(GzBeanBookingLog.builder()
+            .bookingId(entity.getId())
+            .fromStatus(null)
+            .toStatus(STATUS_PENDING)
+            .operatorType(OPERATOR_USER)
+            .operatorId(String.valueOf(userId))
+            .note("用户提交包天套餐预约（" + (free ? "免费单，直接 paid" : "待支付") + "）")
+            .delFlag("0")
+            .build());
+
+        // ⑭ 免费单兜底（价=0 时）：不建支付单，直接返回
+        if (free) {
+            log.info("[bean-day-pass] FREE booking paid bookingNo={} userId={} configId={}", bookingNo, userId, config.getId());
+            return buildPaidSubmitVO(entity, payAmountCent, true, null);
+        }
+
+        // ⑮ 付费单：建 pindou 支付单，拿 mp 五参 + out_trade_no
+        CreateOrderBo orderBo = CreateOrderBo.builder()
+            .businessType(PayBusinessType.PINDOU)
+            .businessOrderNo(bookingNo)
+            .amountCent(payAmountCent)
+            .openid(user.getOpenid())
+            .userId(userId)
+            .description("谷子宇宙拼豆包天套餐 · " + seatTypeName + " · " + bo.getSessDate())
+            .build();
+        MpPayParamsVO payParams = payServiceProvider.getObject().createBusinessOrder(orderBo);
+
+        GzBeanBooking patch = new GzBeanBooking();
+        patch.setId(entity.getId());
+        patch.setOutTradeNo(payParams.getOutTradeNo());
+        bookingMapper.updateById(patch);
+        entity.setOutTradeNo(payParams.getOutTradeNo());
+
+        log.info("[bean-day-pass] PAID booking created bookingNo={} userId={} configId={} amount={} outTradeNo={}",
+            bookingNo, userId, config.getId(), payAmountCent, payParams.getOutTradeNo());
+        return buildPaidSubmitVO(entity, payAmountCent, false, payParams);
+    }
+
+    @Override
+    public List<GzBeanDayPassOptionVO> selectDayPassOptions(Long storeId, LocalDate sessDate) {
+        if (storeId == null || sessDate == null) {
+            return List.of();
+        }
+        GzBeanStore store = storeMapper.selectById(storeId);
+        if (store == null) {
+            return List.of();
+        }
+        String tenantId = store.getTenantId();
+        // 该店启用且开放包天（day_pass_quota>0）的桌型档
+        List<GzBeanSeatTypeConfig> configs = seatTypeConfigMapper.selectList(
+            Wrappers.<GzBeanSeatTypeConfig>lambdaQuery()
+                .eq(GzBeanSeatTypeConfig::getTenantId, tenantId)
+                .eq(GzBeanSeatTypeConfig::getStoreId, storeId)
+                .eq(GzBeanSeatTypeConfig::getEnabled, 1)
+                .gt(GzBeanSeatTypeConfig::getDayPassQuota, 0)
+                .orderByAsc(GzBeanSeatTypeConfig::getSortNo)
+                .orderByAsc(GzBeanSeatTypeConfig::getId));
+        List<GzBeanDayPassOptionVO> result = new ArrayList<>(configs.size());
+        for (GzBeanSeatTypeConfig c : configs) {
+            int quota = c.getDayPassQuota() == null ? 0 : c.getDayPassQuota();
+            long sold = bookingMapper.countActiveDayPass(tenantId, storeId, c.getId(), sessDate);
+            long priceCent = c.getDayPassPriceCent() == null ? 0L : c.getDayPassPriceCent();
+            result.add(GzBeanDayPassOptionVO.builder()
+                .seatTypeConfigId(c.getId())
+                .name(StrUtil.isNotBlank(c.getName()) ? c.getName() : c.getSeatType())
+                .bookMode(c.getBookMode())
+                .dayPassPriceCent(priceCent)
+                .dayPassPriceYuan(new BigDecimal(priceCent).divide(new BigDecimal("100"), 2, RoundingMode.HALF_UP))
+                .full(sold >= quota)
+                .build());
+        }
+        return result;
     }
 
     /**
@@ -1819,12 +2050,15 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         if (seats.isEmpty()) {
             return List.of();
         }
-        // 排除该日该时段已被占用的座（与防超卖同口径：活跃单 + 区间重叠 + 占用止界 COALESCE(actual_end_slot, slot_end)）
-        java.util.Set<Long> occupied = new java.util.HashSet<>(bookingMapper.selectOccupiedSeatIds(
-            tenantId, storeId, booking.getSessDate(), booking.getSlotStart(), booking.getSlotEnd()));
-        // 排除该日该时段按星期关闭的座
+        // 排除「当下有人在坐」的座（GZ-BEAN-043，与 assignSeatAtVerify 同口径）：used + 未放座 + slot_end > now，
+        //   分钟精度、放座即空——给店员一份「此刻真能分」的候选，早上用过/已放座的座重回可选。
+        LocalTime now = LocalTime.now();
+        java.util.Set<Long> occupied = new java.util.HashSet<>(bookingMapper.selectSeatOccupiedNowIds(
+            tenantId, storeId, booking.getSessDate(), now));
+        // 排除该日该时段按星期关闭的座（关闭规则仍按「当下→slot_end」区间判，用 effectiveStart 起算）
+        LocalTime effectiveStart = effectiveAssignStart(booking);
         java.util.Set<Long> closed = new java.util.HashSet<>(seatClosureService.findClosedSeatIds(
-            tenantId, storeId, booking.getSessDate(), booking.getSlotStart(), booking.getSlotEnd()));
+            tenantId, storeId, booking.getSessDate(), effectiveStart, booking.getSlotEnd()));
         return seats.stream()
             .filter(s -> !occupied.contains(s.getId()) && !closed.contains(s.getId()))
             .toList();
@@ -2481,10 +2715,14 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     }
 
     /**
-     * 把整条续坐链改派到新座（一次锁 + 合并时段校验，避免对同一新座重复加锁）：校验新座存在/本店/启用/
-     * 桌型匹配（按锚单），合并时段 {@code [chainStart, chainEnd)} 过关闭规则 + 具体座位区间互斥（FOR UPDATE，
-     * 排除链自身——链此刻仍在原座，正常不会命中新座），通过则把链内每单 seat_id/seat_no_snapshot 改为新座
-     * （in-memory，调用方统一 updateById）。任一校验不过抛业务异常 → 整笔事务回滚。
+     * 把整条续坐链改派到新座（一次锁 + 校验，避免对同一新座重复加锁）：校验新座存在/本店/启用/桌型匹配（按锚单），
+     * 关闭规则 + <b>新座「当下物理占用」判定</b>（GZ-BEAN-043，对齐核销分座 {@link #assignSeatAtVerify}）——
+     * 只看该座此刻有没有人在坐（放座即空、分钟精度），不再用区间/配额止界，故刚放座 / 早场用过现已空的座也能改派过去。
+     * 通过则把链内每单 seat_id/seat_no_snapshot 改为新座（in-memory，调用方统一 updateById）。任一校验不过 → 整笔回滚。
+     *
+     * <p><b>为何 present-moment 对整条链仍安全</b>：链成员均 {@code used}（在店），改派后各自覆盖其时段
+     * → 并发核销想抢该座任一时刻都会被链成员 present-moment 判占；改派「检查→提交」窗口由新座 Redis 锁 + FOR UPDATE
+     * 串行化。未来时段不会有 {@code used} 单预占该座（{@code used} 需已到点核销），故「当下空」= 剩余时段可安全整链占。</p>
      */
     private GzBeanSeat assignChainToSeat(List<GzBeanBooking> chain, Long newSeatId) {
         GzBeanBooking primary = chain.get(0);
@@ -2503,19 +2741,31 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         // 合并时段（链按时段升序，连续 → [首.slotStart, 尾.slotEnd)）
         LocalTime chainStart = chain.get(0).getSlotStart();
         LocalTime chainEnd = chain.get(chain.size() - 1).getSlotEnd();
+        LocalTime now = LocalTime.now();
+        // 关闭规则校验区间起算点对齐「当下」（GZ-BEAN-043）：只校「从现在到链尾」是否落关闭时段，链头已过的部分
+        //   与当下改派无关（仅 sessDate=今天 引入时钟；clamp ≤ chainEnd）。
+        LocalTime closureStart = chainStart;
+        if (LocalDate.now().equals(primary.getSessDate())) {
+            LocalTime nowFloor = LocalTime.of(now.getHour(), 0);
+            closureStart = nowFloor.isAfter(chainStart) ? nowFloor : chainStart;
+            if (closureStart.isAfter(chainEnd)) {
+                closureStart = chainEnd;
+            }
+        }
         List<Long> closedSeatIds = seatClosureService.findClosedSeatIds(
-            tenantId, primary.getStoreId(), primary.getSessDate(), chainStart, chainEnd);
+            tenantId, primary.getStoreId(), primary.getSessDate(), closureStart, chainEnd);
         if (closedSeatIds.contains(newSeatId)) {
             throw new ServiceException(GzBeanErrorCode.SEAT_CLOSED_MSG, GzBeanErrorCode.SEAT_CLOSED);
         }
-        // 新座区间互斥：一次锁新座（链共用一把锁，不逐单重复加锁，否则同事务第二次加锁必失败误报 SEAT_TAKEN）
+        // 新座「当下物理占用」判定：一次锁新座（链共用一把锁，不逐单重复加锁，否则同事务第二次加锁必失败误报 SEAT_TAKEN）
         String seatLockKey = LOCK_SEAT_PREFIX + primary.getStoreId() + ":" + newSeatId + ":" + primary.getSessDate();
         if (!tryAcquireRedisLock(seatLockKey)) {
             throw new ServiceException(GzBeanErrorCode.SEAT_TAKEN_MSG, GzBeanErrorCode.SEAT_TAKEN);
         }
         registerLockReleaseOnTxEnd(seatLockKey);
-        List<Long> overlap = new ArrayList<>(bookingMapper.selectActiveSeatOverlapForUpdate(
-            tenantId, primary.getStoreId(), newSeatId, primary.getSessDate(), chainStart, chainEnd));
+        // 当下有人在坐才拦（放座即空，同 assignSeatAtVerify）；排除链自身（改派到原座=no-op / 链此刻在原座不会命中新座）
+        List<Long> overlap = new ArrayList<>(bookingMapper.selectSeatOccupiedNowForUpdate(
+            tenantId, primary.getStoreId(), newSeatId, primary.getSessDate(), now));
         java.util.Set<Long> chainIds = new java.util.HashSet<>();
         for (GzBeanBooking b : chain) {
             chainIds.add(b.getId());

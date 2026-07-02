@@ -194,6 +194,34 @@ public interface IGzBeanBookingService {
     GzBeanPaidSubmitVO submitPaid(GzBeanPaidBookingSubmitBo bo, Long userId);
 
     /**
+     * mp 端包天套餐下单（GZ-BEAN-042 / ADR-0017）。
+     *
+     * <p>包天单 = 一条全天范围 booking（slot_start=当日开店 / slot_end=闭店），当天占该座（核销时店员现场分座）。
+     * 事务（{@code REPEATABLE_READ}）内：① 校门店/桌型档/包天开放（day_pass_quota&gt;0）；② 取该日营业窗口 open..close；
+     * ③ 幂等（同用户同桌型同日已有活跃单）；④ <b>包天名额 cap</b>（{@code countActiveDayPassForUpdate ≥ day_pass_quota}
+     * → DAY_PASS_FULL，放逐格 count 之前）；⑤ 逐格配额（全天每营业格 FOR UPDATE，含已售包天，防总量超卖）；
+     * ⑥ 定价 = {@code day_pass_price_cent} 固定价（不逐格求和、不锁券、不评促销、is_free=0）；
+     * ⑦ INSERT（is_day_pass=1, seat_id=NULL, dedup_token=booking_no）+ 建支付单。</p>
+     *
+     * @param bo     包天下单参数（storeId / seatTypeConfigId / sessDate；无时段无券）
+     * @param userId 当前登录 user_id（sa-token 拿）
+     * @return 提交结果（含固定包天价 + 支付五参；复用 {@link GzBeanPaidSubmitVO}）
+     */
+    GzBeanPaidSubmitVO submitDayPass(org.dromara.gz.bean.domain.bo.GzBeanDayPassSubmitBo bo, Long userId);
+
+    /**
+     * mp 包天可用性查询（GZ-BEAN-042 / ADR-0017）。
+     *
+     * <p>某门店某日各<b>开放包天</b>（{@code day_pass_quota&gt;0} 且启用）桌型档的包天套餐可选状态：固定价 +
+     * 是否售罄（内部 {@code 已售包天 ≥ day_pass_quota} → full，不向 mp 暴露剩余名额数字）。</p>
+     *
+     * @param storeId  门店 ID
+     * @param sessDate 预约日期
+     * @return 各开放包天的桌型档 {seatTypeConfigId / name / bookMode / dayPassPriceCent / full}
+     */
+    List<org.dromara.gz.bean.domain.vo.GzBeanDayPassOptionVO> selectDayPassOptions(Long storeId, LocalDate sessDate);
+
+    /**
      * mp 选座余量查询（GZ-BEAN-017，ADR-0011 / doc/15a §A.1）。
      *
      * <p>把该日各启用营业窗口按 1h 切成整点格，对某门店某日各 {@code (启用座位类型 × 1h 格)} 返回是否已满

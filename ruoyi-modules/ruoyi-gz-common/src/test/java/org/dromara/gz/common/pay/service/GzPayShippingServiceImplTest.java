@@ -136,6 +136,57 @@ class GzPayShippingServiceImplTest {
         verify(shippingMapper, times(0)).updateById(any(GzPayShippingOrder.class));
     }
 
+    @Test
+    @DisplayName("backfillPending：扫全部 pending/failed（不受窗口/尝试上限约束）批量补报，统计正确")
+    void backfillPending_marksSuccessAndFailed() {
+        GzPayShippingOrder ok = row(11L, GzPayShippingOrder.STATUS_FAILED);
+        ok.setAttemptCount(20); // 远超 MAX_ATTEMPT=8，手动补报仍应处理
+        GzPayShippingOrder bad = row(12L, GzPayShippingOrder.STATUS_PENDING);
+        when(shippingMapper.selectList(any())).thenReturn(List.of(ok, bad));
+        when(shippingClient.uploadShippingInfo(any(UploadCommand.class)))
+            .thenReturn(UploadResult.ok())                       // 已发货单命中幂等 → success
+            .thenReturn(UploadResult.fail(10060001, "支付单不存在")); // 时序未就绪 → failed
+
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(() -> TenantHelper.ignore(any(Supplier.class)))
+                .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
+
+            UploadStats stats = service.backfillPending();
+
+            assertEquals(2, stats.scanned());
+            assertEquals(1, stats.success());
+            assertEquals(1, stats.failed());
+        }
+        verify(shippingClient, times(2)).uploadShippingInfo(any());
+    }
+
+    @Test
+    @DisplayName("retryOne：单条命中 → 调微信 + 回写 success，返回 true")
+    void retryOne_uploadsAndReturnsTrue() {
+        GzPayShippingOrder pending = row(21L, GzPayShippingOrder.STATUS_PENDING);
+        when(shippingMapper.selectById(21L)).thenReturn(pending);
+        when(shippingClient.uploadShippingInfo(any(UploadCommand.class))).thenReturn(UploadResult.ok());
+
+        boolean result;
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(() -> TenantHelper.ignore(any(Supplier.class)))
+                .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
+            result = service.retryOne(21L);
+        }
+
+        assertEquals(true, result);
+        ArgumentCaptor<GzPayShippingOrder> captor = ArgumentCaptor.forClass(GzPayShippingOrder.class);
+        verify(shippingMapper).updateById(captor.capture());
+        assertEquals(GzPayShippingOrder.STATUS_SUCCESS, captor.getValue().getUploadStatus());
+    }
+
+    @Test
+    @DisplayName("retryOne：id 为 null 直接返 false，不触 DB")
+    void retryOne_nullIdReturnsFalse() {
+        assertEquals(false, service.retryOne(null));
+        verify(shippingMapper, times(0)).selectById(any());
+    }
+
     private GzPayShippingOrder row(Long id, String status) {
         return GzPayShippingOrder.builder()
             .id(id)

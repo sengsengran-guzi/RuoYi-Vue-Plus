@@ -52,11 +52,20 @@ public class GzBeanSeatTypeConfigVO implements Serializable {
     /** 数量（每格物理单位数 = 桌/单位数） */
     private Integer quantity;
 
+    /** 包天名额（GZ-BEAN-042；0=不开放包天） */
+    private Integer dayPassQuota;
+
     /** 单价（分；前端 /100 显示元） */
     private Long priceCent;
 
     /** 单价（元；Service 由 priceCent /100 算，便于 admin 直接展示） */
     private BigDecimal priceYuan;
+
+    /** 包天固定价（分；前端 /100 显示元） */
+    private Long dayPassPriceCent;
+
+    /** 包天固定价（元；Service 由 dayPassPriceCent /100 算） */
+    private BigDecimal dayPassPriceYuan;
 
     /** 0=停用 / 1=启用 */
     private Integer enabled;
