@@ -15,6 +15,7 @@ import org.dromara.gz.bean.domain.bo.GzBeanAdminCreateBo;
 import org.dromara.gz.bean.domain.bo.GzBeanBatchSettleBo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingVerifyScanBo;
+import org.dromara.gz.bean.domain.bo.GzBeanBoardNoteBo;
 import org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
 import org.dromara.gz.bean.mapper.GzAdminUserStoreMapper;
@@ -24,6 +25,7 @@ import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -217,6 +219,21 @@ public class GzBeanBookingController extends BaseController {
         String adminUsername = LoginHelper.getUsername();
         log.info("[bean-board-admin] reassignSeat id={} newSeatId={} by={}", id, seatId, adminUsername);
         return R.ok(bookingService.reassignSeat(id, seatId, adminUsername));
+    }
+
+    /**
+     * 看板备注：店员点看板某座位 → 记一条备注。按占用状态分两处存 —— 座位占用中传 {@code bo.bookingId}
+     * （挂本次占用单 board_note，放座后看板不再展示）；座位空闲不传 bookingId（挂 gz_bean_seat.remark，长期留存）。
+     * {@code bo.remark} 传空/空串 = 清空（删除）。复用 {@code gz:bean:booking:verify} 权限（店员可写）。
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @Log(title = "拼豆看板备注", businessType = BusinessType.UPDATE)
+    @PutMapping("/board/seat/{seatId}/note")
+    public R<Void> updateBoardNote(@PathVariable Long seatId, @Validated @RequestBody GzBeanBoardNoteBo bo) {
+        String adminUsername = LoginHelper.getUsername();
+        log.info("[bean-board-admin] updateBoardNote seatId={} bookingId={} by={}", seatId, bo.getBookingId(), adminUsername);
+        bookingService.updateBoardNote(seatId, bo.getBookingId(), bo.getRemark(), adminUsername);
+        return R.ok();
     }
 
     /**

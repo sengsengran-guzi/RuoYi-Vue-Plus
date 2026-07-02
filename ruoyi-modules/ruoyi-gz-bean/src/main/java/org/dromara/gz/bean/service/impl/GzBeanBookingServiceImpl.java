@@ -449,6 +449,18 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             tenantId, booking.getStoreId(), seatId, booking.getSessDate(), now));
         // 排除本单自身（存量已绑该座的重核销场景；新单本单 seat_id 仍 NULL 不会命中）
         occupiedNow.removeIf(id -> id.equals(booking.getId()));
+        // 续坐同座提前核销（GZ-BEAN-045）：排除「同一顾客 + 占用区间与本单计划区间不重叠」的前序在座单。
+        //   续坐 = 同一位客人前序 [.., 17:00) + 本单 [17:00, 19:00) 时段不重叠 → 物理仍是这一位客人连续占同座，
+        //   16:18 提前核销续坐单到 D5 时，D5 上其前序单虽 slot_end>now「当下在座」，但两段不重叠 → 放行分同座
+        //   （对齐改派路径 assignChainToSeat「排除链自身」口径）。前序被延时到真重叠（occupiedEnd > 本单 slot_start）
+        //   则不排除、仍 SEAT_TAKEN；不同顾客占用一律不排除（防物理超卖）。桌型匹配等其它校验不变。
+        if (!occupiedNow.isEmpty() && booking.getUserId() != null) {
+            List<GzBeanBooking> occBookings = bookingMapper.selectByIds(occupiedNow);
+            occupiedNow.removeIf(id -> occBookings.stream().anyMatch(occ ->
+                occ.getId().equals(id)
+                    && booking.getUserId().equals(occ.getUserId())
+                    && !slotsOverlap(occ.getSlotStart(), occupiedEnd(occ), booking.getSlotStart(), booking.getSlotEnd())));
+        }
         if (!occupiedNow.isEmpty()) {
             log.info("[bean-verify-assign] seat occupied now storeId={} seatId={} date={} now={} occupiedIds={}",
                 booking.getStoreId(), seatId, booking.getSessDate(), now, occupiedNow);
@@ -1945,8 +1957,12 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                 GzBeanBooking current = pickCurrentBooking(bySeat.get(seat.getId()), now, sessDate);
                 if (current == null) {
                     row.boardStatus(BOARD_IDLE);
+                    // 空闲 → 座位永久备注
+                    row.remark(seat.getRemark());
                 } else {
                     fillCurrentBooking(row, current, now, sessDate, nearEndMinutes);
+                    // 占用 → 本次占用备注（放座后座位判回空闲，改显座位备注）
+                    row.remark(current.getBoardNote());
                     // 排满收尾信号（ADR-0016 §6）：仅已核销在店单（in_use/near_end/overtime）算可否延时
                     if (STATUS_USED.equals(current.getStatus())) {
                         row.canExtend(computeCanExtend(bySeat.get(seat.getId()), current));
@@ -2373,6 +2389,11 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         return b.getActualEndSlot() != null ? b.getActualEndSlot() : b.getSlotEnd();
     }
 
+    /** 两个左闭右开时段 [aStart,aEnd) 与 [bStart,bEnd) 是否重叠（相邻端点不算重叠，续坐 back-to-back 判不重叠）。 */
+    private boolean slotsOverlap(LocalTime aStart, LocalTime aEnd, LocalTime bStart, LocalTime bEnd) {
+        return aStart.isBefore(bEnd) && bStart.isBefore(aEnd);
+    }
+
     /**
      * 回填当前单 + 算看板状态（doc/11 §3.12 看板状态机）。
      *
@@ -2653,6 +2674,39 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         return toBoardRow(primary, LocalDateTime.now());
     }
 
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void updateBoardNote(Long seatId, Long bookingId, String remark, String operatorId) {
+        // admin 态操作（当前登录租户上下文），走普通租户 scope 的 select/update；LambdaUpdate.set 允许写 null 以清空。
+        String normalized = StrUtil.isBlank(remark) ? null : remark.trim();
+        if (bookingId != null) {
+            // 座位占用中 → 备注挂本次占用单（gz_bean_booking.board_note），放座后看板不再展示
+            GzBeanBooking booking = bookingMapper.selectById(bookingId);
+            if (booking == null) {
+                throw new ServiceException("预约不存在：" + bookingId);
+            }
+            bookingMapper.update(null, Wrappers.<GzBeanBooking>lambdaUpdate()
+                .eq(GzBeanBooking::getId, bookingId)
+                .set(GzBeanBooking::getBoardNote, normalized));
+            log.info("[bean-board] updateBoardNote booking bookingId={} bookingNo={} len={} by={}",
+                bookingId, booking.getBookingNo(), normalized == null ? 0 : normalized.length(), operatorId);
+            return;
+        }
+        // 座位空闲 → 备注挂座位（gz_bean_seat.remark，永久留存）
+        if (seatId == null) {
+            throw new ServiceException("座位 ID 不能为空");
+        }
+        GzBeanSeat seat = seatMapper.selectById(seatId);
+        if (seat == null) {
+            throw new ServiceException("座位不存在：" + seatId);
+        }
+        seatMapper.update(null, Wrappers.<GzBeanSeat>lambdaUpdate()
+            .eq(GzBeanSeat::getId, seatId)
+            .set(GzBeanSeat::getRemark, normalized));
+        log.info("[bean-board] updateBoardNote seat seatId={} seatNo={} len={} by={}",
+            seatId, seat.getSeatNo(), normalized == null ? 0 : normalized.length(), operatorId);
+    }
+
     /**
      * 取「同顾客 + 同座 + 当日 used 未放座」的 back-to-back 连续续坐链（含锚单），按时段升序。
      * 非续坐 / 单独单 → 仅含锚单本身。续坐整条改派不拆座用（{@link #reassignSeat}）。
@@ -2824,6 +2878,8 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .typeName(typeName)
             .bookMode(cfg != null ? cfg.getBookMode() : b.getBookModeSnapshot());
         fillCurrentBooking(row, b, now, b.getSessDate(), resolveNearEndMinutes(store));
+        // 备注：仍占用（未放座）→ 本次占用备注；已放座 → 座位判回空闲、改显座位永久备注（同 selectBoard 口径）
+        row.remark(b.getActualEndTime() == null ? b.getBoardNote() : (seat != null ? seat.getRemark() : null));
         return row.build();
     }
 

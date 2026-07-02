@@ -424,6 +424,23 @@ public interface IGzBeanBookingService {
     GzBeanBoardRowVO reassignSeat(Long bookingId, Long newSeatId, String operatorId);
 
     /**
+     * 看板备注：店员在店内计时看板点座位记一条备注。按占用状态分两处存储 ——
+     * <ul>
+     *   <li>座位<b>占用中</b>（传 {@code bookingId}）→ 挂本次占用单 {@code gz_bean_booking.board_note}，
+     *       仅与这位客人本次占用有关；放座后座位判回空闲、看板不再展示该备注。</li>
+     *   <li>座位<b>空闲</b>（{@code bookingId} 为空）→ 挂座位 {@code gz_bean_seat.remark}，长期留存。</li>
+     * </ul>
+     * {@code remark} 传空/空串 = 清空（删除备注）。复用 {@code gz:bean:booking:verify} 权限（店员可写），
+     * 不走 owner 专属的座位 CRUD 编辑权限。
+     *
+     * @param seatId     座位单元 id（空闲写座位备注必填）
+     * @param bookingId  本次占用单 id（占用写本次备注时传；为空则写座位备注）
+     * @param remark     备注内容（可空 = 清空；长度上限由 BO @Size 校验）
+     * @param operatorId 操作人（日志）
+     */
+    void updateBoardNote(Long seatId, Long bookingId, String remark, String operatorId);
+
+    /**
      * admin 代客预定（GZ-BEAN-039 / kevin-test §4）：现场没带手机的用户，店员直接选门店/日期/时段/桌型/
      * <b>具体座位</b>代下单，一步 {@code used + pay_status=paid}（线下已付），锁座给用户。
      *

@@ -2343,6 +2343,141 @@ class GzBeanBookingServiceImplTest {
         verify(bookingMapper, never()).selectActiveSeatOverlapForUpdate(any(), any(), any(), any(), any(), any());
     }
 
+    /**
+     * GZ-BEAN-045 续坐同座提前核销：客人上一时段的单当下仍在座（used、未放座、slot_end>now），
+     * 提前核销其 back-to-back 续坐单到【同一座位】—— 前序单虽被 present-moment 查询捞出，但因
+     * 「同用户 + 时段不重叠」被排除 → 放行分同座（修复「该座位该时段已被预约」误报 SEAT_TAKEN）。
+     */
+    @Test
+    @DisplayName("verify · 续坐同座提前核销 · 同用户 back-to-back 前序在座 → 排除后放行分同座（GZ-BEAN-045）")
+    void verify_continuousSameSeat_earlyVerify_allowed() {
+        GzBeanBooking booking = new GzBeanBooking();
+        booking.setId(706L);
+        booking.setUserId(9132L);
+        booking.setStatus("pending");
+        booking.setPayStatus("paid");
+        booking.setBookingNo("BK20260702000040");
+        booking.setSeatTypeConfigId(10L);
+        booking.setStoreId(1L);
+        booking.setTenantId("1001");
+        booking.setSessDate(LocalDate.of(2099, 1, 1));
+        booking.setSlotStart(LocalTime.of(17, 0)); // 续坐单 17:00-19:00
+        booking.setSlotEnd(LocalTime.of(19, 0));
+        when(bookingMapper.selectById(706L)).thenReturn(booking);
+
+        org.dromara.gz.bean.domain.entity.GzBeanSeat seat =
+            org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
+                .id(559L).storeId(1L).seatTypeConfigId(10L).seatNo("D5").tableNo("D5").enabled(1).build();
+        when(seatMapper.selectById(559L)).thenReturn(seat);
+
+        // 前序单：同用户 9132、D5、当下在座；slot 15:00-17:00 与本单 17:00-19:00 back-to-back 不重叠
+        GzBeanBooking predecessor = new GzBeanBooking();
+        predecessor.setId(800L);
+        predecessor.setUserId(9132L);
+        predecessor.setStoreId(1L);
+        predecessor.setTenantId("1001");
+        predecessor.setSlotStart(LocalTime.of(15, 0));
+        predecessor.setSlotEnd(LocalTime.of(17, 0));
+        when(bookingMapper.selectSeatOccupiedNowForUpdate(eq("1001"), eq(1L), eq(559L), any(), any()))
+            .thenReturn(new java.util.ArrayList<>(java.util.List.of(800L)));
+        when(bookingMapper.selectByIds(any())).thenReturn(java.util.List.of(predecessor));
+        when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
+        GzBeanBookingVO returnVo = new GzBeanBookingVO();
+        returnVo.setId(706L);
+        returnVo.setStatus("used");
+        when(bookingMapper.selectVoById(706L)).thenReturn(returnVo);
+
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        GzBeanBookingVO vo = spy.verify(706L, 559L, "staff1");
+
+        assertNotNull(vo);
+        assertEquals(559L, booking.getSeatId(), "续坐同座：同用户不重叠前序在座应被排除 → 放行分 D5");
+    }
+
+    /**
+     * GZ-BEAN-045 边界：座位当下被【别的顾客】占用 → 续坐排除不生效（仅限同用户）→ 仍 SEAT_TAKEN（防物理超卖）。
+     */
+    @Test
+    @DisplayName("verify · 座位当下被别的顾客占用 → 仍 SEAT_TAKEN（续坐排除仅限同用户）")
+    void verify_seatTaken_differentUser_stillBlocked() {
+        GzBeanBooking booking = new GzBeanBooking();
+        booking.setId(707L);
+        booking.setUserId(9132L);
+        booking.setStatus("pending");
+        booking.setPayStatus("paid");
+        booking.setBookingNo("BK20260702000041");
+        booking.setSeatTypeConfigId(10L);
+        booking.setStoreId(1L);
+        booking.setTenantId("1001");
+        booking.setSessDate(LocalDate.of(2099, 1, 1));
+        booking.setSlotStart(LocalTime.of(17, 0));
+        booking.setSlotEnd(LocalTime.of(19, 0));
+        when(bookingMapper.selectById(707L)).thenReturn(booking);
+
+        org.dromara.gz.bean.domain.entity.GzBeanSeat seat =
+            org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
+                .id(560L).storeId(1L).seatTypeConfigId(10L).seatNo("D6").tableNo("D6").enabled(1).build();
+        when(seatMapper.selectById(560L)).thenReturn(seat);
+
+        GzBeanBooking otherGuest = new GzBeanBooking();
+        otherGuest.setId(801L);
+        otherGuest.setUserId(5728L); // 别的顾客
+        otherGuest.setStoreId(1L);
+        otherGuest.setTenantId("1001");
+        otherGuest.setSlotStart(LocalTime.of(15, 0));
+        otherGuest.setSlotEnd(LocalTime.of(17, 0));
+        when(bookingMapper.selectSeatOccupiedNowForUpdate(eq("1001"), eq(1L), eq(560L), any(), any()))
+            .thenReturn(new java.util.ArrayList<>(java.util.List.of(801L)));
+        when(bookingMapper.selectByIds(any())).thenReturn(java.util.List.of(otherGuest));
+
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        ServiceException ex = assertThrows(ServiceException.class, () -> spy.verify(707L, 560L, "staff1"));
+        assertEquals(GzBeanErrorCode.SEAT_TAKEN, ex.getCode());
+        verify(bookingMapper, never()).updateById(any(GzBeanBooking.class));
+    }
+
+    /**
+     * GZ-BEAN-045 边界：同用户前序单被延时到与本单计划区间【真重叠】（occupiedEnd > 本单 slot_start）→ 不排除、仍 SEAT_TAKEN。
+     */
+    @Test
+    @DisplayName("verify · 同用户前序延时到与本单重叠 → 仍 SEAT_TAKEN（不重叠才排除）")
+    void verify_seatTaken_sameUserOverlap_stillBlocked() {
+        GzBeanBooking booking = new GzBeanBooking();
+        booking.setId(708L);
+        booking.setUserId(9132L);
+        booking.setStatus("pending");
+        booking.setPayStatus("paid");
+        booking.setBookingNo("BK20260702000042");
+        booking.setSeatTypeConfigId(10L);
+        booking.setStoreId(1L);
+        booking.setTenantId("1001");
+        booking.setSessDate(LocalDate.of(2099, 1, 1));
+        booking.setSlotStart(LocalTime.of(17, 0));
+        booking.setSlotEnd(LocalTime.of(19, 0));
+        when(bookingMapper.selectById(708L)).thenReturn(booking);
+
+        org.dromara.gz.bean.domain.entity.GzBeanSeat seat =
+            org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
+                .id(561L).storeId(1L).seatTypeConfigId(10L).seatNo("D7").tableNo("D7").enabled(1).build();
+        when(seatMapper.selectById(561L)).thenReturn(seat);
+
+        GzBeanBooking predecessor = new GzBeanBooking();
+        predecessor.setId(802L);
+        predecessor.setUserId(9132L);        // 同用户
+        predecessor.setStoreId(1L);
+        predecessor.setTenantId("1001");
+        predecessor.setSlotStart(LocalTime.of(15, 0));
+        predecessor.setSlotEnd(LocalTime.of(18, 0));  // 延到 18:00 → 与本单 17:00-19:00 重叠
+        when(bookingMapper.selectSeatOccupiedNowForUpdate(eq("1001"), eq(1L), eq(561L), any(), any()))
+            .thenReturn(new java.util.ArrayList<>(java.util.List.of(802L)));
+        when(bookingMapper.selectByIds(any())).thenReturn(java.util.List.of(predecessor));
+
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        ServiceException ex = assertThrows(ServiceException.class, () -> spy.verify(708L, 561L, "staff1"));
+        assertEquals(GzBeanErrorCode.SEAT_TAKEN, ex.getCode());
+        verify(bookingMapper, never()).updateById(any(GzBeanBooking.class));
+    }
+
     // ============================================================
     //  GZ-BEAN-036 按星期 + 时段关闭具体座位（Req3）
     // ============================================================
