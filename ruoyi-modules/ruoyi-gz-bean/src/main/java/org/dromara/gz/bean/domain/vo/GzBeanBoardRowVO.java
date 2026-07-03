@@ -66,9 +66,8 @@ public class GzBeanBoardRowVO implements Serializable {
     private String bookMode;
 
     /**
-     * 看板当前应展示的备注（按占用状态取不同来源）：座位空闲 → {@code gz_bean_seat.remark}（座位永久备注）；
-     * 座位占用（有当前活跃单）→ 该单 {@code gz_bean_booking.board_note}（本次占用备注，放座后座位判回空闲、
-     * 本备注不再展示）。前端据 {@code currentBookingId} 是否有值判定保存到座位还是保存到本单；可空。
+     * 座位备注（{@code gz_bean_seat.remark}）：纯挂座位，与座位是否有人/空闲无关，店员手动填/清，
+     * 座位状态变化（核销 / 放座 / 换单等）绝不自动清理；可空。
      */
     private String remark;
 

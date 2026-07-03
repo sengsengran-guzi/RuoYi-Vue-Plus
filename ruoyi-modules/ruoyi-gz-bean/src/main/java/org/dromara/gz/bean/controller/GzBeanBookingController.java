@@ -16,8 +16,10 @@ import org.dromara.gz.bean.domain.bo.GzBeanBatchSettleBo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingVerifyScanBo;
 import org.dromara.gz.bean.domain.bo.GzBeanBoardNoteBo;
+import org.dromara.gz.bean.domain.bo.GzBeanWalkInBo;
 import org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
+import org.dromara.gz.bean.domain.vo.GzBeanSlotAvailabilityDetailVO;
 import org.dromara.gz.bean.mapper.GzAdminUserStoreMapper;
 import org.dromara.gz.bean.service.IGzBeanBookingService;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -102,6 +104,20 @@ public class GzBeanBookingController extends BaseController {
     }
 
     /**
+     * 直接核销已处理（不分座）（客户 0702 反馈 #3）：待分座单无法正常分座核销时（如客人买双人桌实际坐四人桌、
+     * 钱一样不退款让其游玩），店员点「直接核销已处理」→ status pending→used 但不分座，单从待分座列表 / 看板消失。
+     * 复用 {@code gz:bean:booking:verify} 权限（店员现场操作，与核销同权语义）。
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @Log(title = "拼豆预约直接核销已处理", businessType = BusinessType.UPDATE)
+    @PostMapping("/{id}/mark-handled")
+    public R<GzBeanBookingVO> markHandled(@PathVariable Long id) {
+        String adminUsername = LoginHelper.getUsername();
+        log.info("[bean-booking-admin] mark-handled(no-seat) id={} by={}", id, adminUsername);
+        return R.ok(bookingService.markHandledNoSeat(id, adminUsername));
+    }
+
+    /**
      * 某预约核销分座时<b>可分配的空闲座</b>（ADR-0016 §3）：本店 + 该预约桌型 + 启用，且排除该日该时段
      * 已被占用 / 按星期关闭的座。核销弹窗座位下拉据此只列「点了不报 SEAT_TAKEN」的座，避免店员撞占。
      */
@@ -109,6 +125,21 @@ public class GzBeanBookingController extends BaseController {
     @GetMapping("/{id}/assignable-seats")
     public R<List<GzBeanSeatVO>> assignableSeats(@PathVariable Long id) {
         return R.ok(bookingService.selectAssignableSeats(id));
+    }
+
+    /**
+     * 实时余量表格明细（客户 0702 反馈 #4a）：某门店某日各 (桌型 × 1h 格) 的开放 / 已约 / 关闭 / 剩余数字。
+     *
+     * <p>区别于 mp {@code /app/gz/bean/booking/type-slots}（只给 full 布尔，铁律不向 C 端暴露余量数字）：
+     * 本端点 admin 后台专用，明确回传各数字供店员在表上直观「关 N 个」。复用 {@code gz:bean:booking:list}
+     * 权限（owner + staff 均可读，只读可用性无个人数据）。</p>
+     */
+    @SaCheckPermission("gz:bean:booking:list")
+    @GetMapping("/availability/detail")
+    public R<List<GzBeanSlotAvailabilityDetailVO>> availabilityDetail(
+        @RequestParam Long storeId,
+        @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate sessDate) {
+        return R.ok(bookingService.selectTypeSlotAvailabilityDetail(storeId, sessDate));
     }
 
     /**
@@ -222,17 +253,17 @@ public class GzBeanBookingController extends BaseController {
     }
 
     /**
-     * 看板备注：店员点看板某座位 → 记一条备注。按占用状态分两处存 —— 座位占用中传 {@code bo.bookingId}
-     * （挂本次占用单 board_note，放座后看板不再展示）；座位空闲不传 bookingId（挂 gz_bean_seat.remark，长期留存）。
-     * {@code bo.remark} 传空/空串 = 清空（删除）。复用 {@code gz:bean:booking:verify} 权限（店员可写）。
+     * 看板座位备注：店员点看板某座位 → 记一条备注，纯挂座位（{@code gz_bean_seat.remark}）——
+     * 与座位是否有人/空闲无关，店员手动填/清，座位状态变化不自动清。{@code bo.remark} 传空/空串 = 清空（删除）。
+     * 复用 {@code gz:bean:booking:verify} 权限（店员可写）。
      */
     @SaCheckPermission("gz:bean:booking:verify")
-    @Log(title = "拼豆看板备注", businessType = BusinessType.UPDATE)
+    @Log(title = "拼豆看板座位备注", businessType = BusinessType.UPDATE)
     @PutMapping("/board/seat/{seatId}/note")
     public R<Void> updateBoardNote(@PathVariable Long seatId, @Validated @RequestBody GzBeanBoardNoteBo bo) {
         String adminUsername = LoginHelper.getUsername();
-        log.info("[bean-board-admin] updateBoardNote seatId={} bookingId={} by={}", seatId, bo.getBookingId(), adminUsername);
-        bookingService.updateBoardNote(seatId, bo.getBookingId(), bo.getRemark(), adminUsername);
+        log.info("[bean-board-admin] updateBoardNote seatId={} by={}", seatId, adminUsername);
+        bookingService.updateBoardNote(seatId, bo.getRemark(), adminUsername);
         return R.ok();
     }
 
@@ -248,6 +279,22 @@ public class GzBeanBookingController extends BaseController {
         log.info("[bean-admin-create] storeId={} type={} slot={}-{} by={}",
             bo.getStoreId(), bo.getSeatTypeConfigId(), bo.getSlotStart(), bo.getSlotEnd(), adminUsername);
         return R.ok(bookingService.adminCreateBooking(bo, adminUsername));
+    }
+
+    /**
+     * 看板代客预约一步「建单 + 核销 + 分座」（0702 反馈 #2）：现金散客到店，店员在店内计时看板点某<b>具体空闲座位</b>
+     * → 抽屉填时长 / 手机号 / 免费 / 金额 → 提交即生成 {@code status=used + pay_status=paid + seat_id} 的已核销单，
+     * 座位立刻 in_use 起计时。取代两步式 {@code /admin-create}（先 pending 后核销分座）。复用
+     * {@code gz:bean:booking:verify} 权限（店员现场操作，与核销同权语义）。
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @Log(title = "拼豆看板代客预约", businessType = BusinessType.INSERT)
+    @PostMapping("/board/walk-in")
+    public R<GzBeanBookingVO> boardWalkIn(@Validated @RequestBody GzBeanWalkInBo bo) {
+        String adminUsername = LoginHelper.getUsername();
+        log.info("[bean-walk-in] storeId={} seatId={} slot={}-{} free={} by={}",
+            bo.getStoreId(), bo.getSeatId(), bo.getSlotStart(), bo.getSlotEnd(), bo.getIsFree(), adminUsername);
+        return R.ok(bookingService.walkInCreate(bo, adminUsername));
     }
 
     // ============================================================

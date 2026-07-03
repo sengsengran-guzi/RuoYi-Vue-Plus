@@ -172,13 +172,6 @@ public class GzBeanBooking extends TenantEntity {
     /** 备注 */
     private String remark;
 
-    /**
-     * 看板本次占用备注：店员在店内计时看板给「有人在使用」的座位记录的备注，仅与本次占用（这笔单）有关。
-     * 放座后该座位在看板判回空闲 → 本备注不再展示（纯展示逻辑，不物理删）。与 {@code gz_bean_seat.remark}
-     * （座位永久备注，空闲时显示/编辑）区分。
-     */
-    private String boardNote;
-
     /** 软删（0=正常 / 1=删除） */
     @TableLogic
     private String delFlag;

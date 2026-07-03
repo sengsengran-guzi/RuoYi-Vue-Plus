@@ -491,4 +491,71 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
     int settleAsCompleted(@Param("id") Long id,
                           @Param("verifyTime") LocalDateTime verifyTime,
                           @Param("verifiedBy") String verifiedBy);
+
+    // ============================================================
+    //  拼豆营业额（按天，只统计拼豆；数据源 gz_bean_booking 非支付流水 —— 现金代客单不落 gz_pay_transaction）
+    // ============================================================
+
+    /**
+     * 单日拼豆营业额汇总（数据源 = gz_bean_booking，口径「只统计拼豆」）。
+     *
+     * <p><b>为何用 booking 表不用 gz_pay_transaction</b>：现金代客单（店员看板 walk-in / admin-create）线下收款、
+     * 不走微信支付、不落 {@code gz_pay_transaction}；只查支付流水会漏掉现金单，营业额偏低。故直接对 booking 明细
+     * 聚合，与门店实际收款一致。</p>
+     *
+     * <p><b>计入口径</b>：{@code pay_status='paid'}（已付成功，含线下现金代客）{@code AND is_free=0}（前 N 名免费促销单
+     * amount_cent=0、不计营业额）{@code AND del_flag='0'}。按 {@code sess_date}（服务日）过滤 —— 现金单当天即服务，
+     * 口径自然，无跨日结算问题。</p>
+     *
+     * <p><b>现金 vs 线上拆分</b>：{@code out_trade_no} 非空 = 走微信支付（线上）；为空 = 线下现金收款（代客单）。
+     * 直接反映收款方式，比 {@code source} 列更准（source 只区分下单来源，不区分是否真走微信）。</p>
+     *
+     * <p><b>tenant_id 显式传</b>：与本 mapper 其它直查一致，由 service 从登录态 / store 取 tenant 显式传入，
+     * 不依赖拦截器（保持聚合口径明确）。返回单行聚合结果（无命中时 count/sum 为 0）。</p>
+     *
+     * @param tenantId 租户
+     * @param storeId  门店（null = 全部门店，owner 视角）
+     * @param sessDate 服务日
+     * @return 单行汇总（totalCent / orderCount / cashCent / cashCount / onlineCent / onlineCount）
+     */
+    @Select("<script>" +
+        "SELECT " +
+        "  COALESCE(SUM(amount_cent), 0) AS totalCent, " +
+        "  COUNT(*) AS orderCount, " +
+        "  COALESCE(SUM(CASE WHEN out_trade_no IS NULL THEN amount_cent ELSE 0 END), 0) AS cashCent, " +
+        "  COALESCE(SUM(CASE WHEN out_trade_no IS NULL THEN 1 ELSE 0 END), 0) AS cashCount, " +
+        "  COALESCE(SUM(CASE WHEN out_trade_no IS NOT NULL THEN amount_cent ELSE 0 END), 0) AS onlineCent, " +
+        "  COALESCE(SUM(CASE WHEN out_trade_no IS NOT NULL THEN 1 ELSE 0 END), 0) AS onlineCount " +
+        "FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND sess_date = #{sessDate} " +
+        "  AND pay_status = 'paid' AND is_free = 0 AND del_flag = '0' " +
+        "<if test='storeId != null'> AND store_id = #{storeId} </if>" +
+        "</script>")
+    org.dromara.gz.bean.domain.vo.GzBeanRevenueVO.Summary sumDailyRevenue(@Param("tenantId") String tenantId,
+                                                                          @Param("storeId") Long storeId,
+                                                                          @Param("sessDate") LocalDate sessDate);
+
+    /**
+     * 单日拼豆营业额「按桌型分组」（口径同 {@link #sumDailyRevenue}，多一层 {@code seat_type_snapshot} 分组）。
+     *
+     * <p>桌型名取 {@code seat_type_snapshot}（下单时快照，防 config 改名后历史丢信息）；空快照归入「未知桌型」组
+     * 由 service 兜底显示。按营业额降序，方便 admin 看主力桌型。</p>
+     *
+     * @return 每桌型一行（typeName / totalCent / orderCount）
+     */
+    @Select("<script>" +
+        "SELECT " +
+        "  seat_type_snapshot AS typeName, " +
+        "  COALESCE(SUM(amount_cent), 0) AS totalCent, " +
+        "  COUNT(*) AS orderCount " +
+        "FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND sess_date = #{sessDate} " +
+        "  AND pay_status = 'paid' AND is_free = 0 AND del_flag = '0' " +
+        "<if test='storeId != null'> AND store_id = #{storeId} </if>" +
+        "GROUP BY seat_type_snapshot " +
+        "ORDER BY totalCent DESC" +
+        "</script>")
+    List<org.dromara.gz.bean.domain.vo.GzBeanRevenueVO.TypeGroup> sumDailyRevenueByType(@Param("tenantId") String tenantId,
+                                                                                        @Param("storeId") Long storeId,
+                                                                                        @Param("sessDate") LocalDate sessDate);
 }
