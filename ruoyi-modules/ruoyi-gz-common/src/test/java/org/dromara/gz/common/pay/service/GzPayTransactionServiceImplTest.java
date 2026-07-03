@@ -352,6 +352,46 @@ class GzPayTransactionServiceImplTest {
     }
 
     @Test
+    @DisplayName("加固：out_trade_no 计数器落后 DB 撞 UNIQUE → reconcile 对齐 DB MAX 后重试成功（防「连续冲突」耗尽；prod 部署即自愈，无需人工重置 Redis）")
+    void createBusinessOrder_outTradeNoCollision_reconcilesAndRecovers() {
+        CreateOrderBo bo = CreateOrderBo.builder()
+            .businessType(org.dromara.gz.common.pay.enums.PayBusinessType.PINDOU)
+            .businessOrderNo("BK20260703000009")
+            .amountCent(1500L)
+            .openid("openid_buyer")
+            .userId(2001L)
+            .description("谷子宇宙·拼豆预约")
+            .build();
+
+        // Redis 计数器落后 DB（如 Redis 从旧快照恢复）：第 1 次生成的号已存在 → 撞 UNIQUE；
+        //   reconcile 对齐 DB 当日 MAX 后，第 2 次生成越过已存在序号 → 建单成功。
+        when(orderNoGenerator.generate(org.dromara.gz.common.pay.enums.PayBusinessType.PINDOU))
+            .thenReturn("PINDOU-20260703-000003")   // 撞（DB 已存在）
+            .thenReturn("PINDOU-20260703-000006");  // reconcile 抬计数器后可用
+        doThrow(new org.springframework.dao.DuplicateKeyException(
+                "Duplicate entry 'PINDOU-20260703-000003' for key 'uk_tenant_out_trade_no'"))
+            .doAnswer(inv -> {
+                GzPayTransaction tx = inv.getArgument(0);
+                tx.setId(3009L);
+                return 1;
+            })
+            .when(transactionMapper).insert(any(GzPayTransaction.class));
+        when(wechatPayClient.createJsapiOrder(any())).thenReturn("mock_prepay_x");
+        when(transactionMapper.markPending(eq(3009L), anyString())).thenReturn(1);
+        when(wechatPayClient.buildPayParams(anyString()))
+            .thenReturn(new JsapiPayParams("t", "n", "prepay_id=x", "RSA", "sign_x"));
+
+        MpPayParamsVO vo = service.createBusinessOrder(bo);
+
+        assertNotNull(vo);
+        assertEquals("PINDOU-20260703-000006", vo.getOutTradeNo(), "reconcile 对齐后用可用号建单成功");
+        // 关键：撞号时调了 reconcileOutTradeNoToDbMax 把计数器抬到 DB MAX（否则计数器落后 → N 连撞耗尽报「连续冲突」）
+        verify(orderNoGenerator, times(1))
+            .reconcileOutTradeNoToDbMax(org.dromara.gz.common.pay.enums.PayBusinessType.PINDOU);
+        verify(transactionMapper, times(2)).insert(any(GzPayTransaction.class));
+    }
+
+    @Test
     @DisplayName("PAY-101 AC 2：未知 business_type → IllegalArgumentException（前缀映射缺失早失败）")
     void createBusinessOrder_unknownType_fails() {
         CreateOrderBo bo = CreateOrderBo.builder()

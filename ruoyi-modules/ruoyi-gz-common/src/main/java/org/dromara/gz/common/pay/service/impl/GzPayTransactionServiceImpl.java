@@ -70,8 +70,8 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
 
     /** 测试单有效期（doc/10 §2.E5：5 min 未回调 → timeout） */
     private static final int EXPIRE_MINUTES = 5;
-    /** out_trade_no 撞 UNIQUE 时的重试次数（并发同日同序号兜底） */
-    private static final int OUT_TRADE_NO_RETRY = 3;
+    /** out_trade_no 撞 UNIQUE 时的重试次数（并发同日同序号 + 计数器落后 DB 对齐后自愈的兜底余量） */
+    private static final int OUT_TRADE_NO_RETRY = 5;
 
     private final GzPayTransactionMapper transactionMapper;
     private final GzPayCallbackLogMapper callbackLogMapper;
@@ -194,7 +194,10 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
                 return tx;
             } catch (DuplicateKeyException dup) {
                 lastDup = dup;
-                log.warn("[gz-pay] out_trade_no 撞 UNIQUE 重试 {}/{}：{}", i + 1, OUT_TRADE_NO_RETRY, outTradeNo);
+                // 计数器落后 DB（Redis 与 DB 失同步，如 Redis 从旧快照恢复）→ 抬到 DB 当日 MAX，
+                //   下次重试的 incrementAndGet 越过所有已存在序号自愈，无需人工重置 Redis（GZ-PAY 健壮性）。
+                orderNoGenerator.reconcileOutTradeNoToDbMax(businessType);
+                log.warn("[gz-pay] out_trade_no 撞 UNIQUE，已对齐 DB MAX 重试 {}/{}：{}", i + 1, OUT_TRADE_NO_RETRY, outTradeNo);
             }
         }
         throw new ServiceException("生成订单失败（out_trade_no 连续冲突）", lastDup);

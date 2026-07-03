@@ -89,4 +89,36 @@ public class PayOrderNoGenerator {
         }
         return counter.incrementAndGet();
     }
+
+    /**
+     * 撞 UNIQUE 后对齐序号（GZ-PAY 健壮性）：把当日 out_trade_no 计数器 CAS 抬到不小于 DB 当日 MAX，
+     * 让下次 {@link #generate} 的 {@code incrementAndGet} 越过所有已存在序号。
+     *
+     * <p>补 {@link #nextDailySeq} 只在「计数器 == 0」时播种的盲区：Redis 计数器<b>非零但落后 DB</b>
+     *（如 Redis 从旧 RDB 快照恢复 / 与 DB 失同步）时不会重播种，会持续生成已存在号 → 撞
+     * {@code UNIQUE(tenant_id, out_trade_no)} 耗尽重试报「out_trade_no 连续冲突」。建单撞号分支调用本方法即自愈，
+     * 无需人工重置 Redis。</p>
+     *
+     * @param businessType 业务类型（test / preorder / gacha / pindou）
+     */
+    public void reconcileOutTradeNoToDbMax(String businessType) {
+        String prefix = PayBusinessType.toOutTradePrefix(businessType);
+        String date = LocalDate.now().format(DATE_FMT);
+        String prefixDate = prefix + "-" + date + "-";
+        bumpCounterToAtLeast(SEQ_KEY_PREFIX + prefixDate, transactionMapper.selectMaxDailySeq(prefixDate));
+    }
+
+    /**
+     * CAS 把计数器抬到 {@code >= target}（并发安全：不覆盖别的线程刚 {@code incrementAndGet} 上去的更大值）。
+     */
+    private void bumpCounterToAtLeast(String key, long target) {
+        RAtomicLong counter = redissonClient.getAtomicLong(key);
+        long cur;
+        while ((cur = counter.get()) < target) {
+            if (counter.compareAndSet(cur, target)) {
+                break;
+            }
+        }
+        counter.expire(SEQ_KEY_TTL);
+    }
 }
