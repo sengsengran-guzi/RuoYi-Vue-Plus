@@ -182,33 +182,38 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
     // ============================================================
 
     /**
-     * 具体座位区间互斥防超卖核心查询（GZ-BEAN-024，ADR-0015 §2 / doc/11 §3.6）。
+     * 看板代客预约（walk-in）具体座位区间互斥 guard（GZ-BEAN-024 / GZ-BEAN-045，唯一调用方 {@code walkInCreate}）。
      *
-     * <p>下单<b>同一事务</b>内对单个具体座位 {@code seatId} 当日活跃单 {@code FOR UPDATE} 悲观锁，判请求区间
-     * {@code [reqStart, reqEnd)} 是否与该座任一已占区间重叠。命中任一行（区间重叠）→ 该座已被占，整笔回滚
-     * 拒单（{@link org.dromara.gz.bean.exception.GzBeanErrorCode#SEAT_TAKEN}）；无命中 → 放行 INSERT。
-     * 单维度悲观锁 {@code (store, seat_id, sess_date)}，无需逐格循环加锁（取代 ADR-0011 逐格配额计数）。</p>
+     * <p>店员对物理座位一步「建单 + 核销 + 分座」时，<b>同一事务</b>内对单个具体座位 {@code seatId} 当日活跃单
+     * {@code FOR UPDATE} 悲观锁，判请求区间 {@code [reqStart, reqEnd)} 是否与该座<b>仍在占用</b>的活跃单区间重叠。
+     * 命中 → 该座此区间有人在坐，整笔回滚拒单（{@link org.dromara.gz.bean.exception.GzBeanErrorCode#SEAT_TAKEN}）；
+     * 无命中 → 放行 INSERT。单维度悲观锁 {@code (store, seat_id, sess_date)}，无需逐格加锁。</p>
      *
-     * <p><b>占用止界 = {@code COALESCE(actual_end_slot, slot_end)}</b>（ADR-0015 §2/§5）：未提前放座的活跃单
-     * 按计划 {@code slot_end} 占用；已提前放座的 {@code used} 单按 {@code actual_end_slot} 占用 —— 放座后该座
-     * {@code actual_end_slot} 之后的格立即可被再约。</p>
+     * <p><b>放座即空（GZ-BEAN-045 修正，与核销分座 {@code selectSeatOccupiedNowForUpdate} 同「物理占用」口径对齐）</b>：
+     * 已提前放座 / 结单的 {@code used} 单（{@code actual_end_time IS NOT NULL}）＝客人已离场、店员已释放该座 →
+     * 物理上空闲，代客预约<b>不再</b>视其占座（{@code AND actual_end_time IS NULL} 排除）。
+     * 旧口径用 {@code COALESCE(actual_end_slot, slot_end)} 把放座单锁到整点格（配额账止界，给 mp 线上逐格防超卖用），
+     * 会把「14:00-15:00 单坐到 14:30 放座」的椅子一直锁到 15:00，店员对着看板上显示<b>空闲</b>的座却代客失败报
+     * 「该座位该时段已被预约」——物理分座与配额账分家（memory pindou-verify-assign-present-moment-occupancy），
+     * 此处走物理占用：未放座的活跃单按计划 {@code slot_end} 占，放座即释放。</p>
      *
-     * <p><b>区间重叠判定</b>（doc/11 §3.6 钉死）：{@code reqStart < occEnd AND occStart < reqEnd}，即
-     * {@code slot_start < reqEnd AND COALESCE(actual_end_slot, slot_end) > reqStart}。</p>
+     * <p><b>区间重叠判定</b>：{@code slot_start < reqEnd AND slot_end > reqStart}（占用止界 = 计划 {@code slot_end}，
+     * 因已放座单被 {@code actual_end_time IS NULL} 排除，剩余行 {@code actual_end_slot} 恒为 NULL）。</p>
      *
-     * <p><b>活跃定义</b>（ADR-0007 沿用，不变）：{@code status IN ('pending','used') AND
-     * pay_status IN ('paying','paid')} —— pending（待到店）占计划区间，used（在店使用中 / 未放座）在有效占用
-     * 区间内仍占座；cancelled / no_show / pay_closed / refunded 全部释放。</p>
+     * <p><b>活跃定义</b>：{@code status IN ('pending','used') AND pay_status IN ('paying','paid') AND
+     * actual_end_time IS NULL} —— pending（待到店，本模型 seat_id=NULL 不会命中具体座）/ used 未放座（在店使用中）
+     * 才占座；cancelled / no_show / pay_closed / refunded / 已放座 全部释放。「同座连续两单」中第一单未放座时第二单
+     * 落其区间内仍命中拒单（防超卖不变）；当下物理在座另由 {@code selectSeatOccupiedNowForUpdate} 兜底。</p>
      *
-     * <p><b>tenant_id 显式传</b>：mp 下单事务用户态 JWT 无 tenant，不依赖拦截器自动注入（同 submit 注释），
-     * 由 service 从 store / user 取 tenant 显式传入。</p>
+     * <p><b>tenant_id 显式传</b>：service 从 store / user 取 tenant 显式传入（同 submit 注释）。</p>
      *
-     * @return 命中的活跃 booking id 列表（非空即该座区间被占 → SEAT_TAKEN 拒单）
+     * @return 命中的活跃（未放座）booking id 列表（非空即该座区间有人在坐 → SEAT_TAKEN 拒单）
      */
     @Select("SELECT id FROM gz_bean_booking " +
         "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_id = #{seatId} " +
         "  AND sess_date = #{sessDate} " +
-        "  AND slot_start < #{reqEnd} AND COALESCE(actual_end_slot, slot_end) > #{reqStart} " +
+        "  AND actual_end_time IS NULL " +
+        "  AND slot_start < #{reqEnd} AND slot_end > #{reqStart} " +
         "  AND status IN ('pending','used') AND pay_status IN ('paying','paid') AND del_flag = '0' " +
         "FOR UPDATE")
     List<Long> selectActiveSeatOverlapForUpdate(@Param("tenantId") String tenantId,

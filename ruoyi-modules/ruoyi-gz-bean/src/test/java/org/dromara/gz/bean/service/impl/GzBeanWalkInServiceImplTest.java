@@ -183,9 +183,10 @@ class GzBeanWalkInServiceImplTest {
                     boolean activeStatus = "pending".equals(b.getStatus()) || "used".equals(b.getStatus());
                     boolean activePay = "paying".equals(b.getPayStatus()) || "paid".equals(b.getPayStatus());
                     if (!activeStatus || !activePay) continue;
-                    LocalTime occEnd = b.getActualEndSlot() != null ? b.getActualEndSlot() : b.getSlotEnd();
-                    // 与 mapper @Select 同谓词：slot_start < reqEnd AND COALESCE(actual_end_slot,slot_end) > reqStart
-                    if (b.getSlotStart().isBefore(reqEnd) && occEnd.isAfter(reqStart)) {
+                    // 与 mapper @Select 同谓词（GZ-BEAN-045）：actual_end_time IS NULL AND slot_start < reqEnd AND slot_end > reqStart。
+                    // 已放座单（actual_end_time 非空）= 物理释放 → 不占座（放座即空，与看板「空闲」一致）。
+                    if (b.getActualEndTime() != null) continue;
+                    if (b.getSlotStart().isBefore(reqEnd) && b.getSlotEnd().isAfter(reqStart)) {
                         hits.add(b.getId());
                     }
                 }
@@ -264,6 +265,40 @@ class GzBeanWalkInServiceImplTest {
         assertEquals(GzBeanErrorCode.SEAT_TAKEN, ex.getCode());
         // 第二单被挡：内存库仍只有 1 条（未误入库超卖）
         assertEquals(1, memBookings.size(), "第二单必须被 SEAT_TAKEN 挡住，不得入库（防超卖）");
+    }
+
+    @Test
+    @DisplayName("★放座即空 · 座位放座（提前离场/结单）后同座同区间可再代客（GZ-BEAN-045：修「看板显示空闲却报『该座位该时段已被预约』」）")
+    void walkIn_releasedSeat_reBookAllowed() {
+        // 第一单 14:00-16:00 成功入库（used，未放座）
+        service.walkInCreate(walkInBo(T14, T16, false, null), "staff1");
+        assertEquals(1, memBookings.size());
+        GzBeanBooking first = memBookings.get(0);
+
+        // 客人离场，店员放座：写 actual_end_time（+ 整点配额止界 actual_end_slot），status 仍 used（已用记录）。
+        // 看板据 actual_end_time 非空即显「空闲」——放座即空。
+        first.setActualEndTime(java.time.LocalDateTime.of(DATE, LocalTime.of(14, 30)));
+        first.setActualEndSlot(T15);
+
+        // 新客到店，店员点看板「空闲」的同座、同区间 14:00-15:00 再代客 →
+        // 放座单已释放（actual_end_time 非空被 overlap 查询排除）→ 放行，不再误报 SEAT_TAKEN。
+        // 旧口径 COALESCE(actual_end_slot=15:00, slot_end) 会把放座单锁到 15:00 → 误报，本测锁死回归。
+        GzBeanBookingVO vo2 = service.walkInCreate(walkInBo(T14, T15, false, null), "staff2");
+        assertNotNull(vo2);
+        assertEquals(2, memBookings.size(), "放座后该座物理空闲，同区间应可再代客（放座即空，与看板『空闲』一致）");
+        assertEquals("used", memBookings.get(1).getStatus());
+    }
+
+    @Test
+    @DisplayName("防超卖不回退 · 同座第一单『未放座』时第二单重叠仍 SEAT_TAKEN（只排除已放座，不放水占用中的座）")
+    void walkIn_unreleasedSeatOverlap_stillRejected() {
+        // 第一单 14:00-16:00 入库（used，actual_end_time 为空 = 仍在店占用）
+        service.walkInCreate(walkInBo(T14, T16, false, null), "staff1");
+        // 第二单同座 14:00-15:00 落在第一单未放座区间内 → 仍命中 overlap → SEAT_TAKEN（防超卖不因本次修改回退）
+        ServiceException ex = assertThrows(ServiceException.class,
+            () -> service.walkInCreate(walkInBo(T14, T15, false, null), "staff2"));
+        assertEquals(GzBeanErrorCode.SEAT_TAKEN, ex.getCode());
+        assertEquals(1, memBookings.size(), "未放座的座仍占用，第二单必须被挡（放座即空 ≠ 占用中放水）");
     }
 
     @Test

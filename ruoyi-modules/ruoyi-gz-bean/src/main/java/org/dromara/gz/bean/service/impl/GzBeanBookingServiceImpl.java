@@ -2352,8 +2352,10 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
 
         // ③ 座位级占用 guard（复用核销分座同款，不走桌型配额）：Redis seat 锁 + FOR UPDATE 双保险，
         //    ③a 当下物理在座（selectSeatOccupiedNowForUpdate，分钟精度，放座即空）+ ③b 该座 [slotStart,slotEnd) 区间
-        //    与活跃单重叠（selectActiveSeatOverlapForUpdate，止界 COALESCE(actual_end_slot,slot_end)）。任一命中 → SEAT_TAKEN。
-        //    区间重叠是「同座连续两单」防超卖真源（第二单区间落在第一单未结束区间内 → 命中拒单）。
+        //    与「未放座」活跃单重叠（selectActiveSeatOverlapForUpdate，止界 = 计划 slot_end，放座单 actual_end_time
+        //    IS NOT NULL 已排除）。任一命中 → SEAT_TAKEN。区间重叠是「同座连续两单」防超卖真源（第二单区间落在第一单
+        //    未结束区间内 → 命中拒单）；已放座单 = 客人离场、座位释放 → 不占座，店员可对看板「空闲」座立即再代客
+        //    （GZ-BEAN-045：物理分座与配额账分家，放座即空，不再被整点配额止界锁死）。
         String seatLockKey = LOCK_SEAT_PREFIX + bo.getStoreId() + ":" + bo.getSeatId() + ":" + bo.getSessDate();
         if (!tryAcquireRedisLock(seatLockKey)) {
             log.info("[bean-walk-in] seat lock taken storeId={} seatId={} date={}",
