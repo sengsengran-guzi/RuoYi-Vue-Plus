@@ -20,7 +20,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.ExtendWith;
+
+import java.util.concurrent.TimeUnit;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -37,36 +40,32 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * 看板代客预约 walk-in 集成测试（0702 反馈 #2）—— 一步「建单 + 核销 + 分座」 + 防超卖。
+ * 看板代客预约 walk-in 集成测试（0702 反馈 #2；GZ-BEAN-046 松绑重写）。
  *
- * <p><b>为什么这是「集成」而非纯 mock</b>：普通全 stub 单测照不出防超卖（第二单该被 SEAT_TAKEN 挡住）—— 因为
- * {@code selectActiveSeatOverlapForUpdate} 被 stub 返回空就永远放行。本测用<b>内存版 booking 库</b>接管
- * {@code bookingMapper.insert} + {@code selectActiveSeatOverlapForUpdate}：insert 落进 in-memory list，
- * overlap 查询跑<b>真实区间重叠谓词</b>（{@code slot_start < reqEnd AND COALESCE(actual_end_slot,slot_end) > reqStart
- * AND status IN (pending,used) AND pay_status IN (paying,paid)}，与 mapper 的 @Select SQL 一字不差）对内存库判定。
- * 于是「同座连续两单」第一单入库后，第二单 overlap 查得到第一单 → SEAT_TAKEN，真实防超卖。</p>
+ * <p><b>GZ-BEAN-046 甲方口径</b>：代客预约「时间限制不要那么严、座位只判是否空闲、给店员充足操作空间」+「时间精确到分钟」。
+ * 因此本轮重写把座位冲突从「③a 当下物理在座 + ③b 整点区间重叠」收敛为<b>只剩 ③a</b>
+ * （{@code selectSeatOccupiedNowForUpdate}）—— 此刻这把椅子没人坐即可代客，不再做整点区间重叠校验；时间放开到<b>分钟精度</b>
+ * （仅 {@code start < end}，不要求整点 / 营业窗口），计价按<b>跨越的整点格数</b>（{@code floor(start)} 逐 1h 到 {@code < end}）。</p>
  *
- * <p><b>顺带守住 memory version-entity-insert-then-updatebyid-noop 回归</b>：overlap 查询以 {@code seat_id} 为键，
- * 若实现退回「insert(seat_id=null) 后 updateById(seat_id)」老坑（seat_id 不落库），内存库第一单 seat_id=null →
- * overlap 查不到 → 第二单误放行 → 本测「第二单 SEAT_TAKEN」断言会失败逮住它。同时显式断言首单入库实体 seat_id 已配齐、
- * 且核销分座路径<b>不</b>调 {@code updateById}（一次 insert）。</p>
- *
- * <p>真 MySQL 的 InnoDB {@code FOR UPDATE} 并发串行化由 Tier 1B kevin-qa curl 端到端覆盖（本模块 test 无 MySQL 驱动，
- * 不引新依赖；service 层业务正确性 + 防超卖谓词在此层证毕）。</p>
+ * <p><b>为什么座位冲突改用 mock 断言而非内存库真谓词</b>：区间重叠防超卖（旧 ③b）已删，座位唯一硬约束是「当下物理在座」，
+ * 由 {@code selectSeatOccupiedNowForUpdate} 判定（真库 FOR UPDATE + Redis 锁串行化由 Tier 1B / staging 覆盖）。
+ * 本层证 service 业务正确性：空闲即放行（即便同座同区间已有活跃单，只要此刻没人坐）、当下在座即 SEAT_TAKEN、
+ * 分钟精度存取、按整点格计价。<b>顺带守住 memory version-entity-insert-then-updatebyid-noop</b>：断言一次 insert 就带
+ * seat_id、绝不 updateById 补。</p>
  */
 @Tag("dev")
-@DisplayName("GzBeanBookingServiceImpl walk-in 看板代客预约集成测试（0702 #2）")
+@DisplayName("GzBeanBookingServiceImpl walk-in 看板代客预约集成测试（GZ-BEAN-046 松绑 + 分钟精度）")
 @ExtendWith(MockitoExtension.class)
 class GzBeanWalkInServiceImplTest {
 
     @Mock private GzBeanBookingMapper bookingMapper;
+    @Mock private org.dromara.gz.bean.mapper.GzBeanBookingGroupMapper bookingGroupMapper;
     @Mock private GzBeanBookingLogMapper bookingLogMapper;
     @Mock private GzBeanStoreMapper storeMapper;
     @Mock private GzUserMapper gzUserMapper;
@@ -85,7 +84,7 @@ class GzBeanWalkInServiceImplTest {
     private QrCodeSigner qrCodeSigner;
     private GzBeanBookingServiceImpl service;
 
-    /** 内存版 booking 库：insert 落这里，overlap 查询跑真实谓词判定 */
+    /** 内存版 booking 库：insert 落这里，供断言 saved 实体字段 + 「空闲即放行」多单场景 */
     private final List<GzBeanBooking> memBookings = new ArrayList<>();
     private final AtomicLong idSeq = new AtomicLong(1000L);
 
@@ -94,8 +93,15 @@ class GzBeanWalkInServiceImplTest {
     private static final Long SEAT_ID = 13L;    // S1
     private static final LocalDate DATE = LocalDate.of(2026, 7, 10); // 周五
     private static final LocalTime T14 = LocalTime.of(14, 0);
-    private static final LocalTime T15 = LocalTime.of(15, 0);
     private static final LocalTime T16 = LocalTime.of(16, 0);
+    private static final LocalTime T1634 = LocalTime.of(16, 34);
+    private static final LocalTime T1700 = LocalTime.of(17, 0);
+    private static final LocalTime T1750 = LocalTime.of(17, 50);
+    private static final LocalTime T2200 = LocalTime.of(22, 0);
+    private static final LocalTime T2300 = LocalTime.of(23, 0);
+    private static final LocalTime T2330 = LocalTime.of(23, 30);
+    private static final LocalTime T2301 = LocalTime.of(23, 1);
+    private static final LocalTime T2359 = LocalTime.of(23, 59);
 
     @BeforeEach
     void setUp() {
@@ -103,19 +109,17 @@ class GzBeanWalkInServiceImplTest {
         props.setSigningSecret("unit-test-secret");
         qrCodeSigner = new QrCodeSigner(props);
         GzBeanBookingServiceImpl real = new GzBeanBookingServiceImpl(
-            bookingMapper, bookingLogMapper, storeMapper, gzUserMapper, qrCodeSigner,
+            bookingMapper, bookingGroupMapper, bookingLogMapper, storeMapper, gzUserMapper, qrCodeSigner,
             seatTypeConfigMapper, seatMapper, seatTypePriceMapper, timeSlotTemplateMapper, freePromoService,
             seatClosureService, slotQuotaCloseService, payServiceProvider, couponServiceProvider,
             payRefundServiceProvider, configService
         );
-        // spy → override protected Redis 锁（离 Spring 无 Redisson）+ 释放锁 no-op（否则 registerLockReleaseOnTxEnd
-        // 无事务分支会调 releaseRedisLock → RedisUtils 静态初始化炸 NoClassDefFound）
+        // spy → override protected Redis 锁（离 Spring 无 Redisson）+ 释放锁 no-op
         service = org.mockito.Mockito.spy(real);
         lenient().doReturn(true).when(service).tryAcquireRedisLock(anyString());
         lenient().doNothing().when(service).releaseRedisLock(anyString());
         lenient().when(seatTypePriceMapper.selectByConfig(anyLong())).thenReturn(List.of());
 
-        // 门店 + 桌型档 + 座位（lenient：座位停用/跨店等 early-exit 用例不会走到全部 stub）
         GzBeanStore store = new GzBeanStore();
         store.setId(STORE_ID);
         store.setTenantId("1001");
@@ -141,7 +145,7 @@ class GzBeanWalkInServiceImplTest {
         config.setEnabled(1);
         lenient().when(seatTypeConfigMapper.selectById(CONFIG_ID)).thenReturn(config);
 
-        // 营业窗口 10:00-22:00 全周启用 → 14/15/16 均可约
+        // 营业窗口 mock（松绑后 walk-in 不再校验窗口，但保留 lenient 兼容其它路径）
         GzBeanTimeSlotTemplate window = new GzBeanTimeSlotTemplate();
         window.setStoreId(STORE_ID);
         window.setStartTime(LocalTime.of(10, 0));
@@ -151,7 +155,7 @@ class GzBeanWalkInServiceImplTest {
         window.setSortNo(0);
         lenient().when(timeSlotTemplateMapper.selectList(any())).thenReturn(List.of(window));
 
-        // 线下散客占位用户（resolveProxyBookingUserId 无 mobile 走占位）
+        // 线下散客占位用户
         lenient().when(gzUserMapper.selectOne(any())).thenReturn(null);
         lenient().when(gzUserMapper.insert(any(GzUser.class))).thenAnswer(inv -> {
             GzUser u = inv.getArgument(0);
@@ -159,44 +163,17 @@ class GzBeanWalkInServiceImplTest {
             return 1;
         });
 
-        // ── 内存 booking 库接管 insert + overlap 查询 ──
+        // insert → 落内存库
         lenient().when(bookingMapper.insert(any(GzBeanBooking.class))).thenAnswer(inv -> {
             GzBeanBooking b = inv.getArgument(0);
             b.setId(idSeq.incrementAndGet());
             memBookings.add(b);
             return 1;
         });
-        lenient().when(bookingMapper.selectActiveSeatOverlapForUpdate(anyString(), anyLong(), anyLong(), any(), any(), any()))
-            .thenAnswer(inv -> {
-                String tenant = inv.getArgument(0);
-                Long storeId = inv.getArgument(1);
-                Long seatId = inv.getArgument(2);
-                LocalDate sessDate = inv.getArgument(3);
-                LocalTime reqStart = inv.getArgument(4);
-                LocalTime reqEnd = inv.getArgument(5);
-                List<Long> hits = new ArrayList<>();
-                for (GzBeanBooking b : memBookings) {
-                    if (!tenant.equals(b.getTenantId())) continue;
-                    if (!storeId.equals(b.getStoreId())) continue;
-                    if (b.getSeatId() == null || !seatId.equals(b.getSeatId())) continue;
-                    if (!sessDate.equals(b.getSessDate())) continue;
-                    boolean activeStatus = "pending".equals(b.getStatus()) || "used".equals(b.getStatus());
-                    boolean activePay = "paying".equals(b.getPayStatus()) || "paid".equals(b.getPayStatus());
-                    if (!activeStatus || !activePay) continue;
-                    // 与 mapper @Select 同谓词（GZ-BEAN-045）：actual_end_time IS NULL AND slot_start < reqEnd AND slot_end > reqStart。
-                    // 已放座单（actual_end_time 非空）= 物理释放 → 不占座（放座即空，与看板「空闲」一致）。
-                    if (b.getActualEndTime() != null) continue;
-                    if (b.getSlotStart().isBefore(reqEnd) && b.getSlotEnd().isAfter(reqStart)) {
-                        hits.add(b.getId());
-                    }
-                }
-                return hits;
-            });
-        // 当下物理在座（分钟精度）：sessDate=未来 → slot_end>now 恒不命中当天时钟；本测聚焦区间重叠防超卖，
-        // present-moment guard 恒返空（未来日无人在座）。
+        // ③a 座位唯一硬约束：当下物理在座（默认空 = 此刻没人坐，可代客；未来日无人在座天然为空）
         lenient().when(bookingMapper.selectSeatOccupiedNowForUpdate(anyString(), anyLong(), anyLong(), any(), any()))
             .thenReturn(List.of());
-        // selectVoById 从内存库回填一个精简 VO
+        // selectVoById 从内存库回填精简 VO
         lenient().when(bookingMapper.selectVoById(anyLong())).thenAnswer(inv -> {
             Long id = inv.getArgument(0);
             GzBeanBookingVO vo = new GzBeanBookingVO();
@@ -229,15 +206,18 @@ class GzBeanWalkInServiceImplTest {
     }
 
     @Test
-    @DisplayName("happy · 一步建单核销分座 → status=used / pay_status=paid / seat_id 已配齐 / source=walk_in / 逐格计价")
-    void walkIn_happy() {
-        GzBeanBookingVO vo = service.walkInCreate(walkInBo(T14, T16, false, null), "staff1");
+    @DisplayName("★分钟精度 happy · 16:34-17:50 → used/paid/seat_id 配齐、slot 存分钟原值、按跨越整点格计价（16、17 两格 = 2×5000）")
+    void walkIn_happyMinutePrecise() {
+        GzBeanBookingVO vo = service.walkInCreate(walkInBo(T1634, T1750, false, null), "staff1");
 
         assertNotNull(vo);
         assertEquals(1, memBookings.size());
         GzBeanBooking saved = memBookings.get(0);
-        // ★ 一次 insert 配齐全字段（memory version-noop 防回归）：seat_id 已落，状态/支付/核销信息齐
-        assertEquals(SEAT_ID, saved.getSeatId(), "首单必须一次 insert 就带上 seat_id（严禁 insert 后 updateById 补）");
+        // ★ 分钟精度原样存（不被 floor 到整点）——店员端计时 / 展示按分钟走
+        assertEquals(T1634, saved.getSlotStart(), "slot_start 必须存分钟原值 16:34（松绑后不整点化）");
+        assertEquals(T1750, saved.getSlotEnd(), "slot_end 必须存分钟原值 17:50");
+        // ★ 一次 insert 配齐 seat_id（memory version-noop 防回归）
+        assertEquals(SEAT_ID, saved.getSeatId());
         assertEquals("S1", saved.getSeatNoSnapshot());
         assertEquals("used", saved.getStatus());
         assertEquals("paid", saved.getPayStatus());
@@ -245,77 +225,98 @@ class GzBeanWalkInServiceImplTest {
         assertNotNull(saved.getVerifyTime());
         assertEquals("staff1", saved.getVerifiedBy());
         assertEquals(0, saved.getIsFree());
-        // 逐格计价：14-16 两格 × 基础价 5000 = 10000（priceRows 空 → 回退 config.priceCent）
+        // 计价按跨越的整点格：16:34-17:50 触及 16:00、17:00 两格 × 基础价 5000 = 10000（priceRows 空 → 回退 config.priceCent）
         assertEquals(10000L, saved.getAmountCent());
-        // ★ 核销分座走一次 insert，绝不 updateById（否则触 @Version 静默不落坑）
+        // ★ 一次 insert，绝不 updateById（防 @Version 静默不落坑）
         verify(bookingMapper, never()).updateById(any(GzBeanBooking.class));
         verify(bookingMapper).insert(any(GzBeanBooking.class));
     }
 
     @Test
-    @DisplayName("★防超卖 · 同座连续两单（区间重叠）→ 第二单 SEAT_TAKEN 4002（mock 全 stub 照不出，靠内存库真谓词逮住）")
-    void walkIn_sameSeatOverlap_secondRejected() {
-        // 第一单 14:00-16:00 成功入库（used）
+    @DisplayName("整点 happy · 14:00-16:00 → 两整点格 = 2×5000（整点区间仍按格计价，兼容旧行为）")
+    void walkIn_happyWholeHour() {
+        service.walkInCreate(walkInBo(T14, T16, false, null), "staff1");
+        GzBeanBooking saved = memBookings.get(0);
+        assertEquals(T14, saved.getSlotStart());
+        assertEquals(10000L, saved.getAmountCent());
+    }
+
+    @Test
+    @DisplayName("不满整点计价 · 16:34-17:00 → 只触及 16:00 一格 = 1×5000（floor(start) 逐格到 <end）")
+    void walkIn_partialHourBilling() {
+        service.walkInCreate(walkInBo(T1634, T1700, false, null), "staff1");
+        GzBeanBooking saved = memBookings.get(0);
+        assertEquals(5000L, saved.getAmountCent(), "16:34-17:00 只触及 16:00 格 = 1 格价");
+    }
+
+    // ── ★午夜环绕死循环回归（GZ-BEAN-046 对抗审查逮到的 blocker）──
+    // expandWalkInPricingSlots 曾用 LocalTime.plusHours(1) 迭代：到 23:00 后环绕成 00:00，slotEnd∈(23:00,24:00) 时死循环。
+    // @Timeout 兜底：若回退到环绕死循环，测试超时失败而非吊死整个构建。
+
+    @Test
+    @Timeout(value = 5, unit = TimeUnit.SECONDS)
+    @DisplayName("★午夜边界 · 23:30-23:59 → 只触及 23:00 一格（必须终止，不得死循环）")
+    void walkIn_lateNight_2330_2359_terminates() {
+        service.walkInCreate(walkInBo(T2330, T2359, false, null), "staff1");
+        GzBeanBooking saved = memBookings.get(0);
+        assertEquals(T2330, saved.getSlotStart());
+        assertEquals(T2359, saved.getSlotEnd());
+        assertEquals(5000L, saved.getAmountCent(), "23:30-23:59 只触及 23:00 格 = 1 格价");
+    }
+
+    @Test
+    @Timeout(value = 5, unit = TimeUnit.SECONDS)
+    @DisplayName("★午夜边界 · 23:00-23:01 → 只触及 23:00 一格（末格窄区间，必须终止）")
+    void walkIn_lateNight_2300_2301_terminates() {
+        service.walkInCreate(walkInBo(T2300, T2301, false, null), "staff1");
+        assertEquals(5000L, memBookings.get(0).getAmountCent());
+    }
+
+    @Test
+    @Timeout(value = 5, unit = TimeUnit.SECONDS)
+    @DisplayName("★午夜边界 · 22:00-23:59 → 触及 22、23 两格 = 2×5000（跨到末格，必须终止）")
+    void walkIn_lateNight_2200_2359_terminates() {
+        service.walkInCreate(walkInBo(T2200, T2359, false, null), "staff1");
+        assertEquals(10000L, memBookings.get(0).getAmountCent(), "22:00-23:59 触及 22、23 两格 = 2 格价");
+    }
+
+    @Test
+    @DisplayName("★松绑 · 座位「当下空闲」即放行——同座同区间可再代客（区间重叠不再拦，GZ-BEAN-046 只判是否空闲）")
+    void walkIn_seatFreeNow_allowedEvenIfOverlappingBookingExists() {
+        // 第一单 14:00-16:00 成功入库
         service.walkInCreate(walkInBo(T14, T16, false, null), "staff1");
         assertEquals(1, memBookings.size());
-
-        // 第二单同座 14:00-15:00（落在第一单区间内）→ overlap 命中 → SEAT_TAKEN
-        ServiceException ex = assertThrows(ServiceException.class,
-            () -> service.walkInCreate(walkInBo(T14, T15, false, null), "staff2"));
-        assertEquals(GzBeanErrorCode.SEAT_TAKEN, ex.getCode());
-        // 第二单被挡：内存库仍只有 1 条（未误入库超卖）
-        assertEquals(1, memBookings.size(), "第二单必须被 SEAT_TAKEN 挡住，不得入库（防超卖）");
-    }
-
-    @Test
-    @DisplayName("★放座即空 · 座位放座（提前离场/结单）后同座同区间可再代客（GZ-BEAN-045：修「看板显示空闲却报『该座位该时段已被预约』」）")
-    void walkIn_releasedSeat_reBookAllowed() {
-        // 第一单 14:00-16:00 成功入库（used，未放座）
-        service.walkInCreate(walkInBo(T14, T16, false, null), "staff1");
-        assertEquals(1, memBookings.size());
-        GzBeanBooking first = memBookings.get(0);
-
-        // 客人离场，店员放座：写 actual_end_time（+ 整点配额止界 actual_end_slot），status 仍 used（已用记录）。
-        // 看板据 actual_end_time 非空即显「空闲」——放座即空。
-        first.setActualEndTime(java.time.LocalDateTime.of(DATE, LocalTime.of(14, 30)));
-        first.setActualEndSlot(T15);
-
-        // 新客到店，店员点看板「空闲」的同座、同区间 14:00-15:00 再代客 →
-        // 放座单已释放（actual_end_time 非空被 overlap 查询排除）→ 放行，不再误报 SEAT_TAKEN。
-        // 旧口径 COALESCE(actual_end_slot=15:00, slot_end) 会把放座单锁到 15:00 → 误报，本测锁死回归。
-        GzBeanBookingVO vo2 = service.walkInCreate(walkInBo(T14, T15, false, null), "staff2");
+        // 第二单同座、落在第一单区间内 14:00-16:00 —— 当下物理在座 mock 恒空（此刻没人坐）→ 放行
+        // （旧 ③b 会 SEAT_TAKEN，松绑后区间重叠不再拦：店员对物理座现场判断为准）
+        GzBeanBookingVO vo2 = service.walkInCreate(walkInBo(T14, T16, false, null), "staff2");
         assertNotNull(vo2);
-        assertEquals(2, memBookings.size(), "放座后该座物理空闲，同区间应可再代客（放座即空，与看板『空闲』一致）");
-        assertEquals("used", memBookings.get(1).getStatus());
+        assertEquals(2, memBookings.size(), "座位当下空闲即可再代客，区间重叠不再拦（松绑）");
     }
 
     @Test
-    @DisplayName("防超卖不回退 · 同座第一单『未放座』时第二单重叠仍 SEAT_TAKEN（只排除已放座，不放水占用中的座）")
-    void walkIn_unreleasedSeatOverlap_stillRejected() {
-        // 第一单 14:00-16:00 入库（used，actual_end_time 为空 = 仍在店占用）
-        service.walkInCreate(walkInBo(T14, T16, false, null), "staff1");
-        // 第二单同座 14:00-15:00 落在第一单未放座区间内 → 仍命中 overlap → SEAT_TAKEN（防超卖不因本次修改回退）
+    @DisplayName("座位当下有人在坐 → SEAT_TAKEN（唯一硬约束：此刻这把椅子不能有人坐）")
+    void walkIn_seatOccupiedNow_rejected() {
+        when(bookingMapper.selectSeatOccupiedNowForUpdate(anyString(), anyLong(), anyLong(), any(), any()))
+            .thenReturn(List.of(777L));
         ServiceException ex = assertThrows(ServiceException.class,
-            () -> service.walkInCreate(walkInBo(T14, T15, false, null), "staff2"));
+            () -> service.walkInCreate(walkInBo(T1634, T1750, false, null), "staff1"));
         assertEquals(GzBeanErrorCode.SEAT_TAKEN, ex.getCode());
-        assertEquals(1, memBookings.size(), "未放座的座仍占用，第二单必须被挡（放座即空 ≠ 占用中放水）");
+        assertTrue(memBookings.isEmpty(), "此刻有人在坐，必须挡住不入库");
     }
 
     @Test
-    @DisplayName("防超卖 · 同座相邻不重叠续坐 → 第二单放行（back-to-back 端点相接不算重叠）")
-    void walkIn_sameSeatBackToBack_secondAllowed() {
-        // 第一单 14:00-15:00
-        service.walkInCreate(walkInBo(T14, T15, false, null), "staff1");
-        // 第二单 15:00-16:00（端点相接，[14,15) 与 [15,16) 不重叠）→ 放行
-        GzBeanBookingVO vo2 = service.walkInCreate(walkInBo(T15, T16, false, null), "staff2");
-        assertNotNull(vo2);
-        assertEquals(2, memBookings.size());
+    @DisplayName("非法区间 · start >= end → SLOT_RANGE_INVALID（唯一时间校验）")
+    void walkIn_invalidInterval_rejected() {
+        ServiceException ex = assertThrows(ServiceException.class,
+            () -> service.walkInCreate(walkInBo(T1700, T1634, false, null), "staff1"));
+        assertEquals(GzBeanErrorCode.SLOT_RANGE_INVALID, ex.getCode());
+        assertTrue(memBookings.isEmpty());
     }
 
     @Test
     @DisplayName("免费单 → amount_cent=0 / is_free=1（不计营业额 GMV）")
     void walkIn_free() {
-        service.walkInCreate(walkInBo(T14, T15, true, null), "staff1");
+        service.walkInCreate(walkInBo(T1634, T1750, true, null), "staff1");
         GzBeanBooking saved = memBookings.get(0);
         assertEquals(0L, saved.getAmountCent());
         assertEquals(1, saved.getIsFree());
@@ -324,7 +325,7 @@ class GzBeanWalkInServiceImplTest {
     @Test
     @DisplayName("金额覆写 → 店员议价/抹零，amount_cent 用入参（非逐格求和）")
     void walkIn_amountOverride() {
-        service.walkInCreate(walkInBo(T14, T16, false, 8888L), "staff1");
+        service.walkInCreate(walkInBo(T1634, T1750, false, 8888L), "staff1");
         GzBeanBooking saved = memBookings.get(0);
         assertEquals(8888L, saved.getAmountCent());
     }
@@ -341,7 +342,7 @@ class GzBeanWalkInServiceImplTest {
         when(seatMapper.selectById(SEAT_ID)).thenReturn(disabled);
 
         ServiceException ex = assertThrows(ServiceException.class,
-            () -> service.walkInCreate(walkInBo(T14, T15, false, null), "staff1"));
+            () -> service.walkInCreate(walkInBo(T1634, T1750, false, null), "staff1"));
         assertEquals(GzBeanErrorCode.SEAT_DISABLED, ex.getCode());
         assertTrue(memBookings.isEmpty());
     }
@@ -351,14 +352,14 @@ class GzBeanWalkInServiceImplTest {
     void walkIn_seatWrongStore() {
         GzBeanSeat otherStore = new GzBeanSeat();
         otherStore.setId(SEAT_ID);
-        otherStore.setStoreId(2L);   // 别店
+        otherStore.setStoreId(2L);
         otherStore.setSeatTypeConfigId(CONFIG_ID);
         otherStore.setSeatNo("S1");
         otherStore.setEnabled(1);
         when(seatMapper.selectById(SEAT_ID)).thenReturn(otherStore);
 
         ServiceException ex = assertThrows(ServiceException.class,
-            () -> service.walkInCreate(walkInBo(T14, T15, false, null), "staff1"));
+            () -> service.walkInCreate(walkInBo(T1634, T1750, false, null), "staff1"));
         assertEquals(GzBeanErrorCode.SEAT_TAKEN, ex.getCode());
     }
 }

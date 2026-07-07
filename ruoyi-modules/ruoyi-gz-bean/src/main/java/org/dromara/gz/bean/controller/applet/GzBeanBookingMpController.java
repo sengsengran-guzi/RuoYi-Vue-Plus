@@ -13,6 +13,7 @@ import org.dromara.gz.bean.domain.bo.GzBeanBookingVerifyScanBo;
 import org.dromara.gz.bean.domain.bo.GzBeanDayPassSubmitBo;
 import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
+import org.dromara.gz.bean.domain.vo.GzBeanBookingGroupVO;
 import org.dromara.gz.bean.domain.vo.GzBeanDayPassOptionVO;
 import org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatMapVO;
@@ -99,6 +100,23 @@ public class GzBeanBookingMpController {
         log.info("[bean-booking-mp] paid-submit userId={} storeId={} seatTypeConfigId={} sessDate={} slotStart={} couponId={}",
             userId, bo.getStoreId(), bo.getSeatTypeConfigId(), bo.getSessDate(), bo.getSlotStart(), bo.getCouponId());
         return R.ok(bookingService.submitPaid(bo, userId));
+    }
+
+    /**
+     * POST /app/gz/bean/booking/group-submit — 组单预订下单（ADR-0018 §1）
+     * 一家带 N 个孩子：一次订 unitCount 个单位（同桌型 + 同区间）→ 拆 N 子单 + 1 组，支付一次挂组。
+     * 组单不用券、不吃前 N 名免费促销（全价）。防超卖 = 逐格配额原子扣 N 份，任一格不足 → 4011 QUOTA_FULL。
+     */
+    @PostMapping("/group-submit")
+    @Log(title = "拼豆组单预订下单(mp)", businessType = BusinessType.INSERT)
+    public R<GzBeanPaidSubmitVO> groupSubmit(@Valid @RequestBody org.dromara.gz.bean.domain.bo.GzBeanPaidGroupSubmitBo bo) {
+        Long userId = LoginHelper.getUserId();
+        if (userId == null) {
+            return R.fail(401, "未登录");
+        }
+        log.info("[bean-booking-mp] group-submit userId={} storeId={} seatTypeConfigId={} sessDate={} slot={}-{} n={}",
+            userId, bo.getStoreId(), bo.getSeatTypeConfigId(), bo.getSessDate(), bo.getSlotStart(), bo.getSlotEnd(), bo.getUnitCount());
+        return R.ok(bookingService.submitPaidGroup(bo, userId));
     }
 
     /**
@@ -262,6 +280,23 @@ public class GzBeanBookingMpController {
     }
 
     /**
+     * 组单详情（ADR-0018 §1 客户 7.07「多人单显示为一笔」，A 档）：按组 PK 查组头 + N 子单聚合，仅本人可看。
+     * mp 组单支付后跳本页（groupId = submitPaidGroup 返回 vo.id），修复过去拿组 PK 当子单 PK 查报「预约不存在」。
+     */
+    @GetMapping("/group/{groupId}")
+    public R<GzBeanBookingGroupVO> groupDetail(@PathVariable Long groupId) {
+        Long userId = LoginHelper.getUserId();
+        if (userId == null) {
+            return R.fail(401, "未登录");
+        }
+        GzBeanBookingGroupVO vo = bookingService.selectGroupDetailVo(groupId, userId);
+        if (vo == null) {
+            return R.fail("预约不存在");
+        }
+        return R.ok(vo);
+    }
+
+    /**
      * 用户取消预约（doc/10 §3.N9）。
      */
     @PostMapping("/{id}/cancel")
@@ -307,6 +342,19 @@ public class GzBeanBookingMpController {
             return R.fail(403, "无权操作该预约");
         }
         return R.ok(bookingService.closeUnpaid(id, String.valueOf(userId)));
+    }
+
+    /**
+     * 组单用户放弃支付 → 关组释放配额（ADR-0018 §1；mp 组单下单后取消微信支付浮层时调）。
+     * 级联全子单 pay_closed + cancelled；所有权在 service 内校验（非本人静默 false）。前端 fire-and-forget。
+     */
+    @PostMapping("/group/{groupId}/close-unpaid")
+    public R<Boolean> closeUnpaidGroup(@PathVariable Long groupId) {
+        Long userId = LoginHelper.getUserId();
+        if (userId == null) {
+            return R.fail(401, "未登录");
+        }
+        return R.ok(bookingService.closeUnpaidGroup(groupId, String.valueOf(userId)));
     }
 
     /**

@@ -130,4 +130,32 @@ public class GzBeanBoardRowVO implements Serializable {
      * 无续坐 / idle 时 null。与待分座「连续·建议」同口径（同用户成链）。
      */
     private LocalTime continuousUntil;
+
+    // ---- 下一位待核销（reserved）维度（两层看板下栏，ADR-0018 §2；无 next 时全空） ----
+
+    /**
+     * 下一位待核销单 id（string）：该座已排位（{@code status=pending + seat_id 非空 + verify_time NULL}）
+     * 中最早 slot_start 的一笔 → 看板座位格<b>下栏</b>「待核销」显示 + 核销按钮的目标单；无待核销单时 null。
+     * 与上栏在座单（{@code currentBookingId}）正交：两者同现 = 「在座 + 下一位」两层 hero 态。
+     */
+    @JsonSerialize(using = ToStringSerializer.class)
+    private Long nextBookingId;
+
+    /** 下一位待核销单业务码 BK...；无 next 时 null */
+    private String nextBookingNo;
+
+    /** 下一位待核销单计划区间起；无 next 时 null */
+    private LocalTime nextSlotStart;
+
+    /** 下一位待核销单计划区间止；无 next 时 null */
+    private LocalTime nextSlotEnd;
+
+    /** 下一位待核销单预约人手机号快照（脱敏由前端处理）；无 next 时 null */
+    private String nextMobileSnapshot;
+
+    /** 下一位待核销单是否免费单（1=免费）；无 next 时 null */
+    private Integer nextIsFree;
+
+    /** 该座待核销单总数（&gt;1 时下栏显「+N」提示还有几单排在本座）；无 next 时 0 */
+    private Integer nextCount;
 }

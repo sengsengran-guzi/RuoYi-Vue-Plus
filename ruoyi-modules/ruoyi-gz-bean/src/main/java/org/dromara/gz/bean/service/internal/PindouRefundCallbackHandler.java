@@ -41,10 +41,14 @@ public class PindouRefundCallbackHandler implements IRefundCallbackHandler {
 
     @Override
     public void onRefunded(GzPayRefund refund, GzPayTransaction txn) {
-        // business_order_no = gz_bean_booking.booking_no（submitPaid 建支付单时传入）
-        String bookingNo = txn.getBusinessOrderNo();
-        log.info("[pindou-refund] 收到拼豆退款回调 refund_no={} bookingNo={} amount={}（释放配额，未核销单退券恢复可用）",
-            refund.getRefundNo(), bookingNo, refund.getRefundAmountCent());
-        bookingService.onPindouRefunded(bookingNo);
+        // business_order_no = 单笔单 booking_no（BK…）或 组单 group_no（BG…，ADR-0018 §1）
+        String businessOrderNo = txn.getBusinessOrderNo();
+        log.info("[pindou-refund] 收到拼豆退款回调 refund_no={} businessOrderNo={} amount={}（释放配额，未核销单退券恢复可用）",
+            refund.getRefundNo(), businessOrderNo, refund.getRefundAmountCent());
+        if (businessOrderNo != null && businessOrderNo.startsWith("BG")) {
+            bookingService.onPindouGroupRefunded(businessOrderNo);
+        } else {
+            bookingService.onPindouRefunded(businessOrderNo);
+        }
     }
 }

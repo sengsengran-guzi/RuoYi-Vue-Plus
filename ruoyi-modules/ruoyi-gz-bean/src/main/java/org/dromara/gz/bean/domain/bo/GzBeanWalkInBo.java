@@ -40,12 +40,12 @@ public class GzBeanWalkInBo implements Serializable {
     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)
     private LocalDate sessDate;
 
-    /** 区间起（整点，含） */
+    /** 区间起（分钟精度，含）—— GZ-BEAN-046 松绑：店员自由设，不要求整点 */
     @NotNull
     @DateTimeFormat(pattern = "HH:mm:ss")
     private LocalTime slotStart;
 
-    /** 区间止（整点，不含） */
+    /** 区间止（分钟精度，不含）—— 仅要求 slotEnd > slotStart，不要求整点 / 落营业窗口 */
     @NotNull
     @DateTimeFormat(pattern = "HH:mm:ss")
     private LocalTime slotEnd;

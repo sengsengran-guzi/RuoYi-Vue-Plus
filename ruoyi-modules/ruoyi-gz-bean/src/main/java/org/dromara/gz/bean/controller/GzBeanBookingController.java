@@ -118,6 +118,31 @@ public class GzBeanBookingController extends BaseController {
     }
 
     /**
+     * 排位（ADR-0018 §2）：客人到店前把待核销单提前排到某物理座位，状态仍 pending、激活看板 reserved 态，
+     * 单离开「未排位客人」列表。复用 {@code gz:bean:booking:verify} 权限（店员现场操作）。
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @Log(title = "拼豆预约排位", businessType = BusinessType.UPDATE)
+    @PostMapping("/{id}/pre-assign")
+    public R<GzBeanBookingVO> preAssign(@PathVariable Long id, @RequestParam Long seatId) {
+        String adminUsername = LoginHelper.getUsername();
+        log.info("[bean-booking-admin] pre-assign id={} seatId={} by={}", id, seatId, adminUsername);
+        return R.ok(bookingService.preAssignSeat(id, seatId, adminUsername));
+    }
+
+    /**
+     * 取消排位（ADR-0018 §2）：把已排位待核销单的座位清回，单回到「未排位客人」列表。
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @Log(title = "拼豆预约取消排位", businessType = BusinessType.UPDATE)
+    @PostMapping("/{id}/unassign")
+    public R<GzBeanBookingVO> unassign(@PathVariable Long id) {
+        String adminUsername = LoginHelper.getUsername();
+        log.info("[bean-booking-admin] unassign id={} by={}", id, adminUsername);
+        return R.ok(bookingService.unassignSeat(id, adminUsername));
+    }
+
+    /**
      * 某预约核销分座时<b>可分配的空闲座</b>（ADR-0016 §3）：本店 + 该预约桌型 + 启用，且排除该日该时段
      * 已被占用 / 按星期关闭的座。核销弹窗座位下拉据此只列「点了不报 SEAT_TAKEN」的座，避免店员撞占。
      */
@@ -125,6 +150,17 @@ public class GzBeanBookingController extends BaseController {
     @GetMapping("/{id}/assignable-seats")
     public R<List<GzBeanSeatVO>> assignableSeats(@PathVariable Long id) {
         return R.ok(bookingService.selectAssignableSeats(id));
+    }
+
+    /**
+     * 排位候选座（ADR-0018 §2 客户 7.07）：给「排位」弹窗用，<b>区间重叠</b>口径（面向未到店单，非当下物理占用）。
+     * 返回本店该桌型全部启用座 + 每座 {@code assignable} / {@code occupiedUntil}——被目标时段占用的座前端显示但置灰
+     * 标「占用至 HH:mm」，其余可排。解决甲方「D4 被占却凭空消失、不知为何不能排」。
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @GetMapping("/{id}/preassign-candidates")
+    public R<List<GzBeanSeatVO>> preAssignCandidates(@PathVariable Long id) {
+        return R.ok(bookingService.selectPreAssignCandidates(id));
     }
 
     /**

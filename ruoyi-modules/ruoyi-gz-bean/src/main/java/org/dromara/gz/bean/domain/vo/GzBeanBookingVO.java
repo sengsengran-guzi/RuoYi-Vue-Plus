@@ -40,6 +40,10 @@ public class GzBeanBookingVO implements Serializable {
     @JsonSerialize(using = ToStringSerializer.class)
     private Long userId;
 
+    /** 组单 id（ADR-0018 §1）；单笔单为 null。同 group_id 的多条 = 一组（看板未排位列表按它聚合打「组·N人」标签 + 整组排位/核销） */
+    @JsonSerialize(using = ToStringSerializer.class)
+    private Long groupId;
+
     @JsonSerialize(using = ToStringSerializer.class)
     private Long storeId;
 

@@ -16,11 +16,10 @@ import java.time.LocalTime;
  * <p>区别于 mp 的 {@link GzBeanTypeSlotAvailabilityVO}（只给 {@code full} 布尔，铁律不向 C 端暴露余量数字）：
  * 本 VO 是 <b>admin 后台专用</b>，明确回传各数字供店员在表格上「开放 8 / 已约 5 / 剩 3，关 1-3 个」直观操作。</p>
  *
- * <p>口径：{@code effectiveCap = opened − closedSeat − quotaClose}（下限 0），
- * {@code remaining = effectiveCap − booked}（下限 0，即 {@code remaining = opened − booked − closedSeat − quotaClose}）。
+ * <p>口径（ADR-0018 §3 客户 7.05：关闭统一走 quota_close 数量制，旧 seat_closure 已退休不再参与配额）：
+ * {@code effectiveCap = opened − quotaClose}（下限 0），{@code remaining = max(0, opened − booked − quotaClose)}。
  * {@code opened} = 该桌型每格总配额（slotCapacity，按 book_mode 取）；
- * {@code closedSeat} = 老 {@code gz_bean_seat_closure} 按 seat_id + weekday 关闭折算的本桌型座位数；
- * {@code quotaClose} = 新 {@code gz_bean_slot_quota_close} 该具体日期该格的配额关闭数。</p>
+ * {@code quotaClose} = {@code gz_bean_slot_quota_close} 该具体日期该格的配额关闭数。</p>
  *
  * @author kevin-coder (sensenran-guzi · 客户 0702 反馈 #4a)
  */
@@ -58,12 +57,9 @@ public class GzBeanSlotAvailabilityDetailVO implements Serializable {
     /** 已约（该格覆盖的活跃单数，含 used） */
     private Long booked;
 
-    /** 老 seat_id 关闭折算的本桌型座位数（gz_bean_seat_closure 按 weekday 周复发） */
-    private Long closedSeat;
-
-    /** 新配额关闭数（gz_bean_slot_quota_close 按具体日期，本表格 stepper 直接改写） */
+    /** 配额关闭数（gz_bean_slot_quota_close 按具体日期，本表格 stepper 直接改写） */
     private Long quotaClose;
 
-    /** 剩余 = max(0, opened − booked − closedSeat − quotaClose)；表格「剩余」列 + ≤0 灰显 */
+    /** 剩余 = max(0, opened − booked − quotaClose)；表格「剩余」列 + ≤0 灰显 */
     private Long remaining;
 }

@@ -96,6 +96,31 @@ public interface IGzBeanBookingService {
     GzBeanBookingVO markHandledNoSeat(Long bookingId, String operator);
 
     /**
+     * 排位（ADR-0018 §2）：客人到店前，店员把已付款待核销单提前排到某个物理座位。
+     *
+     * <p>写 {@code seat_id} + {@code seat_no_snapshot}，<b>状态仍 pending、verify_time 保持 NULL</b>——
+     * 激活看板 {@code reserved} 态、该单自动离开「未排位客人」列表（列表查询 {@code seat_id IS NULL} 天然生效）。
+     * 客人到店后走 {@link #verify}（用该单已排座）落座。占用判定用<b>区间重叠</b>（含其它 reserved + used 单）——
+     * 面向未来时段的排位不能用「当下物理占用」（后者挡不住两条 pending 排到同座同区间）。可对已排位单再次调用 = 移座。</p>
+     *
+     * @param bookingId 待排位预约 id（须 pending + paid + 未核销）
+     * @param seatId    店员选定的物理座位 id
+     * @param operator  操作人（admin username）
+     * @return 排位后 VO（status 仍 pending，seat_id 已写）
+     */
+    GzBeanBookingVO preAssignSeat(Long bookingId, Long seatId, String operator);
+
+    /**
+     * 取消排位（ADR-0018 §2）：把已排位（reserved：pending + seat_id 非空 + 未核销）单的座位清回 NULL，
+     * 单回到「未排位客人」列表。已核销（used）单不可取消排位（改用改派 / 放座）。
+     *
+     * @param bookingId 已排位预约 id
+     * @param operator  操作人（admin username）
+     * @return 取消排位后 VO（seat_id 已清 NULL）
+     */
+    GzBeanBookingVO unassignSeat(Long bookingId, String operator);
+
+    /**
      * admin 扫码核销预约（GZ-BEAN-008 AC4，doc/10 §3.N11）。
      *
      * <p>流程：</p>
@@ -177,6 +202,15 @@ public interface IGzBeanBookingService {
     GzBeanBookingVO selectVoById(Long id);
 
     /**
+     * 组单详情（ADR-0018 §1 客户 7.07「多人单显示为一笔」，A 档）：按组 PK 查组头 + N 子单聚合。
+     * mp 组单支付后跳组详情页用；组不存在返 null，非本人 userId 抛「无权查看」。
+     *
+     * @param groupId 组 PK（submitPaidGroup 返回 vo.id）
+     * @param userId  当前登录用户（校归属；null 跳过校验）
+     */
+    org.dromara.gz.bean.domain.vo.GzBeanBookingGroupVO selectGroupDetailVo(Long groupId, Long userId);
+
+    /**
      * admin 分页列表。
      */
     TableDataInfo<GzBeanBookingVO> selectPageList(GzBeanBookingQueryBo query, PageQuery pageQuery);
@@ -207,6 +241,17 @@ public interface IGzBeanBookingService {
      * @return 提交结果（含实付 = 单价×N − 券 + 支付五参 / 免费单标记）
      */
     GzBeanPaidSubmitVO submitPaid(GzBeanPaidBookingSubmitBo bo, Long userId);
+
+    /**
+     * 组单预订下单（ADR-0018 §1）：一次订 N 个单位 → 拆 N 条子单 + 1 组，支付一次挂组（businessOrderNo=group_no）。
+     * 组单不用券、不吃前 N 名免费促销（全价）；防超卖 = 逐格配额原子扣 N 份。返回复用 {@link GzBeanPaidSubmitVO}
+     * （{@code bookingNo} 位放 group_no 作支付单 ref）。支付成功走 {@link #onPindouGroupPaid} 翻组 + 全子单。
+     *
+     * @param bo     组单下单参数（storeId / seatTypeConfigId / sessDate / slotStart..slotEnd / unitCount N）
+     * @param userId 当前登录 user_id（sa-token 拿）
+     * @return 提交结果（含组总额 + 支付五参）
+     */
+    GzBeanPaidSubmitVO submitPaidGroup(org.dromara.gz.bean.domain.bo.GzBeanPaidGroupSubmitBo bo, Long userId);
 
     /**
      * mp 端包天套餐下单（GZ-BEAN-042 / ADR-0017）。
@@ -295,6 +340,33 @@ public interface IGzBeanBookingService {
      * @param outTradeNo 支付单业务码（校验对账用）
      */
     void onPindouPaid(String bookingNo, String outTradeNo);
+
+    /**
+     * 组单支付成功回调（ADR-0018 §1）：翻组 {@code pay_status paying → paid} + 级联全部子单 markPaid + 生成核销码。
+     * 支付回调 handler 按 businessOrderNo 前缀路由（BG… → 本方法；BK… → {@link #onPindouPaid}）。幂等：组非 paying 跳过。
+     *
+     * @param groupNo   组业务码（= 支付交易 business_order_no）
+     * @param outTradeNo 支付单业务码（校验对账用）
+     */
+    void onPindouGroupPaid(String groupNo, String outTradeNo);
+
+    /**
+     * 组单退款成功回调（ADR-0018 §1）：翻组 paid→refunded + 级联全子单 markRefunded（未核销 pending→cancelled 释放配额，
+     * 已核销 used 保留）。退款 handler 按 businessOrderNo 前缀路由（BG… → 本方法）。组单不用券、无退券。幂等：组非 paid 跳过。
+     *
+     * @param groupNo 组业务码（= 退款交易 business_order_no）
+     */
+    void onPindouGroupRefunded(String groupNo);
+
+    /**
+     * 组单用户放弃支付关单（ADR-0018 §1）：翻组 unpaid/paying→pay_closed + 级联全子单 markPayClosed（status→cancelled 释放配额）。
+     * 幂等：组已非 unpaid/paying → 返 false（绝不关已付款组）。所有权由 controller 校验。
+     *
+     * @param groupId    组 id
+     * @param operatorId 操作人（mp user_id 字符串）
+     * @return true = 已关组释放 / false = 已非 unpaid/paying
+     */
+    boolean closeUnpaidGroup(Long groupId, String operatorId);
 
     /**
      * 退款成功业务回调（D16 P2，doc/10 §6.N10 退款 SPI）。由 {@code PindouRefundCallbackHandler.onRefunded}
@@ -407,6 +479,17 @@ public interface IGzBeanBookingService {
     List<GzBeanSeatVO> selectAssignableSeats(Long bookingId);
 
     /**
+     * 排位候选座（ADR-0018 §2 客户 7.07）：给「排位」弹窗用。与 {@link #selectAssignableSeats}（核销现场分座，
+     * 当下物理占用口径）不同——排位面向未到店单，占用判定用<b>区间重叠</b>（与后端 preAssign 防超卖同口径）。
+     * 返回本店该桌型<b>全部</b>启用座，被目标时段占用的置 {@code assignable=false} + {@code occupiedUntil}，
+     * 前端显示但置灰、拼「占用至 HH:mm」；其余可排。排除本单自身。
+     *
+     * @param bookingId 待排位预约 id（取其 slot / seatTypeConfigId 算区间可排性）
+     * @return 全部同桌型启用座（含 assignable / occupiedUntil 标注；无则空列表）
+     */
+    List<GzBeanSeatVO> selectPreAssignCandidates(Long bookingId);
+
+    /**
      * 提前放座（GZ-BEAN-026，ADR-0015 §5 / doc/11 §3.12 / doc/10 §11）。
      *
      * <p>对某在店使用中（{@code status='used'}）单写 {@code actual_end_time=now} +
@@ -480,18 +563,20 @@ public interface IGzBeanBookingService {
     GzBeanBookingVO adminCreateBooking(org.dromara.gz.bean.domain.bo.GzBeanAdminCreateBo bo, String operator);
 
     /**
-     * 看板代客预约一步「建单 + 核销 + 分座」（0702 反馈 #2）：现金散客到店，店员在店内计时看板点某<b>具体空闲座位</b>
-     * → 抽屉填时长 / 手机号 / 免费 / 金额 → 提交即生成 {@code status=used + pay_status=paid + seat_id} 的已核销单，
-     * 座位立刻 in_use 起计时。取代「预约管理」两步式 {@link #adminCreateBooking}（先 pending 后核销分座）。
+     * 看板代客预约一步「建单 + 核销 + 分座」（0702 反馈 #2；GZ-BEAN-046 松绑）：现金散客到店，店员在店内计时看板点某
+     * <b>具体空闲座位</b> → 抽屉填<b>分钟精度</b>起止时间 / 手机号 / 免费 / 金额 → 提交即生成
+     * {@code status=used + pay_status=paid + seat_id} 的已核销单，座位立刻 in_use 起计时。
+     * 取代「预约管理」两步式 {@link #adminCreateBooking}（先 pending 后核销分座）。
      *
      * <p><b>一事务（{@code REPEATABLE_READ}）</b>：</p>
      * <ol>
      *   <li>载 {@link org.dromara.gz.bean.domain.entity.GzBeanSeat} → 取 {@code seat_type_config_id}，校验 enabled + 属本店；</li>
-     *   <li><b>座位级占用 guard</b>（复用核销分座同款）：Redis seat 锁 + {@code selectSeatOccupiedNowForUpdate}（当下物理在座）
-     *       + {@code selectActiveSeatOverlapForUpdate}（该座 {@code [slotStart, slotEnd)} 区间与活跃单重叠，止界
-     *       {@code COALESCE(actual_end_slot, slot_end)}）→ 任一命中报 {@code SEAT_TAKEN 4002}。<b>不走桌型配额</b>
-     *       （现场分具体空座是店员对物理现实的操作，配额是 mp 线上口径）；</li>
-     *   <li>计价 = 桌型档价逐格求和 × 该区间；{@code isFree} → 0；入参 {@code amountCent} 非空则覆写（店员议价 / 抹零）；</li>
+     *   <li><b>座位级占用 guard</b>（GZ-BEAN-046 松绑，甲方口径「座位只判是否空闲、给店员充足操作空间」）：Redis seat 锁 +
+     *       {@code selectSeatOccupiedNowForUpdate}（当下物理在座）→ 命中报 {@code SEAT_TAKEN 4002}。<b>不再做整点区间重叠校验</b>
+     *       （只要此刻椅子没人坐即可代客，与看板「空闲」口径一致）；<b>不走桌型配额</b>（现场分具体空座是店员对物理现实的操作，
+     *       桌型配额是 mp 线上口径 —— 本 used 单按整点格计入 {@code countActiveCoveringSlot} 保护 mp 线上不超卖）；</li>
+     *   <li>时间<b>分钟精度</b>（{@code start < end} 即可，不校验整点 / 营业窗口）；计价按跨越的整点格数（{@code floor(start)} 逐 1h
+     *       到 {@code < end}）× 桌型档价；{@code isFree} → 0；入参 {@code amountCent} 非空则覆写（店员议价 / 抹零）；</li>
      *   <li><b>一次 insert 配齐全字段</b>（{@code status=used / seat_id / verify_time=now / verified_by /
      *       pay_status=paid / out_trade_no=NULL / source=walk_in / is_free / snapshot}）——<b>严禁 insert 后 updateById
      *       补 seat_id</b>（{@code @Version} 实体内存 version 为 null 会静默不落，防超卖失效，见 memory）。</li>

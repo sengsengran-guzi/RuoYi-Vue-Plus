@@ -2,6 +2,7 @@ package org.dromara.gz.bean.domain.vo;
 
 import com.fasterxml.jackson.databind.annotation.JsonSerialize;
 import com.fasterxml.jackson.databind.ser.std.ToStringSerializer;
+import com.fasterxml.jackson.annotation.JsonFormat;
 import io.github.linpeilie.annotations.AutoMapper;
 import lombok.Data;
 import org.dromara.gz.bean.domain.entity.GzBeanSeat;
@@ -9,6 +10,7 @@ import org.dromara.gz.bean.domain.entity.GzBeanSeat;
 import java.io.Serial;
 import java.io.Serializable;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
 
 /**
  * gz_bean_seat 座位单元视图对象（ADR-0015）。
@@ -73,4 +75,18 @@ public class GzBeanSeatVO implements Serializable {
 
     /** 订法 whole=整桌 / seat=按座（Service 由 config.book_mode 回填；legacy 座为空） */
     private String bookMode;
+
+    /**
+     * 排位候选专用（selectPreAssignCandidates，ADR-0018 §2 客户 7.07）：本座在目标单时段是否可排位。
+     * 区间重叠口径（与后端 preAssign 防超卖一致）：该座在目标 slot 无重叠活跃单 → true。
+     * 其它查询（座位列表 / 核销分座 assignable-seats）不设此字段（null）。
+     */
+    private Boolean assignable;
+
+    /**
+     * 排位候选专用：本座被占用的止界时刻（COALESCE(actual_end_slot, slot_end) 的最大值）。
+     * {@code assignable=false} 时非空，前端拼「占用至 HH:mm」告诉店员为何不可排。可排 / 非候选查询时为空。
+     */
+    @JsonFormat(pattern = "HH:mm")
+    private LocalTime occupiedUntil;
 }

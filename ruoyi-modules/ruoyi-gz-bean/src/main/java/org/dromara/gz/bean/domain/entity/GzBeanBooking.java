@@ -59,6 +59,9 @@ public class GzBeanBooking extends TenantEntity {
     /** FK → gz_user.id */
     private Long userId;
 
+    /** 组单 FK → gz_bean_booking_group.id；单笔单为 NULL（ADR-0018 §1 组单预订） */
+    private Long groupId;
+
     /** FK → gz_bean_store.id */
     private Long storeId;
 

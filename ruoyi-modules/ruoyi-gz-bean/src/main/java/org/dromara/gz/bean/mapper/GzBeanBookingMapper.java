@@ -64,7 +64,8 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
      * @return 受影响行数（1 = 标记成功 / 0 = 已非 pending，幂等跳过）
      */
     @Update("UPDATE gz_bean_booking " +
-        "SET status = 'no_show', no_show_time = #{noShowTime}, dedup_token = booking_no " +
+        "SET status = 'no_show', no_show_time = #{noShowTime}, dedup_token = booking_no, " +
+        "    seat_id = NULL, seat_no_snapshot = NULL " +
         "WHERE id = #{id} AND status = 'pending' AND del_flag = '0'")
     int markNoShow(@Param("id") Long id, @Param("noShowTime") LocalDateTime noShowTime);
 
@@ -91,11 +92,15 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
      * {@code FOR UPDATE} 悲观锁锁住覆盖该格的活跃行 → 并发下单逐格串行化比对配额。一行区间预约对它覆盖的
      * 每一个 1h 格各占 1 配额，service 层对区间内每格各调一次本查询（按格升序加锁防交叠区间死锁，ADR-0011 §3）。</p>
      *
-     * <p><b>「覆盖 gi」= 区间重叠，不是 slot_start 相等</b>（ADR-0011 §3）：一个 14:00–17:00 的活跃单确实占了
-     * 15:00 这格，但它的 slot_start≠15:00。重叠条件 = {@code slot_start <= gi AND COALESCE(actual_end_slot, slot_end) > gi}
-     * （gi 为格起整点，左闭右开；止界用 COALESCE 与座位互斥一致，提前放座后该格立即释放）。</p>
+     * <p><b>「覆盖 gi」= 区间与格 [gi, gi+1h) 重叠，不是 slot_start 相等</b>（ADR-0011 §3；GZ-BEAN-046 分钟精度修正）：
+     * 一个 14:00–17:00 的活跃单确实占了 15:00 这格，但它的 slot_start≠15:00。重叠条件 =
+     * {@code slot_start < gi+1h AND COALESCE(actual_end_slot, slot_end) > gi}（gi 为格起整点，格 = 左闭右开 [gi,gi+1h)；
+     * 止界用 COALESCE 与放座即空一致，提前放座后该格立即释放）。<b>起界用 {@code slot_start < gi+1h}（非旧 {@code slot_start <= gi}）</b>：
+     * 对整点单二者恒等（slot_start 是整点，{@code <=gi} ⟺ {@code <gi+1h}），是 no-op；但对代客预约的<b>分钟精度</b>单
+     * （GZ-BEAN-046，如 16:34 起）唯有 {@code < gi+1h} 才能把它正确计入其所在整点格（16:00 格：16:34&lt;17:00），
+     * 保证 mp 线上同桌型余量不被分钟起点漏算、不超卖（Kevin 拍板「按整点格保护」）。</p>
      *
-     * <p><b>活跃定义（ADR-0016 §2 修正，与具体座位互斥 {@link #selectActiveSeatOverlapForUpdate} 对齐）</b>：
+     * <p><b>活跃定义（ADR-0016 §2）</b>：
      * {@code status IN ('pending','used') AND pay_status IN ('paying','paid')} —— pending（待到店占计划格）
      * 与 used（已核销占走 1 个物理座）<b>都计配额</b>；{@code cancelled / no_show / pay_closed / refunded} 全部释放不计。
      * <b>⚠️ 反转后铁律</b>：ADR-0016 下「核销才占物理座」，若配额只数 pending（漏 used），used 单退出配额却仍占物理座
@@ -110,7 +115,7 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
      */
     @Select("SELECT COUNT(*) FROM gz_bean_booking " +
         "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_type_config_id = #{seatTypeConfigId} " +
-        "  AND sess_date = #{sessDate} AND slot_start <= #{slot} AND COALESCE(actual_end_slot, slot_end) > #{slot} " +
+        "  AND sess_date = #{sessDate} AND slot_start < ADDTIME(#{slot}, '01:00:00') AND COALESCE(actual_end_slot, slot_end) > #{slot} " +
         "  AND status IN ('pending','used') AND pay_status IN ('paying','paid') AND del_flag = '0' " +
         "FOR UPDATE")
     long countActiveCoveringSlotForUpdate(@Param("tenantId") String tenantId,
@@ -131,7 +136,7 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
      */
     @Select("SELECT COUNT(*) FROM gz_bean_booking " +
         "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_type_config_id = #{seatTypeConfigId} " +
-        "  AND sess_date = #{sessDate} AND slot_start <= #{slot} AND COALESCE(actual_end_slot, slot_end) > #{slot} " +
+        "  AND sess_date = #{sessDate} AND slot_start < ADDTIME(#{slot}, '01:00:00') AND COALESCE(actual_end_slot, slot_end) > #{slot} " +
         "  AND status IN ('pending','used') AND pay_status IN ('paying','paid') AND del_flag = '0'")
     long countActiveCoveringSlot(@Param("tenantId") String tenantId,
                                  @Param("storeId") Long storeId,
@@ -178,56 +183,17 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
                             @Param("sessDate") LocalDate sessDate);
 
     // ============================================================
-    //  GZ-BEAN-024 具体座位区间互斥防超卖（ADR-0015 §2 / doc/11 §3.6，取代逐格配额计数）
+    //  GZ-BEAN-024 具体座位区间互斥（ADR-0015 §2 / doc/11 §3.6）—— seat-map 展示 + 改派冲突用
+    //  （代客预约 walk-in 的座位判定 GZ-BEAN-046 已改为「当下物理占用」selectSeatOccupiedNowForUpdate，
+    //   不再走本区间互斥；单座 FOR UPDATE 版 selectActiveSeatOverlapForUpdate 随之删除。）
     // ============================================================
-
-    /**
-     * 看板代客预约（walk-in）具体座位区间互斥 guard（GZ-BEAN-024 / GZ-BEAN-045，唯一调用方 {@code walkInCreate}）。
-     *
-     * <p>店员对物理座位一步「建单 + 核销 + 分座」时，<b>同一事务</b>内对单个具体座位 {@code seatId} 当日活跃单
-     * {@code FOR UPDATE} 悲观锁，判请求区间 {@code [reqStart, reqEnd)} 是否与该座<b>仍在占用</b>的活跃单区间重叠。
-     * 命中 → 该座此区间有人在坐，整笔回滚拒单（{@link org.dromara.gz.bean.exception.GzBeanErrorCode#SEAT_TAKEN}）；
-     * 无命中 → 放行 INSERT。单维度悲观锁 {@code (store, seat_id, sess_date)}，无需逐格加锁。</p>
-     *
-     * <p><b>放座即空（GZ-BEAN-045 修正，与核销分座 {@code selectSeatOccupiedNowForUpdate} 同「物理占用」口径对齐）</b>：
-     * 已提前放座 / 结单的 {@code used} 单（{@code actual_end_time IS NOT NULL}）＝客人已离场、店员已释放该座 →
-     * 物理上空闲，代客预约<b>不再</b>视其占座（{@code AND actual_end_time IS NULL} 排除）。
-     * 旧口径用 {@code COALESCE(actual_end_slot, slot_end)} 把放座单锁到整点格（配额账止界，给 mp 线上逐格防超卖用），
-     * 会把「14:00-15:00 单坐到 14:30 放座」的椅子一直锁到 15:00，店员对着看板上显示<b>空闲</b>的座却代客失败报
-     * 「该座位该时段已被预约」——物理分座与配额账分家（memory pindou-verify-assign-present-moment-occupancy），
-     * 此处走物理占用：未放座的活跃单按计划 {@code slot_end} 占，放座即释放。</p>
-     *
-     * <p><b>区间重叠判定</b>：{@code slot_start < reqEnd AND slot_end > reqStart}（占用止界 = 计划 {@code slot_end}，
-     * 因已放座单被 {@code actual_end_time IS NULL} 排除，剩余行 {@code actual_end_slot} 恒为 NULL）。</p>
-     *
-     * <p><b>活跃定义</b>：{@code status IN ('pending','used') AND pay_status IN ('paying','paid') AND
-     * actual_end_time IS NULL} —— pending（待到店，本模型 seat_id=NULL 不会命中具体座）/ used 未放座（在店使用中）
-     * 才占座；cancelled / no_show / pay_closed / refunded / 已放座 全部释放。「同座连续两单」中第一单未放座时第二单
-     * 落其区间内仍命中拒单（防超卖不变）；当下物理在座另由 {@code selectSeatOccupiedNowForUpdate} 兜底。</p>
-     *
-     * <p><b>tenant_id 显式传</b>：service 从 store / user 取 tenant 显式传入（同 submit 注释）。</p>
-     *
-     * @return 命中的活跃（未放座）booking id 列表（非空即该座区间有人在坐 → SEAT_TAKEN 拒单）
-     */
-    @Select("SELECT id FROM gz_bean_booking " +
-        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_id = #{seatId} " +
-        "  AND sess_date = #{sessDate} " +
-        "  AND actual_end_time IS NULL " +
-        "  AND slot_start < #{reqEnd} AND slot_end > #{reqStart} " +
-        "  AND status IN ('pending','used') AND pay_status IN ('paying','paid') AND del_flag = '0' " +
-        "FOR UPDATE")
-    List<Long> selectActiveSeatOverlapForUpdate(@Param("tenantId") String tenantId,
-                                                @Param("storeId") Long storeId,
-                                                @Param("seatId") Long seatId,
-                                                @Param("sessDate") LocalDate sessDate,
-                                                @Param("reqStart") LocalTime reqStart,
-                                                @Param("reqEnd") LocalTime reqEnd);
 
     /**
      * seat-map 可用性：批量取某门店某日<b>每个具体座位</b>在请求区间 {@code [reqStart, reqEnd)} 内是否被占
      * （GZ-BEAN-024，无锁，仅展示用）。返回该日所有「与请求区间重叠的活跃单」所占的 {@code seat_id} 去重列表，
      * service 层据此对每座算 {@code full}（座 id ∈ 本列表 → full=true）。重叠 + 活跃 + 占用止界口径同
-     * {@link #selectActiveSeatOverlapForUpdate}，但不加 {@code FOR UPDATE}、不限定单座。</p>
+     * {@link #selectActiveSeatOverlapExcludingForUpdate}（{@code slot_start < reqEnd AND
+     * COALESCE(actual_end_slot, slot_end) > reqStart}），但不加 {@code FOR UPDATE}、不限定单座、不排除自身。</p>
      *
      * @return 在请求区间内被占的座位 id 去重列表
      */
@@ -245,9 +211,9 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
     /**
      * 核销分座「当下物理占用」判定（GZ-BEAN-043 / ADR-0017 §店员自主）：某具体座位 {@code seatId} 此刻是否有人在坐。
      *
-     * <p><b>与区间/配额判定分家（关键）</b>：{@link #selectActiveSeatOverlapForUpdate} 的
-     * {@code [reqStart, reqEnd)} 区间重叠 + {@code actual_end_slot}（放座向上取整整点）止界是为<b>逐格配额防超卖</b>
-     * 服务的——卖出的整点格不可回收。但「店员核销时能不能把这张椅子分给刚到的客人」是<b>物理在座</b>问题，粒度到分钟、
+     * <p><b>与区间/配额判定分家（关键）</b>：逐格配额 {@link #countActiveCoveringSlotForUpdate} 的
+     * {@code [gi, gi+1h)} 格覆盖 + {@code actual_end_slot}（放座向上取整整点）止界是为<b>逐格配额防超卖</b>
+     * 服务的——卖出的整点格不可回收。但「店员核销 / 代客时能不能把这张椅子分给刚到的客人」是<b>物理在座</b>问题，粒度到分钟、
      * 放座即空：不能沿用配额止界（否则 14:00-15:00 单坐到 14:30 放座后，配额 {@code actual_end_slot=15:00} 会把椅子
      * 一直锁到 15:00，店员分不出去 = 「限制太死」）。</p>
      *
@@ -359,9 +325,9 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
      * 延时撞占校验（GZ-BEAN-026 E4b，ADR-0015 §5）：判某座在「新增格区间」{@code [reqStart, reqEnd)}
      * 是否与<b>除自身外</b>的活跃单重叠。{@code FOR UPDATE} 锁住该座活跃单串行化延时与并发下单。
      *
-     * <p>与 {@link #selectActiveSeatOverlapForUpdate} 同口径（具体座位区间互斥 + 占用止界
-     * {@code COALESCE(actual_end_slot, slot_end)}），但多 {@code id != #{excludeId}} 排除被延时单本身
-     * （否则它自己的占用区间会命中）。命中任一行 → 新增格已被别人占，拒绝延时（E4b）。</p>
+     * <p>具体座位区间互斥 + 占用止界 {@code COALESCE(actual_end_slot, slot_end)}，多
+     * {@code id != #{excludeId}} 排除被延时单本身（否则它自己的占用区间会命中）。命中任一行 →
+     * 新增格已被别人占，拒绝延时（E4b）。</p>
      *
      * @return 命中的活跃 booking id 列表（非空即新增格被占 → 拒绝延时）
      */

@@ -41,11 +41,15 @@ public class PindouPayCallbackHandler implements PayCallbackHandler {
 
     @Override
     public void onPaid(GzPayTransaction txn) {
-        // business_order_no = gz_bean_booking.booking_no（submitPaid 建支付单时传入）
-        String bookingNo = txn.getBusinessOrderNo();
-        log.info("[pindou-onpaid] 收到拼豆支付回调 bookingNo={} outTradeNo={} amount={}",
-            bookingNo, txn.getOutTradeNo(), txn.getAmountCent());
-        bookingService.onPindouPaid(bookingNo, txn.getOutTradeNo());
+        // business_order_no = 单笔单 booking_no（BK…，submitPaid）或 组单 group_no（BG…，submitPaidGroup，ADR-0018 §1）
+        String businessOrderNo = txn.getBusinessOrderNo();
+        log.info("[pindou-onpaid] 收到拼豆支付回调 businessOrderNo={} outTradeNo={} amount={}",
+            businessOrderNo, txn.getOutTradeNo(), txn.getAmountCent());
+        if (businessOrderNo != null && businessOrderNo.startsWith("BG")) {
+            bookingService.onPindouGroupPaid(businessOrderNo, txn.getOutTradeNo());
+        } else {
+            bookingService.onPindouPaid(businessOrderNo, txn.getOutTradeNo());
+        }
     }
 
     /**

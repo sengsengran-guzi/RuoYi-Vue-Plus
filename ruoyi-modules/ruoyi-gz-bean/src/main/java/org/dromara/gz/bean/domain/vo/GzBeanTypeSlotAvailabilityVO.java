@@ -56,6 +56,15 @@ public class GzBeanTypeSlotAvailabilityVO implements Serializable {
     private Boolean full;
 
     /**
+     * 该 1h 格该类型的剩余可订份数（= max(0, 有效配额 − 活跃单数)，ADR-0018 §1 客户 7.05）。
+     *
+     * <p>供 mp「按人数 N 动态灰」逻辑用：一家带 N 个孩子组单时，{@code remaining < N} 的时段自动灰显不可选。
+     * <b>UI 只据此渲染「可约 / 已满」两态、不显具体数字</b>（与 doc/15a §A.1「不暴露余量数字」铁律一致——
+     * 阈值随 N 移动，仍不向用户展示"还剩 N 名"这类稀缺话术）。N=1 普通下单时 {@code remaining>=1 ⟺ !full}。</p>
+     */
+    private Integer remaining;
+
+    /**
      * 座位类型 config 是否启用（mp 契约字段：active=false 灰显/过滤）。
      * 余量接口仅查 enabled=1 的 config（service selectTypeSlotAvailability eq enabled=1），故恒 true；
      * 显式回传以满足 mp TypeSlotVO.active 契约，避免 undefined→falsy→整档被过滤。
