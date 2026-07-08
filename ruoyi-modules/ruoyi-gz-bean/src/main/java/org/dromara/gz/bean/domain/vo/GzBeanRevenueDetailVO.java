@@ -14,9 +14,9 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 
 /**
- * 拼豆营业额明细行视图对象（按天，只统计拼豆）。
+ * 拼豆营业额明细行视图对象（区间下钻，只统计拼豆）。
  *
- * <p>明细口径与 {@link GzBeanRevenueVO} 汇总一致（{@code pay_status='paid' AND is_free=0}），逐单展开：
+ * <p>明细口径与 {@link GzBeanRevenueAggregateVO} 聚合一致（{@code pay_status='paid' AND is_free=0}），逐单展开：
  * 时间 / 门店 / 桌型快照 / 金额 / 支付方式 / 是否代客。ID 全 string 序列化防精度丢失。</p>
  *
  * @author kevin-coder (sensenran-guzi · 拼豆营业额)

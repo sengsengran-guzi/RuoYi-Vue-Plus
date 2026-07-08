@@ -10,8 +10,8 @@ import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.satoken.utils.LoginHelper;
 import org.dromara.common.web.core.BaseController;
 import org.dromara.gz.bean.domain.bo.GzBeanRevenueQueryBo;
+import org.dromara.gz.bean.domain.vo.GzBeanRevenueAggregateVO;
 import org.dromara.gz.bean.domain.vo.GzBeanRevenueDetailVO;
-import org.dromara.gz.bean.domain.vo.GzBeanRevenueVO;
 import org.dromara.gz.bean.mapper.GzAdminUserStoreMapper;
 import org.dromara.gz.bean.service.IGzBeanRevenueService;
 import org.springframework.validation.annotation.Validated;
@@ -23,7 +23,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.Set;
 
 /**
- * 拼豆营业额（按天，只统计拼豆）admin 端。
+ * 拼豆营业额（周/月/季度/日整合 + 桌型×计费方式拆分，只统计拼豆）admin 端。
  *
  * <p>路径前缀 {@code /system/gz/bean/revenue}，权限 {@code gz:bean:revenue:list}（owner + staff）。</p>
  *
@@ -49,21 +49,25 @@ public class GzBeanRevenueController extends BaseController {
     private final GzAdminUserStoreMapper adminUserStoreMapper;
 
     /**
-     * 单日营业额汇总（总额 / 单数 / 现金-线上拆分 / 桌型分组）。
+     * 营业额区间聚合（汇总卡 + 类目字典 + 时间桶×类目趋势 + 每类合计）。
      *
-     * @param storeId 门店 id（可选；owner 传空 = 全部门店，staff 忽略强制本店）
-     * @param date    查询日期 yyyy-MM-dd（必填）
+     * @param granularity 时间粒度 day/week/month/quarter（必填）
+     * @param startDate   区间起 yyyy-MM-dd（必填）
+     * @param endDate     区间止 yyyy-MM-dd（必填）
+     * @param storeId     门店 id（可选；owner 传空 = 全部门店，staff 忽略强制本店）
      */
     @SaCheckPermission("gz:bean:revenue:list")
-    @GetMapping("/daily")
-    public R<GzBeanRevenueVO> daily(@RequestParam(required = false) Long storeId,
-                                    @RequestParam String date) {
+    @GetMapping("/aggregate")
+    public R<GzBeanRevenueAggregateVO> aggregate(@RequestParam String granularity,
+                                                 @RequestParam String startDate,
+                                                 @RequestParam String endDate,
+                                                 @RequestParam(required = false) Long storeId) {
         Long staffStoreId = resolveStaffStoreId();
-        return R.ok(revenueService.selectDailyRevenue(storeId, date, staffStoreId));
+        return R.ok(revenueService.selectAggregate(granularity, startDate, endDate, storeId, staffStoreId));
     }
 
     /**
-     * 单日营业额明细分页（时间 / 门店 / 桌型 / 金额 / 支付方式 / 是否代客）。
+     * 营业额明细分页（区间下钻：时间 / 门店 / 桌型 / 金额 / 支付方式 / 是否代客）。
      */
     @SaCheckPermission("gz:bean:revenue:list")
     @GetMapping("/detail")

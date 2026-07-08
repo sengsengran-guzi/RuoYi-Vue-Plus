@@ -464,29 +464,30 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
                           @Param("verifiedBy") String verifiedBy);
 
     // ============================================================
-    //  拼豆营业额（按天，只统计拼豆；数据源 gz_bean_booking 非支付流水 —— 现金代客单不落 gz_pay_transaction）
+    //  拼豆营业额（周/月/季度/日整合 + 桌型×计费方式拆分；数据源 gz_bean_booking 非支付流水 —— 现金代客单不落 gz_pay_transaction）
     // ============================================================
 
     /**
-     * 单日拼豆营业额汇总（数据源 = gz_bean_booking，口径「只统计拼豆」）。
+     * 拼豆营业额区间汇总（数据源 = gz_bean_booking，口径「只统计拼豆」）。
      *
      * <p><b>为何用 booking 表不用 gz_pay_transaction</b>：现金代客单（店员看板 walk-in / admin-create）线下收款、
      * 不走微信支付、不落 {@code gz_pay_transaction}；只查支付流水会漏掉现金单，营业额偏低。故直接对 booking 明细
      * 聚合，与门店实际收款一致。</p>
      *
      * <p><b>计入口径</b>：{@code pay_status='paid'}（已付成功，含线下现金代客）{@code AND is_free=0}（前 N 名免费促销单
-     * amount_cent=0、不计营业额）{@code AND del_flag='0'}。按 {@code sess_date}（服务日）过滤 —— 现金单当天即服务，
-     * 口径自然，无跨日结算问题。</p>
+     * amount_cent=0、不计营业额）{@code AND del_flag='0'}。按 {@code sess_date}（服务日）区间过滤 —— 现金单当天即服务，
+     * 口径自然；与对账中心 4% 分成口径（按 paid_time）有意分开。</p>
      *
      * <p><b>现金 vs 线上拆分</b>：{@code out_trade_no} 非空 = 走微信支付（线上）；为空 = 线下现金收款（代客单）。
      * 直接反映收款方式，比 {@code source} 列更准（source 只区分下单来源，不区分是否真走微信）。</p>
      *
-     * <p><b>tenant_id 显式传</b>：与本 mapper 其它直查一致，由 service 从登录态 / store 取 tenant 显式传入，
-     * 不依赖拦截器（保持聚合口径明确）。返回单行聚合结果（无命中时 count/sum 为 0）。</p>
+     * <p><b>tenant_id 显式传</b>：与本 mapper 其它直查一致，由 service 从登录态取 tenant 显式传入，不依赖拦截器。
+     * 返回单行聚合结果（无命中时 count/sum 为 0）。</p>
      *
      * @param tenantId 租户
      * @param storeId  门店（null = 全部门店，owner 视角）
-     * @param sessDate 服务日
+     * @param start    区间起（含）
+     * @param end      区间止（含）
      * @return 单行汇总（totalCent / orderCount / cashCent / cashCount / onlineCent / onlineCount）
      */
     @Select("<script>" +
@@ -498,35 +499,54 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
         "  COALESCE(SUM(CASE WHEN out_trade_no IS NOT NULL THEN amount_cent ELSE 0 END), 0) AS onlineCent, " +
         "  COALESCE(SUM(CASE WHEN out_trade_no IS NOT NULL THEN 1 ELSE 0 END), 0) AS onlineCount " +
         "FROM gz_bean_booking " +
-        "WHERE tenant_id = #{tenantId} AND sess_date = #{sessDate} " +
+        "WHERE tenant_id = #{tenantId} AND sess_date BETWEEN #{start} AND #{end} " +
         "  AND pay_status = 'paid' AND is_free = 0 AND del_flag = '0' " +
         "<if test='storeId != null'> AND store_id = #{storeId} </if>" +
         "</script>")
-    org.dromara.gz.bean.domain.vo.GzBeanRevenueVO.Summary sumDailyRevenue(@Param("tenantId") String tenantId,
-                                                                          @Param("storeId") Long storeId,
-                                                                          @Param("sessDate") LocalDate sessDate);
+    org.dromara.gz.bean.domain.vo.GzBeanRevenueAggregateVO.Summary sumRangeRevenue(@Param("tenantId") String tenantId,
+                                                                                    @Param("storeId") Long storeId,
+                                                                                    @Param("start") LocalDate start,
+                                                                                    @Param("end") LocalDate end);
 
     /**
-     * 单日拼豆营业额「按桌型分组」（口径同 {@link #sumDailyRevenue}，多一层 {@code seat_type_snapshot} 分组）。
+     * 拼豆营业额「时间桶 × 类目」逐行聚合（口径同 {@link #sumRangeRevenue}）。
      *
-     * <p>桌型名取 {@code seat_type_snapshot}（下单时快照，防 config 改名后历史丢信息）；空快照归入「未知桌型」组
-     * 由 service 兜底显示。按营业额降序，方便 admin 看主力桌型。</p>
+     * <p><b>时间桶</b>由 {@code granularity} 决定（周一起 ISO 周 / 自然月 / 自然季度 / 自然日）；
+     * <b>类目</b> = {@code seat_type}（COALESCE 兜底 unknown）× {@code is_day_pass}（COALESCE 兜底 0=计时）。
+     * {@code typeName} 取 {@code MAX(seat_type_snapshot)} 供前端给自定义桌型标注中文名（single/double/quad
+     * 前端走 i18n 覆盖，不依赖此值）。MySQL 允许 GROUP BY 别名，故桶表达式只在 SELECT 出现一次。</p>
      *
-     * @return 每桌型一行（typeName / totalCent / orderCount）
+     * @param tenantId    租户
+     * @param storeId     门店（null = 全部门店）
+     * @param start       区间起（含）
+     * @param end         区间止（含）
+     * @param granularity 时间粒度 day/week/month/quarter（service 已白名单校验）
+     * @return 逐行（periodKey / seatType / isDayPass / totalCent / orderCount / typeName），service 透视成矩形
      */
     @Select("<script>" +
         "SELECT " +
-        "  seat_type_snapshot AS typeName, " +
+        "  <choose>" +
+        "    <when test='granularity == \"week\"'>DATE_FORMAT(sess_date, '%x-W%v')</when>" +
+        "    <when test='granularity == \"month\"'>DATE_FORMAT(sess_date, '%Y-%m')</when>" +
+        "    <when test='granularity == \"quarter\"'>CONCAT(YEAR(sess_date), '-Q', QUARTER(sess_date))</when>" +
+        "    <otherwise>DATE_FORMAT(sess_date, '%Y-%m-%d')</otherwise>" +
+        "  </choose> AS periodKey, " +
+        "  COALESCE(seat_type, 'unknown') AS seatType, " +
+        "  COALESCE(is_day_pass, 0) AS isDayPass, " +
         "  COALESCE(SUM(amount_cent), 0) AS totalCent, " +
-        "  COUNT(*) AS orderCount " +
+        "  COUNT(*) AS orderCount, " +
+        "  MAX(seat_type_snapshot) AS typeName " +
         "FROM gz_bean_booking " +
-        "WHERE tenant_id = #{tenantId} AND sess_date = #{sessDate} " +
+        "WHERE tenant_id = #{tenantId} AND sess_date BETWEEN #{start} AND #{end} " +
         "  AND pay_status = 'paid' AND is_free = 0 AND del_flag = '0' " +
         "<if test='storeId != null'> AND store_id = #{storeId} </if>" +
-        "GROUP BY seat_type_snapshot " +
-        "ORDER BY totalCent DESC" +
+        "GROUP BY periodKey, seatType, isDayPass " +
+        "ORDER BY periodKey, seatType, isDayPass" +
         "</script>")
-    List<org.dromara.gz.bean.domain.vo.GzBeanRevenueVO.TypeGroup> sumDailyRevenueByType(@Param("tenantId") String tenantId,
-                                                                                        @Param("storeId") Long storeId,
-                                                                                        @Param("sessDate") LocalDate sessDate);
+    List<org.dromara.gz.bean.domain.vo.GzBeanRevenueAggregateVO.PeriodCategoryRow> sumRangeByPeriodCategory(
+        @Param("tenantId") String tenantId,
+        @Param("storeId") Long storeId,
+        @Param("start") LocalDate start,
+        @Param("end") LocalDate end,
+        @Param("granularity") String granularity);
 }
