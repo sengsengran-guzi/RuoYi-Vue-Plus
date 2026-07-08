@@ -2285,39 +2285,6 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     }
 
     /**
-     * 代客预约（walk-in）时间松绑展开（GZ-BEAN-046，甲方口径「店员自由设分钟精度时间」）。
-     *
-     * <p>区别 {@link #validateAndExpandInterval}（mp / admin-create 的整点 + 营业窗口连续性严校验）：代客预约是店员
-     * 现场对物理座的操作，甲方要求「时间限制不要那么严、给店员充足操作空间」，故<b>只校验 {@code start < end}</b>，
-     * 允许分钟精度、不要求整点、不要求落在营业窗口内。</p>
-     *
-     * <p><b>计价 / 线上余量按整点格</b>：产出 {@code [floor(start→整点), floor(start)+1h, ...]}（逐 1h 步进到 {@code < end}）
-     * ——即本区间<b>触及的整点格</b>序列。{@link #intervalAmount} 据此逐格求和默认计价；mp 线上同桌型余量
-     * {@link #countActiveCoveringSlot} 侧对本 used 单的覆盖判定（{@code slot_start < 格+1h AND COALESCE(actual_end_slot,
-     * slot_end) > 格}）与本序列一致 —— 分钟起点（如 16:34）也占住其所在整点格（16:00 格）的线上余量，保证 mp 不超卖
-     * （Kevin 拍板「按整点格保护」）。</p>
-     *
-     * @return 区间触及的整点格起序列（升序，至少 1 格；空区间/非法 → 抛 {@link GzBeanErrorCode#SLOT_RANGE_INVALID}）
-     */
-    private List<LocalTime> expandWalkInPricingSlots(LocalTime slotStart, LocalTime slotEnd) {
-        if (slotStart == null || slotEnd == null || !slotStart.isBefore(slotEnd)) {
-            throw new ServiceException(GzBeanErrorCode.SLOT_RANGE_INVALID_MSG, GzBeanErrorCode.SLOT_RANGE_INVALID);
-        }
-        // ⚠️ 按整数小时数迭代，绝不用 LocalTime.plusHours——LocalTime 到 23:00 后 plusHours(1) 环绕成 00:00，
-        //    当 slotEnd 落在 (23:00, 24:00)（如晚间代客 23:30-23:59）时 00:00.isBefore(slotEnd) 恒真 → 死循环撑爆堆/吊死线程。
-        //    整点格 = floor(start 的整点小时) 起、到 slotEnd 之前的每个整点，h 上界 23（当日末格 [23:00, 24:00)）。
-        List<LocalTime> slots = new ArrayList<>();
-        for (int h = slotStart.getHour(); h <= 23; h++) {
-            LocalTime gi = LocalTime.of(h, 0);
-            if (!gi.isBefore(slotEnd)) {
-                break;
-            }
-            slots.add(gi);
-        }
-        return slots;
-    }
-
-    /**
      * 该日启用时段模板过滤（doc/11 §3.2 重要语义：enabled=1 + weekdays 含该 ISO 星期 + 生效区间）。
      * 复用 BEAN-002/003 口径，应用层 contains 判 weekdays（逗号分隔）。
      */
@@ -2931,9 +2898,12 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         }
 
         // ② 时间松绑（GZ-BEAN-046，甲方口径）：代客预约店员自由设「分钟精度」时间，不做整点/营业窗口连续性严校验
-        //    （区别 mp / admin-create 的 validateAndExpandInterval 整点严校验）。仅要求 start<end；
-        //    计价按跨越的整点格数（floor(start) 逐 1h 到 <end），mp 线上余量侧也按这些整点格计入本单（countActiveCoveringSlot）。
-        List<LocalTime> reqSlots = expandWalkInPricingSlots(bo.getSlotStart(), bo.getSlotEnd());
+        //    （区别 mp / admin-create 的 validateAndExpandInterval 整点严校验）。仅要求 start<end（分钟精度、不要求整点、
+        //    不要求落在营业窗口）。mp 线上同桌型余量对本 used 单的覆盖判定在 countActiveCoveringSlot 侧按整点格 SQL 直算
+        //    （slot_start < 格+1h AND COALESCE(actual_end_slot, slot_end) > 格），不依赖 Java 侧整点展开。
+        if (bo.getSlotStart() == null || bo.getSlotEnd() == null || !bo.getSlotStart().isBefore(bo.getSlotEnd())) {
+            throw new ServiceException(GzBeanErrorCode.SLOT_RANGE_INVALID_MSG, GzBeanErrorCode.SLOT_RANGE_INVALID);
+        }
 
         // ③ 座位级占用 guard（松绑 GZ-BEAN-046，甲方口径「座位只判是否空闲、给店员充足操作空间」）：
         //    Redis seat 锁 + FOR UPDATE + ③a 当下物理在座（selectSeatOccupiedNowForUpdate，分钟精度、放座即空）。
@@ -2957,17 +2927,11 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             throw new ServiceException(GzBeanErrorCode.SEAT_TAKEN_MSG, GzBeanErrorCode.SEAT_TAKEN);
         }
 
-        // ④ 计价：免费 → 0；入参 amountCent 非空则覆盖；否则逐格求和（与 mp 同口径）
-        long amountCent;
-        if (Boolean.TRUE.equals(bo.getIsFree())) {
-            amountCent = 0L;
-        } else if (bo.getAmountCent() != null) {
-            amountCent = Math.max(0L, bo.getAmountCent());
-        } else {
-            int weekday = bo.getSessDate().getDayOfWeek().getValue();
-            List<GzBeanSeatTypePrice> priceRows = seatTypePriceMapper.selectByConfig(config.getId());
-            amountCent = intervalAmount(config, priceRows, weekday, reqSlots);
-        }
+        // ④ 计价（甲方口径 GZ-BEAN-046）：免费单 或 店员未录金额（amountCent==null）→ 营业额 0，不臆造收入
+        //    （不再按桌型自动计价：店员没录金额 = 没收钱）。店员录入金额 → 该金额即实收（现场议价 / 抹零，下限 0）。
+        long amountCent = (Boolean.TRUE.equals(bo.getIsFree()) || bo.getAmountCent() == null)
+            ? 0L
+            : Math.max(0L, bo.getAmountCent());
         int isFree = Boolean.TRUE.equals(bo.getIsFree()) ? 1 : 0;
 
         // ⑤ 用户身份：传 mobile 命中既有 gz_user 则关联，否则门店租户级「线下散客」占位用户（复用 GZ-BEAN-039）

@@ -20,10 +20,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.ExtendWith;
 
-import java.util.concurrent.TimeUnit;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -51,12 +49,13 @@ import static org.mockito.Mockito.when;
  * <p><b>GZ-BEAN-046 甲方口径</b>：代客预约「时间限制不要那么严、座位只判是否空闲、给店员充足操作空间」+「时间精确到分钟」。
  * 因此本轮重写把座位冲突从「③a 当下物理在座 + ③b 整点区间重叠」收敛为<b>只剩 ③a</b>
  * （{@code selectSeatOccupiedNowForUpdate}）—— 此刻这把椅子没人坐即可代客，不再做整点区间重叠校验；时间放开到<b>分钟精度</b>
- * （仅 {@code start < end}，不要求整点 / 营业窗口），计价按<b>跨越的整点格数</b>（{@code floor(start)} 逐 1h 到 {@code < end}）。</p>
+ * （仅 {@code start < end}，不要求整点 / 营业窗口）。<b>计价（甲方口径 GZ-BEAN-046）：店员未录金额 → 营业额 0，不按桌型
+ * 自动计价；录入金额则该金额即实收（议价 / 抹零）。</b></p>
  *
  * <p><b>为什么座位冲突改用 mock 断言而非内存库真谓词</b>：区间重叠防超卖（旧 ③b）已删，座位唯一硬约束是「当下物理在座」，
  * 由 {@code selectSeatOccupiedNowForUpdate} 判定（真库 FOR UPDATE + Redis 锁串行化由 Tier 1B / staging 覆盖）。
  * 本层证 service 业务正确性：空闲即放行（即便同座同区间已有活跃单，只要此刻没人坐）、当下在座即 SEAT_TAKEN、
- * 分钟精度存取、按整点格计价。<b>顺带守住 memory version-entity-insert-then-updatebyid-noop</b>：断言一次 insert 就带
+ * 分钟精度存取、未录金额营业额 0。<b>顺带守住 memory version-entity-insert-then-updatebyid-noop</b>：断言一次 insert 就带
  * seat_id、绝不 updateById 补。</p>
  */
 @Tag("dev")
@@ -97,10 +96,7 @@ class GzBeanWalkInServiceImplTest {
     private static final LocalTime T1634 = LocalTime.of(16, 34);
     private static final LocalTime T1700 = LocalTime.of(17, 0);
     private static final LocalTime T1750 = LocalTime.of(17, 50);
-    private static final LocalTime T2200 = LocalTime.of(22, 0);
-    private static final LocalTime T2300 = LocalTime.of(23, 0);
     private static final LocalTime T2330 = LocalTime.of(23, 30);
-    private static final LocalTime T2301 = LocalTime.of(23, 1);
     private static final LocalTime T2359 = LocalTime.of(23, 59);
 
     @BeforeEach
@@ -118,7 +114,6 @@ class GzBeanWalkInServiceImplTest {
         service = org.mockito.Mockito.spy(real);
         lenient().doReturn(true).when(service).tryAcquireRedisLock(anyString());
         lenient().doNothing().when(service).releaseRedisLock(anyString());
-        lenient().when(seatTypePriceMapper.selectByConfig(anyLong())).thenReturn(List.of());
 
         GzBeanStore store = new GzBeanStore();
         store.setId(STORE_ID);
@@ -206,7 +201,7 @@ class GzBeanWalkInServiceImplTest {
     }
 
     @Test
-    @DisplayName("★分钟精度 happy · 16:34-17:50 → used/paid/seat_id 配齐、slot 存分钟原值、按跨越整点格计价（16、17 两格 = 2×5000）")
+    @DisplayName("★分钟精度 happy · 16:34-17:50 未录金额 → used/paid/seat_id 配齐、slot 存分钟原值、营业额 0（不自动计价）")
     void walkIn_happyMinutePrecise() {
         GzBeanBookingVO vo = service.walkInCreate(walkInBo(T1634, T1750, false, null), "staff1");
 
@@ -225,59 +220,21 @@ class GzBeanWalkInServiceImplTest {
         assertNotNull(saved.getVerifyTime());
         assertEquals("staff1", saved.getVerifiedBy());
         assertEquals(0, saved.getIsFree());
-        // 计价按跨越的整点格：16:34-17:50 触及 16:00、17:00 两格 × 基础价 5000 = 10000（priceRows 空 → 回退 config.priceCent）
-        assertEquals(10000L, saved.getAmountCent());
+        // 甲方口径（GZ-BEAN-046）：店员未录金额（amountCent=null）→ 营业额 0，不按桌型自动计价（不臆造收入）
+        assertEquals(0L, saved.getAmountCent(), "未录金额 → 营业额 0");
         // ★ 一次 insert，绝不 updateById（防 @Version 静默不落坑）
         verify(bookingMapper, never()).updateById(any(GzBeanBooking.class));
         verify(bookingMapper).insert(any(GzBeanBooking.class));
     }
 
     @Test
-    @DisplayName("整点 happy · 14:00-16:00 → 两整点格 = 2×5000（整点区间仍按格计价，兼容旧行为）")
-    void walkIn_happyWholeHour() {
-        service.walkInCreate(walkInBo(T14, T16, false, null), "staff1");
-        GzBeanBooking saved = memBookings.get(0);
-        assertEquals(T14, saved.getSlotStart());
-        assertEquals(10000L, saved.getAmountCent());
-    }
-
-    @Test
-    @DisplayName("不满整点计价 · 16:34-17:00 → 只触及 16:00 一格 = 1×5000（floor(start) 逐格到 <end）")
-    void walkIn_partialHourBilling() {
-        service.walkInCreate(walkInBo(T1634, T1700, false, null), "staff1");
-        GzBeanBooking saved = memBookings.get(0);
-        assertEquals(5000L, saved.getAmountCent(), "16:34-17:00 只触及 16:00 格 = 1 格价");
-    }
-
-    // ── ★午夜环绕死循环回归（GZ-BEAN-046 对抗审查逮到的 blocker）──
-    // expandWalkInPricingSlots 曾用 LocalTime.plusHours(1) 迭代：到 23:00 后环绕成 00:00，slotEnd∈(23:00,24:00) 时死循环。
-    // @Timeout 兜底：若回退到环绕死循环，测试超时失败而非吊死整个构建。
-
-    @Test
-    @Timeout(value = 5, unit = TimeUnit.SECONDS)
-    @DisplayName("★午夜边界 · 23:30-23:59 → 只触及 23:00 一格（必须终止，不得死循环）")
-    void walkIn_lateNight_2330_2359_terminates() {
+    @DisplayName("午夜边界 · 23:30-23:59 未录金额 → used 单入库、分钟原值存、营业额 0（末格分钟精度不炸）")
+    void walkIn_lateNight_2330_2359() {
         service.walkInCreate(walkInBo(T2330, T2359, false, null), "staff1");
         GzBeanBooking saved = memBookings.get(0);
         assertEquals(T2330, saved.getSlotStart());
         assertEquals(T2359, saved.getSlotEnd());
-        assertEquals(5000L, saved.getAmountCent(), "23:30-23:59 只触及 23:00 格 = 1 格价");
-    }
-
-    @Test
-    @Timeout(value = 5, unit = TimeUnit.SECONDS)
-    @DisplayName("★午夜边界 · 23:00-23:01 → 只触及 23:00 一格（末格窄区间，必须终止）")
-    void walkIn_lateNight_2300_2301_terminates() {
-        service.walkInCreate(walkInBo(T2300, T2301, false, null), "staff1");
-        assertEquals(5000L, memBookings.get(0).getAmountCent());
-    }
-
-    @Test
-    @Timeout(value = 5, unit = TimeUnit.SECONDS)
-    @DisplayName("★午夜边界 · 22:00-23:59 → 触及 22、23 两格 = 2×5000（跨到末格，必须终止）")
-    void walkIn_lateNight_2200_2359_terminates() {
-        service.walkInCreate(walkInBo(T2200, T2359, false, null), "staff1");
-        assertEquals(10000L, memBookings.get(0).getAmountCent(), "22:00-23:59 触及 22、23 两格 = 2 格价");
+        assertEquals(0L, saved.getAmountCent(), "未录金额 → 营业额 0");
     }
 
     @Test
