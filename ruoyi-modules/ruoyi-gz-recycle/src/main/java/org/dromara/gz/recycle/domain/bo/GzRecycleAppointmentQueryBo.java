@@ -34,4 +34,13 @@ public class GzRecycleAppointmentQueryBo implements Serializable {
     /** 预约日期止（含） */
     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)
     private LocalDate apptDateEnd;
+
+    /** 点数档编码（qty_bucket_code；存于 product_snapshot_json，回收看板记录区按点数档筛选，GZ-RECYCLE-008） */
+    private String qtyBucketCode;
+
+    /** 实付金额下限（分，含；按最终收款金额区间筛选） */
+    private Long finalAmountCentMin;
+
+    /** 实付金额上限（分，含） */
+    private Long finalAmountCentMax;
 }

@@ -1,5 +1,6 @@
 package org.dromara.gz.recycle.controller.applet;
 
+import cn.dev33.satoken.annotation.SaIgnore;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -10,15 +11,15 @@ import org.dromara.common.satoken.utils.LoginHelper;
 import org.dromara.gz.recycle.domain.bo.GzRecycleAppointmentSubmitBo;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleCategoryVO;
-import org.dromara.gz.recycle.domain.vo.GzRecycleIpVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleQtyRangeVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleTimeSlotVO;
+import org.dromara.gz.recycle.domain.vo.RecycleSlotAvailabilityVO;
 import org.dromara.gz.recycle.domain.vo.RecycleVerifyCodeVO;
 import org.dromara.gz.recycle.service.IGzRecycleAppointmentService;
-import org.dromara.gz.recycle.service.IGzRecycleIpService;
 import org.dromara.gz.recycle.service.IGzRecyclePriceRuleService;
 import org.dromara.gz.recycle.service.IGzRecycleQtyRangeService;
 import org.dromara.gz.recycle.service.IGzRecycleTimeSlotService;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -28,26 +29,29 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.time.LocalDate;
 import java.util.List;
 
 /**
- * mp 端回收预约 Controller（ADR-0012：去估价 + 单份多选 + 桶 + IP + 核销码）。
+ * mp 端回收预约 Controller（GZ-RECYCLE-007 放开：去 IP / 去拍照 + 点数档 + 时段容量 + 核销码）。
  *
  * <p>路径 {@code /app/gz/recycle/appointment}（mp 前缀 {@code /app/} 与 admin {@code /system/} 区分）。</p>
  *
  * <p>端点：</p>
  * <ul>
- *   <li>{@code GET  /ips} — 启用 IP 多选源（契约 §C.2）</li>
- *   <li>{@code GET  /qty-ranges} — 启用数量桶单选源（契约 §C.2，带 durationMinutes）</li>
- *   <li>{@code GET  /time-slots?storeId} — 某门店启用到店时段单选源（GZ-RECYCLE-006，按门店可配）</li>
+ *   <li>{@code GET  /qty-ranges} — 启用点数档单选源（带 durationMinutes + occupyNextSlot）</li>
+ *   <li>{@code GET  /time-slots?storeId} — 某门店启用到店时段列表（GZ-RECYCLE-006，按门店可配）</li>
+ *   <li>{@code GET  /slot-availability?storeId&date} — 某门店某日各时段可用性（占用置灰，GZ-RECYCLE-007）</li>
  *   <li>{@code GET  /categories} — 可回收品类下拉</li>
- *   <li>{@code POST /submit} — 提交回收预约（单份多选，去估价，落 submitted）</li>
+ *   <li>{@code POST /submit} — 提交回收预约（点数档 + 时段容量，去 IP / 去拍照，落 submitted）</li>
  *   <li>{@code GET  /my} — 我的回收记录列表（顾客窄 VO 三段）</li>
  *   <li>{@code GET  /{id}} — 我的回收预约详情（仅本人，顾客窄 VO）</li>
  *   <li>{@code GET  /{id}/verify-code} — 取到店核销码（契约 §F.2，仅本人）</li>
  * </ul>
  *
- * <p><b>登录态</b>：本接口需登录态；sa-token 全局拦截，未登录 → 401。userId / openid 由 sa-token 拿。</p>
+ * <p><b>登录态</b>：只读浏览端点（qty-ranges / time-slots / slot-availability / categories）<b>匿名可读</b>
+ * （{@link SaIgnore}，browse-first：回收是落地 tab，游客先浏览点数档 / 时段 / 品类再决定是否预约，仅只读、无个人数据）；
+ * 提交 / 我的 / 详情 / 核销码端点仍需登录态（未登录 → 401，userId / openid 由 sa-token 拿），故注解打在方法级。</p>
  *
  * @author kevin-coder (sensenran-guzi · GZ-RECYCLE-004)
  */
@@ -60,37 +64,23 @@ public class GzRecycleAppointmentMpController {
 
     private final IGzRecycleAppointmentService appointmentService;
     private final IGzRecyclePriceRuleService priceRuleService;
-    private final IGzRecycleIpService ipService;
     private final IGzRecycleQtyRangeService qtyRangeService;
     private final IGzRecycleTimeSlotService timeSlotService;
 
     /**
-     * 启用 IP 列表（mp 填单多选源，契约 15a §C.2 / ADR-0012 §4）。
-     *
-     * <pre>
-     * GET /app/gz/recycle/appointment/ips
-     * 200 OK { "code":200, "data": [ {"id":"3","ipName":"火影",...}, {"id":"7","ipName":"海贼王",...} ] }
-     * </pre>
-     *
-     * <p>仅返 enabled=1，按 sort_no/id 升序；登录态即可（无新权限）。用户从此列表多选 → 提交 ipIds；
-     * 不在列表的走 customIps 自由文本（与列表项并存）。</p>
-     */
-    @GetMapping("/ips")
-    public R<List<GzRecycleIpVO>> ips() {
-        return R.ok(ipService.listEnabled());
-    }
-
-    /**
-     * 启用数量桶列表（mp 填单单选源，契约 15a §C.2 / ADR-0012 §3，带 durationMinutes）。
+     * 启用点数档列表（mp 填单单选源，GZ-RECYCLE-007 放开，带 durationMinutes + occupyNextSlot）。
      *
      * <pre>
      * GET /app/gz/recycle/appointment/qty-ranges
-     * 200 OK { "code":200, "data": [ {"id":"1","code":"1-25","label":"1-25 件","durationMinutes":30,...} ] }
+     * 200 OK { "code":200, "data": [ {"id":"1","code":"pts-1-50","label":"1-50 点","durationMinutes":60,"occupyNextSlot":0,...} ] }
      * </pre>
      *
-     * <p>仅返 enabled=1，按 sort_no/id 升序；登录态即可（无新权限）。用户单选桶 → 提交 qtyBucketCode；
-     * 该桶 durationMinutes = 预计回收时长，提交时后端按 code 查表落 matched_duration_minutes。</p>
+     * <p>仅返 enabled=1，按 sort_no/id 升序；登录态即可（无新权限）。用户单选点数档 → 提交 qtyBucketCode；
+     * durationMinutes = 预计回收时长，occupyNextSlot=1（大单）下单时额外占用下一个到店时段。</p>
+     *
+     * <p>匿名可读（{@link SaIgnore}，browse-first）：游客浏览点数档所需，仅只读、无个人数据。</p>
      */
+    @SaIgnore
     @GetMapping("/qty-ranges")
     public R<List<GzRecycleQtyRangeVO>> qtyRanges() {
         return R.ok(qtyRangeService.listEnabled());
@@ -107,10 +97,36 @@ public class GzRecycleAppointmentMpController {
      * <p>仅返该门店 {@code enabled=1} 时段，按 sort_no/start_time/id 升序；登录态即可（无新权限）。
      * 用户单选时段 → 提交 timeSlotId；后端按 id 取起止时间落预约单 slot_start/slot_end。
      * storeId 缺省返空列表（前端先选门店再拉时段）。</p>
+     *
+     * <p>匿名可读（{@link SaIgnore}，browse-first）：游客浏览门店到店时段所需，仅只读、无个人数据。</p>
      */
+    @SaIgnore
     @GetMapping("/time-slots")
     public R<List<GzRecycleTimeSlotVO>> timeSlots(@RequestParam(required = false) Long storeId) {
         return R.ok(timeSlotService.listEnabledByStore(storeId));
+    }
+
+    /**
+     * 某门店某日到店时段可用性（GZ-RECYCLE-007 放开，mp 选时段实时显「可约/已占」）。
+     *
+     * <pre>
+     * GET /app/gz/recycle/appointment/slot-availability?storeId=1&amp;date=2026-07-15
+     * 200 OK { "code":200, "data": [ {"id":"5","label":"上午","startTime":"10:00:00","endTime":"13:00:00","taken":false}, ... ] }
+     * </pre>
+     *
+     * <p>逐个本店 enabled 时段带 {@code taken}：占用真源 = 活跃单 {@code time_slot_id=本档 OR spill_time_slot_id=本档}
+     * （每档容量 1，大单额外占下一档）。前端把 taken=true 的档置灰禁选。登录态即可（无新权限）。
+     * storeId / date 缺省 → 空列表 / 全 taken=false。</p>
+     *
+     * <p>匿名可读（{@link SaIgnore}，browse-first）：游客浏览时段可用性所需，仅只读占用布尔、无个人数据
+     * （与拼豆 type-slots / seat-map 一致口径）。</p>
+     */
+    @SaIgnore
+    @GetMapping("/slot-availability")
+    public R<List<RecycleSlotAvailabilityVO>> slotAvailability(
+        @RequestParam(required = false) Long storeId,
+        @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        return R.ok(appointmentService.getSlotAvailability(storeId, date));
     }
 
     /**
@@ -123,26 +139,33 @@ public class GzRecycleAppointmentMpController {
      *
      * <p>= 价目表有 enabled 规则的 distinct category + 字典 gz_recycle_category 中文 label。
      * 去估价后价目表停用于估价，但 category 维度仍作品类来源（停用表保留可查）。</p>
+     *
+     * <p>匿名可读（{@link SaIgnore}，browse-first）：游客浏览可回收品类所需，仅只读、无个人数据。</p>
      */
+    @SaIgnore
     @GetMapping("/categories")
     public R<List<GzRecycleCategoryVO>> categories() {
         return R.ok(priceRuleService.listCategories());
     }
 
     /**
-     * 提交回收预约（ADR-0012 §2，单份多选 + 去估价，落 status=submitted）。
+     * 提交回收预约（GZ-RECYCLE-007 放开：去 IP / 去拍照，落 status=submitted）。
      *
      * <pre>
      * POST /app/gz/recycle/appointment/submit
-     * Body: { storeId, product:{categories[],ipIds[],customIps[],qtyBucketCode}, remark?, imageIds:[..], arrivalSlot, apptDate }
+     * Body: { storeId, product:{categories[],qtyBucketCode}, remark?, timeSlotId, apptDate }
      *
-     * 200 OK { "code":200, "data": { appointmentNo:"RCY-20260622-000001", matchedDurationMinutes, status:"submitted", ... } }
+     * 200 OK { "code":200, "data": { appointmentNo:"RCY-20260708-000001", matchedDurationMinutes, status:"submitted", ... } }
      *
      * 业务错误（R.code，mp 端按 code 决定 UX）：
-     *   4101 SUBMIT_IMAGE_REQUIRED   → 「请先拍照上传实物再提交」（前端已先拦截，后端兜底）
      *   4103 OPENID_REQUIRED         → 「请重新授权微信登录后再提交回收」
-     *   4107 QTY_BUCKET_INVALID      → 「数量区间无效，请重选」
+     *   4125 MOBILE_REQUIRED         → 「请先提供手机号再预约回收」
+     *   4107 QTY_BUCKET_INVALID      → 「点数区间无效，请重选」
      *   4108 CATEGORY_REQUIRED       → 「请至少选择一个回收品类」
+     *   4124 SLOT_INVALID            → 「到店时段无效或已关闭，请重新选择」
+     *   4122 SLOT_TAKEN              → 「该时段已被预约，请换个时段」
+     *   4123 SLOT_SPILL_BLOCKED      → 「该点数需连占下一个时段，但下一个时段已被预约」
+     *   4126 SLOT_LOCK_BUSY          → 「预约繁忙，请稍后重试」
      * </pre>
      */
     @PostMapping("/submit")
@@ -152,10 +175,10 @@ public class GzRecycleAppointmentMpController {
         if (userId == null) {
             return R.fail(401, "未登录");
         }
-        log.info("[recycle-mp] submit userId={} storeId={} bucket={} images={}",
+        log.info("[recycle-mp] submit userId={} storeId={} bucket={} timeSlotId={}",
             userId, bo.getStoreId(),
             bo.getProduct() == null ? null : bo.getProduct().getQtyBucketCode(),
-            bo.getImageIds() == null ? 0 : bo.getImageIds().size());
+            bo.getTimeSlotId());
         return R.ok(appointmentService.submit(bo, userId));
     }
 

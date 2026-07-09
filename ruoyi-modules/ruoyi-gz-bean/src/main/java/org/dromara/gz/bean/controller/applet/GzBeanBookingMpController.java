@@ -86,7 +86,6 @@ public class GzBeanBookingMpController {
      *   4016 SLOT_RANGE_INVALID      → 「所选时段不连续或跨越休息时段」（跳选 / 跨午休 / 含不可约格）
      *   4012 SEAT_TYPE_NOT_CONFIGURED→ 「该座位暂未开放」（座未挂桌型 / 桌型缺失）
      *   4013 SEAT_TYPE_DISABLED      → 「该座位所属桌型已停用」
-     *   4014 WECHAT_ID_REQUIRED      → 弹填微信号
      *   4004 SUBMIT_TOO_FAST         → 「操作过快」
      * </pre>
      */
@@ -129,7 +128,7 @@ public class GzBeanBookingMpController {
      * 200 OK（付费单）：{ ...GzBeanPaidSubmitVO，amountCent=固定包天价，payParams=五参... }
      *
      * 业务错误（R.code，mp 端按 code 提示）：
-     *   4001 PHONE_REQUIRED / 4014 WECHAT_ID_REQUIRED → 弹授权
+     *   4001 PHONE_REQUIRED          → 弹授权手机号
      *   4012 SEAT_TYPE_NOT_CONFIGURED / 4013 SEAT_TYPE_DISABLED
      *   4025 DAY_PASS_NOT_OPEN        → 「该桌型暂未开放包天」
      *   4024 DAY_PASS_FULL            → 「今日包天名额已满」

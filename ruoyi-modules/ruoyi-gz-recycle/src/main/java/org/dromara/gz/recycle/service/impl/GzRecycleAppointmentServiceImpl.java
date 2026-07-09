@@ -11,6 +11,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.exception.ServiceException;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
+import org.dromara.common.redis.utils.RedisUtils;
 import org.dromara.common.tenant.helper.TenantHelper;
 import org.dromara.gz.common.domain.entity.GzUser;
 import org.dromara.gz.common.mapper.GzUserMapper;
@@ -29,27 +30,33 @@ import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentAdminVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleProductVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleQtyRangeVO;
+import org.dromara.gz.recycle.domain.vo.GzRecycleTimeSlotVO;
+import org.dromara.gz.recycle.domain.vo.RecycleSlotAvailabilityVO;
 import org.dromara.gz.recycle.domain.vo.RecycleVerifyCodeVO;
 import org.dromara.gz.recycle.exception.GzRecycleErrorCode;
 import org.dromara.gz.recycle.mapper.GzRecycleAppointmentMapper;
 import org.dromara.gz.recycle.service.IGzRecycleAppointmentService;
-import org.dromara.gz.recycle.service.IGzRecycleIpService;
 import org.dromara.gz.recycle.service.IGzRecycleQtyRangeService;
 import org.dromara.gz.recycle.service.IGzRecycleTimeSlotService;
 import org.dromara.gz.recycle.service.internal.RecycleApptNoGenerator;
 import org.dromara.gz.recycle.service.internal.RecycleQrSigner;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Objects;
+import java.util.Set;
 
 /**
  * 回收预约单服务实现（ADR-0012：去估价 + 单份多选 + 桶→时长 + 核销码 + 聚合详情）。
@@ -77,6 +84,14 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
     /** 钩子 / no_show 单轮扫描上限（防雪崩，与 PAY-105 SCAN_LIMIT 同口径） */
     private static final int SCAN_LIMIT = 100;
 
+    /** 占用到店时段的活跃态（GZ-RECYCLE-007；{@code cancelled / no_show} 释放不占） */
+    private static final List<String> ACTIVE_HOLD_STATUSES =
+        List.of("submitted", "confirmed_onsite", "paying", "paid", "payout_failed");
+    /** Redis 锁前缀：同门店同日下单串行化（时段容量防超卖，gz:recycle:lock:slot:{store}:{date}） */
+    private static final String LOCK_SLOT_PREFIX = "gz:recycle:lock:slot:";
+    /** Redis 锁 TTL（同拼豆 5s） */
+    private static final Duration LOCK_TTL = Duration.ofSeconds(5);
+
     // 旧到店档常量（GZ-RECYCLE-006 起到店时段改 admin 按门店可配；下列仅 deriveArrivalSlot 用于
     // 回显历史单的 morning/afternoon 标签，提交链路已改走 timeSlotService）。
     private static final String ARRIVAL_MORNING = "morning";
@@ -88,9 +103,8 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
     private final GzUserMapper gzUserMapper;
     private final RecycleApptNoGenerator apptNoGenerator;
     private final IGzRecycleQtyRangeService qtyRangeService;
-    /** 到店时段服务（GZ-RECYCLE-006，按门店可配；提交按 timeSlotId 取起止落预约单 slot_start/slot_end） */
+    /** 到店时段服务（GZ-RECYCLE-006，按门店可配；提交取本店 enabled 时段有序列表定位选中档 + 下一档） */
     private final IGzRecycleTimeSlotService timeSlotService;
-    private final IGzRecycleIpService ipService;
     private final RecycleQrSigner qrSigner;
     /** 全局 Jackson ObjectMapper（spring 注入；product_snapshot_json 序列化/反序列化，可单测注入真实实例） */
     private final ObjectMapper objectMapper;
@@ -105,35 +119,28 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
     private static final long DEFAULT_FINAL_MAX_CENT = 100000L;
 
     @Override
-    @Transactional(rollbackFor = Exception.class)
+    @Transactional(rollbackFor = Exception.class, isolation = Isolation.REPEATABLE_READ)
     public GzRecycleAppointmentVO submit(GzRecycleAppointmentSubmitBo bo, Long userId) {
+        // ⚠️ 防超卖正确性前提（镜像拼豆 submitPaid）：⑤ FOR UPDATE 靠 InnoDB 间隙锁串行化并发同档下单，
+        //    命中 0 行也锁索引区段挡并发 INSERT 后读旧 count，仅 REPEATABLE_READ 成立，故此处显式声明 RR。
         if (userId == null) {
             throw new ServiceException("未登录");
         }
 
-        // ① imageIds 必填二次校验（拍照前置声明 §5，前端已先拦截，后端兜底）
-        List<Long> imageIds = bo.getImageIds();
-        if (imageIds == null || imageIds.isEmpty() || imageIds.stream().anyMatch(Objects::isNull)) {
-            throw new ServiceException(GzRecycleErrorCode.SUBMIT_IMAGE_REQUIRED_MSG, GzRecycleErrorCode.SUBMIT_IMAGE_REQUIRED);
-        }
-
-        // ② product 对象 + categories 非空（契约 §B.5 4108）
+        // ① product + categories 非空（契约 §B.5 4108）
         GzRecycleAppointmentSubmitBo.ProductBo product = bo.getProduct();
         if (product == null || product.getCategories() == null
             || product.getCategories().stream().filter(StrUtil::isNotBlank).findAny().isEmpty()) {
             throw new ServiceException(GzRecycleErrorCode.CATEGORY_REQUIRED_MSG, GzRecycleErrorCode.CATEGORY_REQUIRED);
         }
 
-        // ③ 数量桶命中启用桶（契约 §B.3/§B.5 4107）→ 取 duration_minutes + label 快照
+        // ② 点数档命中启用档（4107）→ 取 duration_minutes + occupy_next_slot + label 快照
         GzRecycleQtyRangeVO bucket = qtyRangeService.getEnabledByCode(product.getQtyBucketCode());
         if (bucket == null) {
             throw new ServiceException(GzRecycleErrorCode.QTY_BUCKET_INVALID_MSG, GzRecycleErrorCode.QTY_BUCKET_INVALID);
         }
 
-        // ④ 到店时段 → slot_start/slot_end（GZ-RECYCLE-006，按门店可配；校验属本店 + 启用，取起止快照）
-        LocalTime[] slot = resolveTimeSlot(bo.getTimeSlotId(), bo.getStoreId());
-
-        // ⑤ 用户存在 + receiver_openid（E5，反向打款必需）+ 快照
+        // ③ 用户存在 + receiver_openid（反向打款必需 4103）+ 手机号（放开后必填 4125）+ 快照
         GzUser user = gzUserMapper.selectById(userId);
         if (user == null) {
             throw new ServiceException("用户不存在");
@@ -141,26 +148,50 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         if (StrUtil.isBlank(user.getOpenid())) {
             throw new ServiceException(GzRecycleErrorCode.OPENID_REQUIRED_MSG, GzRecycleErrorCode.OPENID_REQUIRED);
         }
+        if (StrUtil.isBlank(user.getMobile())) {
+            throw new ServiceException(GzRecycleErrorCode.MOBILE_REQUIRED_MSG, GzRecycleErrorCode.MOBILE_REQUIRED);
+        }
+        String tenantId = user.getTenantId();
 
-        // ⑥ IP 名快照（ipIds → join 取名 + customIps 并存）
-        List<String> ipNames = ipService.listNamesByIds(product.getIpIds());
+        // ④ 到店时段：本店 enabled 有序列表中定位选中档（非法/跨店/已关闭 → 4124）+ 计算下一档 + 是否大单占位。
+        //    FLAT 规则（客户 7.08）：大单（occupy_next_slot=1）额外占下一 enabled 档；末档无下一档 → 不占（晚 7 点例外）。
+        List<GzRecycleTimeSlotVO> enabledSlots = timeSlotService.listEnabledByStore(bo.getStoreId());
+        int idx = indexOfSlot(enabledSlots, bo.getTimeSlotId());
+        if (idx < 0) {
+            throw new ServiceException(GzRecycleErrorCode.SLOT_INVALID_MSG, GzRecycleErrorCode.SLOT_INVALID);
+        }
+        GzRecycleTimeSlotVO chosen = enabledSlots.get(idx);
+        GzRecycleTimeSlotVO next = (idx + 1 < enabledSlots.size()) ? enabledSlots.get(idx + 1) : null;
+        boolean occupiesNext = bucket.getOccupyNextSlot() != null && bucket.getOccupyNextSlot() == 1 && next != null;
+        Long spillSlotId = occupiesNext ? next.getId() : null;
 
-        // ⑦ product_snapshot_json 落对象（categories/ipIds/ipNames/customIps/qtyBucketCode/qtyBucketLabel）
+        // ⑤ 时段容量防超卖（每门店每天每档 1 单 + 大单连占下一档）：
+        //    (store,date) Redis 锁串行化同门店同日下单 + FOR UPDATE 计活跃占用（RR 间隙锁兜底），任一档已占则拒。
+        String lockKey = LOCK_SLOT_PREFIX + bo.getStoreId() + ":" + bo.getApptDate();
+        if (!tryAcquireRedisLock(lockKey)) {
+            throw new ServiceException(GzRecycleErrorCode.SLOT_LOCK_BUSY_MSG, GzRecycleErrorCode.SLOT_LOCK_BUSY);
+        }
+        registerLockReleaseOnTxEnd(lockKey);
+
+        if (baseMapper.countActiveHoldingSlotForUpdate(tenantId, bo.getStoreId(), bo.getApptDate(), chosen.getId()) > 0) {
+            throw new ServiceException(GzRecycleErrorCode.SLOT_TAKEN_MSG, GzRecycleErrorCode.SLOT_TAKEN);
+        }
+        if (occupiesNext
+            && baseMapper.countActiveHoldingSlotForUpdate(tenantId, bo.getStoreId(), bo.getApptDate(), spillSlotId) > 0) {
+            throw new ServiceException(GzRecycleErrorCode.SLOT_SPILL_BLOCKED_MSG, GzRecycleErrorCode.SLOT_SPILL_BLOCKED);
+        }
+
+        // ⑥ product_snapshot_json 落对象（放开后去 IP：ip 字段留空，兼容老 VO 结构 + 老单展示）
         GzRecycleProductVO snapshot = new GzRecycleProductVO();
         snapshot.setCategories(product.getCategories().stream().filter(StrUtil::isNotBlank).toList());
-        snapshot.setIpIds(product.getIpIds() == null ? List.of()
-            : product.getIpIds().stream().filter(Objects::nonNull).toList());
-        snapshot.setIpNames(ipNames);
-        snapshot.setCustomIps(product.getCustomIps() == null ? List.of()
-            : product.getCustomIps().stream().filter(StrUtil::isNotBlank).map(StrUtil::trim).toList());
+        snapshot.setIpIds(List.of());
+        snapshot.setIpNames(List.of());
+        snapshot.setCustomIps(List.of());
         snapshot.setQtyBucketCode(bucket.getCode());
         snapshot.setQtyBucketLabel(bucket.getLabel());
         String productJson = writeProductJson(snapshot);
 
-        // ⑧ imageIds 落库逗号分隔 image_id（不存裸 url，强约束 #5）
-        String imageIdsStr = StrUtil.join(",", imageIds);
-
-        // ⑨ 生成业务码 + INSERT（status=submitted；去估价：estimated/total_qty=null，时长=桶 duration）
+        // ⑦ 生成业务码 + INSERT（放开后：无实物照 / 无微信号快照；带 time_slot_id + spill_time_slot_id；去估价 null）
         String appointmentNo = apptNoGenerator.generate();
         GzRecycleAppointment entity = GzRecycleAppointment.builder()
             .appointmentNo(appointmentNo)
@@ -171,32 +202,95 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             .matchedDurationMinutes(bucket.getDurationMinutes())
             .estimatedAmountCent(null)
             .apptDate(bo.getApptDate())
-            .slotStart(slot[0])
-            .slotEnd(slot[1])
-            .submitImageIds(imageIdsStr)
+            .slotStart(chosen.getStartTime())
+            .slotEnd(chosen.getEndTime())
+            .timeSlotId(chosen.getId())
+            .spillTimeSlotId(spillSlotId)
+            .submitImageIds(null)
             .receiverOpenid(user.getOpenid())
             .mobileSnapshot(user.getMobile())
-            .wechatIdSnapshot(user.getWechatId())
             .status(STATUS_SUBMITTED)
             .version(0)
             .delFlag("0")
             .build();
         baseMapper.insert(entity);
 
-        log.info("[gz-recycle] appointment SUBMIT no={} userId={} storeId={} categories={} bucket={} duration={} images={}",
-            appointmentNo, userId, bo.getStoreId(), snapshot.getCategories(), bucket.getCode(),
-            bucket.getDurationMinutes(), imageIds.size());
+        log.info("[gz-recycle] appointment SUBMIT no={} userId={} storeId={} date={} slot={} spill={} categories={} bucket={} duration={}",
+            appointmentNo, userId, bo.getStoreId(), bo.getApptDate(), chosen.getId(), spillSlotId,
+            snapshot.getCategories(), bucket.getCode(), bucket.getDurationMinutes());
 
         return toVO(entity);
     }
 
-    /** 到店时段 id → [slot_start, slot_end]（GZ-RECYCLE-006，按门店可配）；非法 / 跨店 / 已停用抛业务异常。 */
-    private LocalTime[] resolveTimeSlot(Long timeSlotId, Long storeId) {
-        LocalTime[] slot = timeSlotService.resolveEnabledSlot(timeSlotId, storeId);
-        if (slot == null) {
-            throw new ServiceException("到店时段无效或已停用，请重新选择");
+    @Override
+    public List<RecycleSlotAvailabilityVO> getSlotAvailability(Long storeId, LocalDate date) {
+        List<GzRecycleTimeSlotVO> slots = timeSlotService.listEnabledByStore(storeId);
+        if (slots.isEmpty()) {
+            return List.of();
         }
-        return slot;
+        Set<Long> taken = new HashSet<>();
+        if (date != null) {
+            List<GzRecycleAppointment> active = baseMapper.selectList(Wrappers.<GzRecycleAppointment>lambdaQuery()
+                .eq(GzRecycleAppointment::getStoreId, storeId)
+                .eq(GzRecycleAppointment::getApptDate, date)
+                .in(GzRecycleAppointment::getStatus, ACTIVE_HOLD_STATUSES));
+            for (GzRecycleAppointment a : active) {
+                if (a.getTimeSlotId() != null) {
+                    taken.add(a.getTimeSlotId());
+                }
+                if (a.getSpillTimeSlotId() != null) {
+                    taken.add(a.getSpillTimeSlotId());
+                }
+            }
+        }
+        return slots.stream().map(s -> {
+            RecycleSlotAvailabilityVO vo = new RecycleSlotAvailabilityVO();
+            vo.setId(s.getId());
+            vo.setLabel(s.getLabel());
+            vo.setStartTime(s.getStartTime());
+            vo.setEndTime(s.getEndTime());
+            vo.setTaken(taken.contains(s.getId()));
+            return vo;
+        }).toList();
+    }
+
+    /** 在本店 enabled 时段有序列表中定位 timeSlotId 的下标（未命中返 -1）。 */
+    private int indexOfSlot(List<GzRecycleTimeSlotVO> slots, Long timeSlotId) {
+        if (timeSlotId == null) {
+            return -1;
+        }
+        for (int i = 0; i < slots.size(); i++) {
+            if (timeSlotId.equals(slots.get(i).getId())) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /* ---------------- 时段容量防超卖 Redis 锁（镜像拼豆 GzBeanBookingServiceImpl） ---------------- */
+
+    /** 抢 Redis 锁（{@code SET key NX EX 5}）。protected 便于单测 spy override（RedisUtils 静态工具依赖 Spring 容器）。 */
+    protected boolean tryAcquireRedisLock(String key) {
+        return RedisUtils.setObjectIfAbsent(key, "1", LOCK_TTL);
+    }
+
+    /** 释放 Redis 锁（{@code DEL key}）。protected 同上 —— 单测可 spy override。 */
+    protected void releaseRedisLock(String key) {
+        RedisUtils.deleteObject(key);
+    }
+
+    /** 事务结束（提交/回滚）即释放 Redis 锁；无事务（单测/异常路径）→ 立即释放（防回滚后锁残留 ≤TTL 误锁）。 */
+    private void registerLockReleaseOnTxEnd(String lockKey) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCompletion(int status) {
+                    releaseRedisLock(lockKey);
+                }
+            });
+        } else {
+            releaseRedisLock(lockKey);
+        }
     }
 
     /** 由 slot_start 反推到店档（详情 VO 回显；旧单非 10:00/13:00 起 → null）。 */
@@ -401,6 +495,12 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             .eq(StrUtil.isNotBlank(query.getAppointmentNo()), GzRecycleAppointment::getAppointmentNo, query.getAppointmentNo())
             .ge(query.getApptDateStart() != null, GzRecycleAppointment::getApptDate, query.getApptDateStart())
             .le(query.getApptDateEnd() != null, GzRecycleAppointment::getApptDate, query.getApptDateEnd())
+            .ge(query.getFinalAmountCentMin() != null, GzRecycleAppointment::getFinalAmountCent, query.getFinalAmountCentMin())
+            .le(query.getFinalAmountCentMax() != null, GzRecycleAppointment::getFinalAmountCent, query.getFinalAmountCentMax())
+            // 点数档筛选（GZ-RECYCLE-008）：qty_bucket_code 存于 product_snapshot_json（JSON 列不散列，强约束 #12），
+            // 用 JSON 提取比对；{0} 为参数化占位（防注入）。
+            .apply(StrUtil.isNotBlank(query.getQtyBucketCode()),
+                "JSON_UNQUOTE(JSON_EXTRACT(product_snapshot_json, '$.qtyBucketCode')) = {0}", query.getQtyBucketCode())
             .orderByDesc(GzRecycleAppointment::getId);
         Page<GzRecycleAppointment> page = baseMapper.selectPage(pageQuery.build(), lqw);
         List<GzRecycleAppointmentAdminVO> records = page.getRecords().stream().map(this::toAdminVO).toList();

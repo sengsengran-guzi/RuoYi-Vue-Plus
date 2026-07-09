@@ -14,6 +14,7 @@ import org.dromara.gz.bean.service.IGzBeanBookingService;
 import org.dromara.gz.bean.service.internal.QrCodeSigner;
 import org.dromara.gz.common.domain.entity.GzUser;
 import org.dromara.gz.common.mapper.GzUserMapper;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -93,6 +94,15 @@ class GzBeanBookingServiceImplTest {
 
     private QrCodeSigner qrCodeSigner;
     private GzBeanBookingServiceImpl service;
+
+    @BeforeAll
+    static void initMpLambdaCache() {
+        // 纯 Mockito 单测无 Spring/MP 启动 → LambdaUpdateWrapper.set(GzBeanSeat::...) 需要的 lambda 列缓存未装载
+        //（selectBoard 每日清理 / updateBoardNote 用到）。手动初始化 GzBeanSeat 的 TableInfo（幂等、全局静态、无副作用）。
+        com.baomidou.mybatisplus.core.metadata.TableInfoHelper.initTableInfo(
+            new org.apache.ibatis.builder.MapperBuilderAssistant(new com.baomidou.mybatisplus.core.MybatisConfiguration(), ""),
+            org.dromara.gz.bean.domain.entity.GzBeanSeat.class);
+    }
 
     @BeforeEach
     void setUp() {
@@ -670,7 +680,7 @@ class GzBeanBookingServiceImplTest {
 
     private GzBeanBookingServiceImpl spyWithRedisOk() {
         GzBeanBookingServiceImpl spy = Mockito.spy(service);
-        // lenient：早期校验失败的用例（如 wechatIdRequired）在到达锁之前就抛错，锁 stub 不被用到；
+        // lenient：早期校验失败的用例（如手机号未填）在到达锁之前就抛错，锁 stub 不被用到；
         //   submitPaid 用户提交锁靠 TTL 自动失效（不显式 releaseRedisLock，同 submit 口径）。
         lenient().doReturn(true).when(spy).tryAcquireRedisLock(anyString());
         lenient().doNothing().when(spy).releaseRedisLock(anyString());
@@ -941,18 +951,6 @@ class GzBeanBookingServiceImplTest {
         assertEquals(expected, cap.getValue().getVerifyCode(), "免费单 verify_code = signByType(seatType)");
         // 免费单不建支付单
         verify(payServiceProvider, never()).getObject();
-    }
-
-    @Test
-    @DisplayName("submitPaid · 微信号未填 → WECHAT_ID_REQUIRED（doc/10 §11.N6）")
-    void submitPaid_wechatIdRequired() {
-        GzBeanBookingServiceImpl spy = spyWithRedisOk();
-        GzUser u = newPaidUser(1L);
-        u.setWechatId(null);
-        when(gzUserMapper.selectById(1L)).thenReturn(u);
-
-        ServiceException ex = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("single"), 1L));
-        assertEquals(GzBeanErrorCode.WECHAT_ID_REQUIRED, ex.getCode());
     }
 
     @Test
@@ -2811,6 +2809,73 @@ class GzBeanBookingServiceImplTest {
         assertEquals("pending", inserted.getStatus());
         assertEquals("paying", inserted.getPayStatus());
         verify(payService).createBusinessOrder(any());
+    }
+
+    // ============================================================
+    //  GZ-BEAN-052 看板座位备注每天自动清理
+    // ============================================================
+
+    @Test
+    @DisplayName("selectBoard · 看板备注每日自动清理（GZ-BEAN-052）：非当天备注读时清空 + 清库，当天备注保留")
+    void selectBoard_dailyRemarkAutoClear() {
+        long storeId = 1L;
+        LocalDate today = LocalDate.now();
+
+        GzBeanStore store = new GzBeanStore();
+        store.setId(storeId);
+        store.setTenantId("1001");
+        store.setNearEndMinutes(10); // 显式设 → resolveNearEndMinutes 不走 configService
+        when(storeMapper.selectById(storeId)).thenReturn(store);
+
+        // 座位 A：昨天写的备注（过期）；座位 B：今天写的备注（保留）
+        org.dromara.gz.bean.domain.entity.GzBeanSeat stale = new org.dromara.gz.bean.domain.entity.GzBeanSeat();
+        stale.setId(11L); stale.setStoreId(storeId); stale.setSeatTypeConfigId(100L);
+        stale.setSeatNo("S1"); stale.setEnabled(1);
+        stale.setRemark("昨天的备注"); stale.setRemarkDate(today.minusDays(1));
+
+        org.dromara.gz.bean.domain.entity.GzBeanSeat fresh = new org.dromara.gz.bean.domain.entity.GzBeanSeat();
+        fresh.setId(12L); fresh.setStoreId(storeId); fresh.setSeatTypeConfigId(100L);
+        fresh.setSeatNo("S2"); fresh.setEnabled(1);
+        fresh.setRemark("今天的备注"); fresh.setRemarkDate(today);
+
+        when(seatMapper.selectList(any())).thenReturn(new java.util.ArrayList<>(java.util.List.of(stale, fresh)));
+
+        org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig cfg = new org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig();
+        cfg.setId(100L); cfg.setStoreId(storeId); cfg.setEnabled(1);
+        cfg.setBookMode("whole"); cfg.setName("四人桌"); cfg.setSeatType("four");
+        when(seatTypeConfigMapper.selectByIds(any())).thenReturn(java.util.List.of(cfg));
+
+        // 两座皆空闲（无活跃单）→ 只触发备注清理，不进 current/next 分支
+        when(bookingMapper.selectActiveBookingsForBoard(anyString(), anyLong(), any())).thenReturn(java.util.List.of());
+
+        java.util.List<org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO> rows = service.selectBoard(storeId, today);
+
+        // 过期备注必须触发一次清库（remark + remark_date 置空）
+        verify(seatMapper).update(any(), any());
+        org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO staleRow =
+            rows.stream().filter(r -> r.getSeatId().equals(11L)).findFirst().orElseThrow();
+        org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO freshRow =
+            rows.stream().filter(r -> r.getSeatId().equals(12L)).findFirst().orElseThrow();
+        assertNull(staleRow.getRemark(), "非当天备注读看板时清空");
+        assertEquals("今天的备注", freshRow.getRemark(), "当天备注保留");
+    }
+
+    @Test
+    @DisplayName("updateBoardNote · 写备注同时 set remark_date（GZ-BEAN-052：否则当天备注会被下次读看板误判过期清掉）")
+    void updateBoardNote_stampsRemarkDate() {
+        org.dromara.gz.bean.domain.entity.GzBeanSeat seat = new org.dromara.gz.bean.domain.entity.GzBeanSeat();
+        seat.setId(11L); seat.setSeatNo("S1"); seat.setStoreId(1L);
+        when(seatMapper.selectById(11L)).thenReturn(seat);
+
+        @SuppressWarnings("rawtypes")
+        org.mockito.ArgumentCaptor<com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper> cap =
+            org.mockito.ArgumentCaptor.forClass(com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper.class);
+
+        service.updateBoardNote(11L, "预留VIP", "staff1");
+
+        verify(seatMapper).update(any(), cap.capture());
+        String sqlSet = cap.getValue().getSqlSet();
+        assertTrue(sqlSet.contains("remark_date"), "写备注必须同时 set remark_date：" + sqlSet);
     }
 
 }

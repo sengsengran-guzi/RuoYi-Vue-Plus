@@ -8,8 +8,10 @@ import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyScanBo;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentAdminVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentVO;
+import org.dromara.gz.recycle.domain.vo.RecycleSlotAvailabilityVO;
 import org.dromara.gz.recycle.domain.vo.RecycleVerifyCodeVO;
 
+import java.time.LocalDate;
 import java.util.List;
 
 /**
@@ -24,19 +26,32 @@ import java.util.List;
 public interface IGzRecycleAppointmentService {
 
     /**
-     * 提交回收预约（ADR-0012 §2，去估价 + 单份多选，落 status=submitted）。
+     * 提交回收预约（GZ-RECYCLE-007 放开 + ADR-0012 去估价，落 status=submitted）。
      *
-     * <p>事务内：① imageIds 必填二次校验（抛 4101）；② categories 非空（抛 4108）；③ 校验用户存在 +
-     * receiver_openid（E5，抛 4103）；④ qtyBucketCode 命中启用桶（抛 4107）→ 取 durationMinutes 落
-     * matched_duration_minutes，label 进 snapshot；⑤ ipIds → join 取 ipNames 快照（+ customIps 并存）；
-     * ⑥ arrivalSlot → slot_start/slot_end 映射；⑦ product_snapshot_json 落<b>对象</b>；
-     * ⑧ estimated_amount_cent/total_qty 置 null（去估价/无精确件数）；⑨ 生成 appointment_no（RCY-）+ INSERT。</p>
+     * <p>事务（{@code REPEATABLE_READ}）内：① categories 非空（抛 4108）；② qtyBucketCode 命中启用点数档
+     * （抛 4107）→ 取 durationMinutes + occupy_next_slot；③ 用户存在 + receiver_openid（抛 4103）+ 手机号
+     * （抛 4125）；④ 到店时段定位本店 enabled 有序列表中的选中档（非法抛 4124）+ 计算下一档；⑤ 时段容量防超卖
+     * ——{@code (store,date)} Redis 锁 + {@code FOR UPDATE} 计本档活跃占用（≥1 抛 4122 SLOT_TAKEN），大单再计
+     * 下一档（≥1 抛 4123 SLOT_SPILL_BLOCKED）；⑥ product_snapshot_json 落对象（去 IP：ip 字段空）；
+     * ⑦ INSERT（去客人拍照/微信号快照；带 time_slot_id + spill_time_slot_id；estimated/total_qty null）。</p>
      *
      * @param bo     提交参数
      * @param userId 当前登录用户 id（sa-token 拿，不接受前端传）
      * @return 提交结果顾客窄 VO（含 appointmentNo / status=submitted，无金额估价）
      */
     GzRecycleAppointmentVO submit(GzRecycleAppointmentSubmitBo bo, Long userId);
+
+    /**
+     * 某门店某日到店时段可用性（GZ-RECYCLE-007 放开，mp 填单选时段用）。
+     *
+     * <p>逐个本店 enabled 时段标 {@code taken}（是否已被占）：占用真源 = 活跃单 {@code time_slot_id=本档 OR
+     * spill_time_slot_id=本档}（每档容量 1，大单额外占下一档）。已关闭（enabled=0）的档不在列。无锁，仅展示。</p>
+     *
+     * @param storeId 门店 id
+     * @param date    到店日期（null → 全档 taken=false）
+     * @return 该门店该日各 enabled 时段的可用性
+     */
+    List<RecycleSlotAvailabilityVO> getSlotAvailability(Long storeId, LocalDate date);
 
     /**
      * 我的回收记录列表（按 create_time desc，doc/12 §MP-RECYCLE-LIST）。

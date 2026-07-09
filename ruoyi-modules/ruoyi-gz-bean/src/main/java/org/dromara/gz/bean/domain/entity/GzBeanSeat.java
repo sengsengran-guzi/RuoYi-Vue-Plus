@@ -12,6 +12,7 @@ import lombok.NoArgsConstructor;
 import org.dromara.common.tenant.core.TenantEntity;
 
 import java.io.Serial;
+import java.time.LocalDate;
 
 /**
  * gz_bean_seat — 拼豆座位单元 entity（ADR-0015 复活为「座位单元表」，挂桌型之下）。
@@ -78,8 +79,11 @@ public class GzBeanSeat extends TenantEntity {
     /** 排序值（升序） */
     private Integer sortNo;
 
-    /** 备注（覆盖 BaseEntity 缺失 remark） */
+    /** 看板座位备注（店员手写；每天自动清理，见 remarkDate）（覆盖 BaseEntity 缺失 remark） */
     private String remark;
+
+    /** 看板备注所属日期（GZ-BEAN-052 每天自动清理）：读看板发现非当天 → 清空 remark。remark 为空时同为 NULL */
+    private LocalDate remarkDate;
 
     /** 软删标志（'0'=正常 / '2'=删除，对齐 ruoyi 全局 @TableLogic logicDeleteValue=2） */
     @TableLogic

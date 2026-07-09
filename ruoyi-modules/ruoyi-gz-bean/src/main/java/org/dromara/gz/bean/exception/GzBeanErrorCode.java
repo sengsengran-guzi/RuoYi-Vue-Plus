@@ -81,9 +81,7 @@ public final class GzBeanErrorCode {
     public static final int SEAT_TYPE_DISABLED = 4013;
     public static final String SEAT_TYPE_DISABLED_MSG = "该座位类型已停用，请重选";
 
-    /** 付款前未采集微信号（doc/10 §11.N6 / §11.E2） */
-    public static final int WECHAT_ID_REQUIRED = 4014;
-    public static final String WECHAT_ID_REQUIRED_MSG = "拼豆预约需填写微信号，便于门店联系";
+    /* 4014 WECHAT_ID_REQUIRED 已作废（GZ-RECYCLE-007 放开：拼豆/回收下单去微信号门槛，仅需手机号） */
 
     /** 核销前置未满足：仅 pay_status='paid' 的 pending 单可核销（ADR-0007 §1.2） */
     public static final int NOT_PAID = 4015;

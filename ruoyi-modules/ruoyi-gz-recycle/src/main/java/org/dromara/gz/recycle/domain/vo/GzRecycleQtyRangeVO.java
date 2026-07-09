@@ -35,6 +35,9 @@ public class GzRecycleQtyRangeVO implements Serializable {
     /** 该桶预计回收时长（分钟） */
     private Integer durationMinutes;
 
+    /** 大单占位：1=选此档下单额外整格占用下一个到店时段（仅最高档）；0=普通档（GZ-RECYCLE-007） */
+    private Integer occupyNextSlot;
+
     /** 启用标志（0=停用 / 1=启用）；mp 列表恒为启用桶，admin 列表全状态 */
     private Integer enabled;
 

@@ -1186,16 +1186,13 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             throw new ServiceException("未登录");
         }
 
-        // ① 用户存在 + 手机号 + 微信号已采集（doc/10 §11.N6）
+        // ① 用户存在 + 手机号已采集（放开后去微信号门槛，GZ-RECYCLE-007 同步；doc/10 §11.N6）
         GzUser user = gzUserMapper.selectById(userId);
         if (user == null) {
             throw new ServiceException("user.notFound");
         }
         if (StrUtil.isBlank(user.getMobile())) {
             throw new ServiceException(GzBeanErrorCode.PHONE_REQUIRED_MSG, GzBeanErrorCode.PHONE_REQUIRED);
-        }
-        if (StrUtil.isBlank(user.getWechatId())) {
-            throw new ServiceException(GzBeanErrorCode.WECHAT_ID_REQUIRED_MSG, GzBeanErrorCode.WECHAT_ID_REQUIRED);
         }
         String tenantId = user.getTenantId();
 
@@ -1707,16 +1704,13 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             throw new ServiceException("未登录");
         }
 
-        // ① 用户存在 + 手机号 + 微信号已采集（同 submitPaid）
+        // ① 用户存在 + 手机号已采集（放开后去微信号门槛，同 submitPaid）
         GzUser user = gzUserMapper.selectById(userId);
         if (user == null) {
             throw new ServiceException("user.notFound");
         }
         if (StrUtil.isBlank(user.getMobile())) {
             throw new ServiceException(GzBeanErrorCode.PHONE_REQUIRED_MSG, GzBeanErrorCode.PHONE_REQUIRED);
-        }
-        if (StrUtil.isBlank(user.getWechatId())) {
-            throw new ServiceException(GzBeanErrorCode.WECHAT_ID_REQUIRED_MSG, GzBeanErrorCode.WECHAT_ID_REQUIRED);
         }
         String tenantId = user.getTenantId();
 
@@ -2542,6 +2536,28 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                 return List.of();
             }
 
+            // 看板座位备注每日自动清理（GZ-BEAN-052，无 cron 依赖）：seat.remark 是店员当天手写的看板备注，跨日失效。
+            //   读看板时发现备注非当天（remark_date < 今天，含 legacy 无日期的旧备注）→ 直接清库 + 内存置空不返回。
+            //   当天写的备注（updateBoardNote 把 remark_date 记成当天）当天不清。首个跨日打开看板的请求触发清理，幂等。
+            LocalDate today = now.toLocalDate();
+            List<Long> staleRemarkSeatIds = seats.stream()
+                .filter(s -> isBoardRemarkStale(s, today))
+                .map(GzBeanSeat::getId)
+                .toList();
+            if (!staleRemarkSeatIds.isEmpty()) {
+                seatMapper.update(null, Wrappers.<GzBeanSeat>lambdaUpdate()
+                    .in(GzBeanSeat::getId, staleRemarkSeatIds)
+                    .set(GzBeanSeat::getRemark, null)
+                    .set(GzBeanSeat::getRemarkDate, null));
+                seats.forEach(s -> {
+                    if (staleRemarkSeatIds.contains(s.getId())) {
+                        s.setRemark(null);
+                        s.setRemarkDate(null);
+                    }
+                });
+                log.info("[bean-board] 看板备注每日自动清理 storeId={} clearedSeatIds={}", storeId, staleRemarkSeatIds);
+            }
+
             // 桌型 config 批量取（typeName / bookMode 回填 + 停用桌型座过滤，与 seat-map 一致）
             List<Long> configIds = seats.stream()
                 .map(GzBeanSeat::getSeatTypeConfigId)
@@ -2575,7 +2591,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                     .seatTypeConfigId(cfg.getId())
                     .typeName(typeName)
                     .bookMode(cfg.getBookMode())
-                    // 备注纯挂座位（gz_bean_seat.remark）：与是否有人/空闲无关，店员手动填/清，状态变化不自动清
+                    // 备注纯挂座位（gz_bean_seat.remark）：与是否有人/空闲无关；每日自动清理已在上方 sweep 完成（seat.remark 此刻为当天有效值）
                     .remark(seat.getRemark());
 
                 List<GzBeanBooking> seatBookings = bySeat.get(seat.getId());
@@ -3515,7 +3531,8 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     @Override
     @Transactional(rollbackFor = Exception.class)
     public void updateBoardNote(Long seatId, String remark, String operatorId) {
-        // 备注纯挂座位（gz_bean_seat.remark）：与是否有人/空闲无关，店员手动填/清，座位状态变化不自动清。
+        // 备注纯挂座位（gz_bean_seat.remark）：与是否有人/空闲无关，店员手动填/清；每天自动清理（GZ-BEAN-052，
+        //   跨日读看板即清），故写备注同时把 remark_date 记成当天（清空则一并置 NULL）。
         // admin 态操作（当前登录租户上下文），走普通租户 scope 的 select/update；LambdaUpdate.set 允许写 null 以清空。
         if (seatId == null) {
             throw new ServiceException("座位 ID 不能为空");
@@ -3527,7 +3544,8 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         String normalized = StrUtil.isBlank(remark) ? null : remark.trim();
         seatMapper.update(null, Wrappers.<GzBeanSeat>lambdaUpdate()
             .eq(GzBeanSeat::getId, seatId)
-            .set(GzBeanSeat::getRemark, normalized));
+            .set(GzBeanSeat::getRemark, normalized)
+            .set(GzBeanSeat::getRemarkDate, normalized == null ? null : LocalDate.now()));
         log.info("[bean-board] updateBoardNote seatId={} seatNo={} len={} by={}",
             seatId, seat.getSeatNo(), normalized == null ? 0 : normalized.length(), operatorId);
     }
@@ -3705,9 +3723,19 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         // 单座即时回显（放座/延时后），无续坐链上下文 → effectiveEnd = 本单 slot_end（保持原行为，
         //   不在此做续坐合并；续坐显示由下一次 selectBoard 全量刷新时按 continuousUntil 校正）。
         fillCurrentBooking(row, b, now, b.getSessDate(), resolveNearEndMinutes(store), b.getSlotEnd());
-        // 备注纯挂座位（gz_bean_seat.remark）：与是否有人/空闲无关，同 selectBoard 口径
-        row.remark(seat != null ? seat.getRemark() : null);
+        // 备注纯挂座位（gz_bean_seat.remark）：同 selectBoard 口径 + 每日自动清理（GZ-BEAN-052）——非当天备注不回显
+        //   （DB 清空由 selectBoard 惰性做；此处仅显示门控，避免跨日单座回显残留旧备注）。
+        row.remark(isBoardRemarkStale(seat, now.toLocalDate()) ? null : (seat != null ? seat.getRemark() : null));
         return row.build();
+    }
+
+    /**
+     * 看板座位备注每日自动清理判定（GZ-BEAN-052）：座位有备注且非当天（{@code remark_date < today}，
+     * 含 legacy 无日期的旧备注）→ 视为过期。selectBoard 据此清库，toBoardRow 据此不回显。
+     */
+    private boolean isBoardRemarkStale(GzBeanSeat seat, LocalDate today) {
+        return seat != null && StrUtil.isNotBlank(seat.getRemark())
+            && (seat.getRemarkDate() == null || seat.getRemarkDate().isBefore(today));
     }
 
     // ============================================================

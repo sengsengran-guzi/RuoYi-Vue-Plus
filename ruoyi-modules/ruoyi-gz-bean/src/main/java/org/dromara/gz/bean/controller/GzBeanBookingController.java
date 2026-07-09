@@ -290,7 +290,8 @@ public class GzBeanBookingController extends BaseController {
 
     /**
      * 看板座位备注：店员点看板某座位 → 记一条备注，纯挂座位（{@code gz_bean_seat.remark}）——
-     * 与座位是否有人/空闲无关，店员手动填/清，座位状态变化不自动清。{@code bo.remark} 传空/空串 = 清空（删除）。
+     * 与座位是否有人/空闲无关，店员手动填/清；每天自动清理（GZ-BEAN-052：只当天有效，跨日读看板时自动清空）。
+     * {@code bo.remark} 传空/空串 = 清空（删除）。
      * 复用 {@code gz:bean:booking:verify} 权限（店员可写）。
      */
     @SaCheckPermission("gz:bean:booking:verify")

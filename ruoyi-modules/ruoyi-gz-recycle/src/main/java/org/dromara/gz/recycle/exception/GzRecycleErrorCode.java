@@ -6,17 +6,14 @@ package org.dromara.gz.recycle.exception;
  * <p>设计原则同拼豆域 {@code GzBeanErrorCode}：code 为业务可识别整数，mp 端按 R.code 决定 UX；
  * msg 为给用户看的中文（mp 可直接 toast）。ServiceException 体系下 http status 统一 200，按 code 分流。</p>
  *
- * <p><b>码段分配</b>（契约 15a 钉死）：4101/4103 提交校验；4104-4106 店员核对侧；4107 QTY_BUCKET_INVALID /
- * 4108 CATEGORY_REQUIRED 单份提交；4109-4112 到店核销码（§F）。{@code 4102 HAS_UNPRICED_CATEGORY 已作废}
- * （去估价 ADR-0012 §1）。内部资金/重试码移至 412x（避开契约 mp 码段）。</p>
+ * <p><b>码段分配</b>（契约 15a 钉死）：4103 提交校验；4104-4106 店员核对侧；4107 QTY_BUCKET_INVALID /
+ * 4108 CATEGORY_REQUIRED 单份提交；4109-4112 到店核销码（§F）。{@code 4101 SUBMIT_IMAGE_REQUIRED 已作废}
+ * （GZ-RECYCLE-007 放开：客人不拍照）、{@code 4102 HAS_UNPRICED_CATEGORY 已作废}（去估价 ADR-0012 §1）。
+ * 内部资金/重试/时段容量码移至 412x（避开契约 mp 码段）。</p>
  *
  * @author kevin-coder (sensenran-guzi · GZ-RECYCLE-004)
  */
 public final class GzRecycleErrorCode {
-
-    /** 未上传实物照（拍照前置声明 §5）；前端已先拦截，后端兜底 */
-    public static final int SUBMIT_IMAGE_REQUIRED = 4101;
-    public static final String SUBMIT_IMAGE_REQUIRED_MSG = "请先拍照上传实物再提交";
 
     /** receiver_openid 缺失 / 无效（doc/10 §13.E5），反向打款必需 → 拦截提交 */
     public static final int OPENID_REQUIRED = 4103;
@@ -69,6 +66,28 @@ public final class GzRecycleErrorCode {
     /** admin 重试非「打款失败」态的预约单（retry-payout 状态守卫） */
     public static final int RETRY_NOT_ALLOWED = 4121;
     public static final String RETRY_NOT_ALLOWED_MSG = "仅打款失败的预约单可重试";
+
+    /* ===================== 时段容量 / 大单占位（412x，GZ-RECYCLE-007 放开） ===================== */
+
+    /** 所选到店时段已被占（每门店每天每时段仅 1 单） */
+    public static final int SLOT_TAKEN = 4122;
+    public static final String SLOT_TAKEN_MSG = "该时段已被预约，请换个时段";
+
+    /** 大单（超点数阈值）需连占下一个时段，但下一个时段已被占 */
+    public static final int SLOT_SPILL_BLOCKED = 4123;
+    public static final String SLOT_SPILL_BLOCKED_MSG = "该点数需连占下一个时段，但下一个时段已被预约，请换时段或减少点数";
+
+    /** 到店时段无效 / 不属本门店 / 已关闭 */
+    public static final int SLOT_INVALID = 4124;
+    public static final String SLOT_INVALID_MSG = "到店时段无效或已关闭，请重新选择";
+
+    /** 未提供手机号（放开后：下单需微信登录 + 手机号，doc 需求 #6） */
+    public static final int MOBILE_REQUIRED = 4125;
+    public static final String MOBILE_REQUIRED_MSG = "请先提供手机号再预约回收";
+
+    /** 同门店同日并发下单抢锁失败（短暂繁忙，可重试） */
+    public static final int SLOT_LOCK_BUSY = 4126;
+    public static final String SLOT_LOCK_BUSY_MSG = "预约繁忙，请稍后重试";
 
     private GzRecycleErrorCode() {
     }

@@ -166,8 +166,14 @@ public class GzRecycleQtyRangeServiceImpl implements IGzRecycleQtyRangeService {
         e.setCode(StrUtil.trim(bo.getCode()));
         e.setLabel(bo.getLabel());
         e.setDurationMinutes(bo.getDurationMinutes());
+        e.setOccupyNextSlot(normalizeFlag(bo.getOccupyNextSlot()));
         e.setSortNo(bo.getSortNo());
         e.setRemark(bo.getRemark());
+    }
+
+    /** 布尔标记归一（仅 1 为 1，其余含 null 归 0）。 */
+    private int normalizeFlag(Integer flag) {
+        return (flag != null && flag == 1) ? 1 : 0;
     }
 
     private int normalizeEnabled(Integer enabled) {
@@ -197,6 +203,7 @@ public class GzRecycleQtyRangeServiceImpl implements IGzRecycleQtyRangeService {
         vo.setCode(e.getCode());
         vo.setLabel(e.getLabel());
         vo.setDurationMinutes(e.getDurationMinutes());
+        vo.setOccupyNextSlot(e.getOccupyNextSlot());
         vo.setEnabled(e.getEnabled());
         vo.setSortNo(e.getSortNo());
         vo.setCreateTime(e.getCreateTime());

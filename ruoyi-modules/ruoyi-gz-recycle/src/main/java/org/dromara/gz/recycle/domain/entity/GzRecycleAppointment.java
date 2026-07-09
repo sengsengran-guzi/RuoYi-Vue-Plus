@@ -87,7 +87,13 @@ public class GzRecycleAppointment extends TenantEntity {
     /** 到店时段结束 */
     private LocalTime slotEnd;
 
-    /** 用户提交时拍的实物照（逗号分隔 gz_file_object.id，usage_type=recycle_submit_image）；<b>必填</b> */
+    /** 本单占用的到店时段 id（FK gz_recycle_time_slot.id，GZ-RECYCLE-007 容量/占位判定用；历史单 best-effort 回填） */
+    private Long timeSlotId;
+
+    /** 大单额外占用的下一个时段 id（GZ-RECYCLE-007，点数档 occupy_next_slot=1 且非末档时写；普通单 NULL） */
+    private Long spillTimeSlotId;
+
+    /** 用户提交时拍的实物照（逗号分隔 gz_file_object.id）；GZ-RECYCLE-007 放开后停采集（NULL），历史单保留 */
     private String submitImageIds;
 
     /** 店员到店核对拍照（逗号分隔 gz_file_object.id，usage_type=recycle_verify_image）；本卡 NULL，RECYCLE-003 写 */

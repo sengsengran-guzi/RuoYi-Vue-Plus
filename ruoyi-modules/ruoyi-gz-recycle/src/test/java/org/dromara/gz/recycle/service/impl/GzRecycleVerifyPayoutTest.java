@@ -16,7 +16,6 @@ import org.dromara.gz.recycle.domain.entity.GzRecycleAppointment;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentAdminVO;
 import org.dromara.gz.recycle.exception.GzRecycleErrorCode;
 import org.dromara.gz.recycle.mapper.GzRecycleAppointmentMapper;
-import org.dromara.gz.recycle.service.IGzRecycleIpService;
 import org.dromara.gz.recycle.service.IGzRecycleQtyRangeService;
 import org.dromara.gz.recycle.service.internal.RecycleApptNoGenerator;
 import org.dromara.gz.recycle.service.internal.RecycleQrSigner;
@@ -80,8 +79,6 @@ class GzRecycleVerifyPayoutTest {
     @Mock
     private org.dromara.gz.recycle.service.IGzRecycleTimeSlotService timeSlotService;
     @Mock
-    private IGzRecycleIpService ipService;
-    @Mock
     private IGzPayPayoutService payoutService;
     @Mock
     private GzPayPayoutTransactionMapper payoutMapper;
@@ -94,7 +91,7 @@ class GzRecycleVerifyPayoutTest {
     void setUp() {
         // configService 未 stub → getConfigValue 返 null → final_amount 校验走默认绝对硬上限 ¥1000（ADR-0012 去估价×倍数档）。
         service = new GzRecycleAppointmentServiceImpl(
-            baseMapper, gzUserMapper, apptNoGenerator, qtyRangeService, timeSlotService, ipService,
+            baseMapper, gzUserMapper, apptNoGenerator, qtyRangeService, timeSlotService,
             new RecycleQrSigner(new GzRecycleQrProperties()), new ObjectMapper(),
             payoutService, payoutMapper, configService);
     }

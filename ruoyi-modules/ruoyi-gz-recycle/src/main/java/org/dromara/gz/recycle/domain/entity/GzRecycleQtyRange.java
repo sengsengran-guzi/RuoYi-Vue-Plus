@@ -55,6 +55,9 @@ public class GzRecycleQtyRange extends TenantEntity {
     /** 该桶预计回收时长（分钟），admin 可配；命中落预约单 matched_duration_minutes */
     private Integer durationMinutes;
 
+    /** 大单占位：1=选此档下单额外整格占用下一个 enabled 到店时段（仅最高档；末档无下一档则不占）；0=普通档（GZ-RECYCLE-007） */
+    private Integer occupyNextSlot;
+
     /** 启用标志（0=停用 / 1=启用）；mp 仅拉启用桶 */
     private Integer enabled;
 

@@ -50,6 +50,36 @@ public interface GzRecycleAppointmentMapper extends BaseMapperPlus<GzRecycleAppo
     String selectStoreNameById(@Param("storeId") Long storeId);
 
     /**
+     * 某门店某日某到店时段的活跃占用数（GZ-RECYCLE-007 时段容量防超卖，FOR UPDATE）。
+     *
+     * <p>「占用该档」= 活跃单 {@code time_slot_id = slotId}（本单选此档）<b>或</b> {@code spill_time_slot_id = slotId}
+     * （某大单溢出占了此档）。活跃态 = {@code submitted / confirmed_onsite / paying / paid / payout_failed}
+     * （{@code cancelled / no_show} 释放不计）。每档容量 = 1，故调用方 {@code >0 即已占}。</p>
+     *
+     * <p><b>防超卖正确性前提</b>（镜像拼豆 {@code countActiveCoveringSlotForUpdate}）：{@code FOR UPDATE} 靠 InnoDB
+     * 间隙锁串行化并发同档下单（命中 0 行也锁索引区段挡并发 INSERT 后读旧 count），<b>仅 REPEATABLE_READ 成立</b>，
+     * service 上 {@code @Transactional(isolation = REPEATABLE_READ)} + {@code (store,date)} Redis 锁双保险。</p>
+     *
+     * <p><b>tenant_id 显式传</b>：mp 下单事务用户态 JWT 无 tenant，不依赖 ruoyi 拦截器自动注入（同拼豆 submit），
+     * 由 service 从 user 取 tenant 显式传入。</p>
+     *
+     * @param tenantId 租户 id（显式传）
+     * @param storeId  门店 id
+     * @param apptDate 到店日期
+     * @param slotId   待判定占用的到店时段 id
+     * @return 该档当前活跃占用数（≥ 1 即已被占）
+     */
+    @Select("SELECT COUNT(*) FROM gz_recycle_appointment " +
+        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND appt_date = #{apptDate} " +
+        "  AND (time_slot_id = #{slotId} OR spill_time_slot_id = #{slotId}) " +
+        "  AND status IN ('submitted', 'confirmed_onsite', 'paying', 'paid', 'payout_failed') AND del_flag = '0' " +
+        "FOR UPDATE")
+    long countActiveHoldingSlotForUpdate(@Param("tenantId") String tenantId,
+                                         @Param("storeId") Long storeId,
+                                         @Param("apptDate") LocalDate apptDate,
+                                         @Param("slotId") Long slotId);
+
+    /**
      * 店员核对确认：submitted → confirmed_onsite（GZ-RECYCLE-003 AC1，doc/10 §13.N8）。
      *
      * <p>原子写入核对留痕（verify_image_ids / final_amount_cent / verified_by / verify_time）+ 推进状态 + version+1。

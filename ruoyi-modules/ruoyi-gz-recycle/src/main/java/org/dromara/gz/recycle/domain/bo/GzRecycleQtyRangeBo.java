@@ -47,6 +47,9 @@ public class GzRecycleQtyRangeBo implements Serializable {
     @Min(value = 0, message = "预计回收时长不能为负", groups = {AddGroup.class, EditGroup.class})
     private Integer durationMinutes;
 
+    /** 大单占位：1=选此档下单额外整格占用下一个到店时段（仅最高档）；0=普通档（GZ-RECYCLE-007，默认 0） */
+    private Integer occupyNextSlot;
+
     /** 启用标志（0=停用 / 1=启用），默认启用 */
     private Integer enabled;
 
