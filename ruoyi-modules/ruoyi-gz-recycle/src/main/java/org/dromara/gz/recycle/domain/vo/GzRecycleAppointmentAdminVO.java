@@ -101,6 +101,9 @@ public class GzRecycleAppointmentAdminVO implements Serializable {
     @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
     private LocalDateTime verifyTime;
 
+    /** 核销备注（GZ-RECYCLE-009，店员核对时填）；submitted 时 null */
+    private String verifyRemark;
+
     /** 联系手机号快照（admin 显示完整，便于门店联系） */
     private String mobileSnapshot;
 

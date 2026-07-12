@@ -563,28 +563,29 @@ public interface IGzBeanBookingService {
     GzBeanBookingVO adminCreateBooking(org.dromara.gz.bean.domain.bo.GzBeanAdminCreateBo bo, String operator);
 
     /**
-     * 看板代客预约一步「建单 + 核销 + 分座」（0702 反馈 #2；GZ-BEAN-046 松绑）：现金散客到店，店员在店内计时看板点某
-     * <b>具体空闲座位</b> → 抽屉填<b>分钟精度</b>起止时间 / 手机号 / 免费 / 金额 → 提交即生成
-     * {@code status=used + pay_status=paid + seat_id} 的已核销单，座位立刻 in_use 起计时。
-     * 取代「预约管理」两步式 {@link #adminCreateBooking}（先 pending 后核销分座）。
+     * 看板代客预约一步「建单 +（当下）核销 + 分座」（0702 反馈 #2；GZ-BEAN-046 分钟精度；GZ-BEAN-047 排位共存；
+     * GZ-BEAN-048 占用座排后空档）：现金散客到店，店员在店内计时看板点某座位（<b>空闲 / 占用 / 已排位皆可</b>）→ 抽屉填
+     * <b>分钟精度</b>起止时间 / 手机号 / 免费 / 金额 → 提交建单。取代「预约管理」两步式 {@link #adminCreateBooking}。
      *
      * <p><b>一事务（{@code REPEATABLE_READ}）</b>：</p>
      * <ol>
      *   <li>载 {@link org.dromara.gz.bean.domain.entity.GzBeanSeat} → 取 {@code seat_type_config_id}，校验 enabled + 属本店；</li>
-     *   <li><b>座位级占用 guard</b>（GZ-BEAN-046 松绑，甲方口径「座位只判是否空闲、给店员充足操作空间」）：Redis seat 锁 +
-     *       {@code selectSeatOccupiedNowForUpdate}（当下物理在座）→ 命中报 {@code SEAT_TAKEN 4002}。<b>不再做整点区间重叠校验</b>
-     *       （只要此刻椅子没人坐即可代客，与看板「空闲」口径一致）；<b>不走桌型配额</b>（现场分具体空座是店员对物理现实的操作，
-     *       桌型配额是 mp 线上口径 —— 本 used 单按整点格计入 {@code countActiveCoveringSlot} 保护 mp 线上不超卖）；</li>
-     *   <li>时间<b>分钟精度</b>（{@code start < end} 即可，不校验整点 / 营业窗口）；计价按跨越的整点格数（{@code floor(start)} 逐 1h
-     *       到 {@code < end}）× 桌型档价；{@code isFree} → 0；入参 {@code amountCent} 非空则覆写（店员议价 / 抹零）；</li>
-     *   <li><b>一次 insert 配齐全字段</b>（{@code status=used / seat_id / verify_time=now / verified_by /
-     *       pay_status=paid / out_trade_no=NULL / source=walk_in / is_free / snapshot}）——<b>严禁 insert 后 updateById
-     *       补 seat_id</b>（{@code @Version} 实体内存 version 为 null 会静默不落，防超卖失效，见 memory）。</li>
+     *   <li><b>座位级占用 guard = 按请求时段判区间重叠</b>（GZ-BEAN-048，取代 GZ-BEAN-046 的「当下物理在座」present-moment）：
+     *       Redis seat 锁 + ③a {@code selectSeatUsedOverlapForUpdate}（与该座未放座 used 单区间重叠 → {@code SEAT_TAKEN 4002}）
+     *       + ③c {@code selectReservedSeatOverlapForUpdate}（与排位 pending 单区间重叠 → {@code SEAT_RESERVED_OVERLAP 4026}）。
+     *       现占 13-15 的座，代客排其后空档 15-17（不重叠）放行、盖 14-16（重叠）拒；已放座 / 结单单不占（放座即空）。
+     *       <b>不走桌型配额</b>（本单按整点格计入 {@code countActiveCoveringSlot} 保护 mp 线上不超卖）；</li>
+     *   <li>时间<b>分钟精度</b>（{@code start < end} 即可，不校验整点 / 营业窗口）；金额：{@code isFree} 或未录 {@code amountCent} → 0
+     *       （甲方口径 GZ-BEAN-046，不臆造收入），录了则实收（议价 / 抹零）；</li>
+     *   <li><b>当下就坐 vs 排后空档（GZ-BEAN-048）一次 insert 配齐全字段</b>（严禁 insert 后 updateById 补 seat_id，
+     *       {@code @Version} 内存 version 为 null 会静默不落）：请求时段覆盖此刻 → {@code status=used}（立刻核销，verify_time=now）；
+     *       整段在未来（占用座排其后空档）→ {@code status=pending}（排位待核销，verify_time/verified_by 留空，客人到点在看板下栏核销
+     *       落座，复用 preAssign 排位的两栏看板 + 核销流程）。两者都 {@code seat_id + pay_status=paid + source=walk_in}。</li>
      * </ol>
      *
      * @param bo       代客预约参数（storeId/seatId/sessDate/slotStart/slotEnd/mobile?/isFree/amountCent?）
      * @param operator 操作店员 username（落 verified_by / booking_log）
-     * @return 创建后预约 VO（已 used 已分座）
+     * @return 创建后预约 VO（当下 = used 已核销分座 / 未来 = pending 排位待核销）
      */
     GzBeanBookingVO walkInCreate(org.dromara.gz.bean.domain.bo.GzBeanWalkInBo bo, String operator);
 

@@ -95,14 +95,15 @@ public interface GzRecycleAppointmentMapper extends BaseMapperPlus<GzRecycleAppo
      */
     @Update("UPDATE gz_recycle_appointment " +
         "SET status = 'confirmed_onsite', verify_image_ids = #{verifyImageIds}, final_amount_cent = #{finalAmountCent}, " +
-        "    verified_by = #{verifiedBy}, verify_time = #{verifyTime}, version = version + 1 " +
+        "    verified_by = #{verifiedBy}, verify_time = #{verifyTime}, verify_remark = #{verifyRemark}, version = version + 1 " +
         "WHERE id = #{id} AND version = #{version} AND status = 'submitted' AND del_flag = '0'")
     int markConfirmedOnsite(@Param("id") Long id,
                             @Param("version") Integer version,
                             @Param("verifyImageIds") String verifyImageIds,
                             @Param("finalAmountCent") Long finalAmountCent,
                             @Param("verifiedBy") String verifiedBy,
-                            @Param("verifyTime") LocalDateTime verifyTime);
+                            @Param("verifyTime") LocalDateTime verifyTime,
+                            @Param("verifyRemark") String verifyRemark);
 
     /**
      * 触发打款回填：confirmed_onsite → paying（GZ-RECYCLE-003 AC2，doc/10 §13.N9）。

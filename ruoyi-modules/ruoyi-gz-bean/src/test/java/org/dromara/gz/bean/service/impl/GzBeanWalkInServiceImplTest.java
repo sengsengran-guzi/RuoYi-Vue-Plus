@@ -90,7 +90,10 @@ class GzBeanWalkInServiceImplTest {
     private static final Long STORE_ID = 1L;
     private static final Long CONFIG_ID = 3L;   // quad 四人桌 seat 模式
     private static final Long SEAT_ID = 13L;    // S1
-    private static final LocalDate DATE = LocalDate.of(2026, 7, 10); // 周五
+    // 昨天：sessDate < 今天 → future=false → 立刻 used（不受运行时钟影响，确定性）。GZ-BEAN-048 的 used/pending 分支按 now 判，
+    //   静态 fixed 日期会随运行时刻 flaky，故用相对日期钉死分支。
+    private static final LocalDate DATE = LocalDate.now().minusDays(1);
+    private static final LocalDate FUTURE_DATE = LocalDate.now().plusDays(1); // 明天：future=true → 排位 pending 待核销
     private static final LocalTime T14 = LocalTime.of(14, 0);
     private static final LocalTime T16 = LocalTime.of(16, 0);
     private static final LocalTime T1634 = LocalTime.of(16, 34);
@@ -165,8 +168,14 @@ class GzBeanWalkInServiceImplTest {
             memBookings.add(b);
             return 1;
         });
-        // ③a 座位唯一硬约束：当下物理在座（默认空 = 此刻没人坐，可代客；未来日无人在座天然为空）
-        lenient().when(bookingMapper.selectSeatOccupiedNowForUpdate(anyString(), anyLong(), anyLong(), any(), any()))
+        // ③a-future 在座单区间互斥（GZ-BEAN-048，排后空档用）：默认空 = 不与在座 used 区间重叠 → 放行
+        lenient().when(bookingMapper.selectSeatUsedOverlapForUpdate(anyString(), anyLong(), anyLong(), any(), any(), any()))
+            .thenReturn(List.of());
+        // ③a-immediate 当下物理占用（GZ-BEAN-048 blocker 修，当下就坐用）：默认空 = 座位此刻物理空 → 放行
+        lenient().when(bookingMapper.selectSeatUnreleasedUsedForUpdate(anyString(), anyLong(), anyLong(), any()))
+            .thenReturn(List.of());
+        // ③c 未来排位保护（GZ-BEAN-047）：默认空 = 该座无排位或不与代客时段重叠 → 放行
+        lenient().when(bookingMapper.selectReservedSeatOverlapForUpdate(anyString(), anyLong(), anyLong(), any(), any(), any()))
             .thenReturn(List.of());
         // selectVoById 从内存库回填精简 VO
         lenient().when(bookingMapper.selectVoById(anyLong())).thenAnswer(inv -> {
@@ -197,6 +206,13 @@ class GzBeanWalkInServiceImplTest {
         bo.setSlotEnd(end);
         bo.setIsFree(free);
         bo.setAmountCent(amountOverride);
+        return bo;
+    }
+
+    /** 指定日期（future 分支测试用）。 */
+    private GzBeanWalkInBo walkInBoOn(LocalDate date, LocalTime start, LocalTime end) {
+        GzBeanWalkInBo bo = walkInBo(start, end, false, null);
+        bo.setSessDate(date);
         return bo;
     }
 
@@ -238,27 +254,77 @@ class GzBeanWalkInServiceImplTest {
     }
 
     @Test
-    @DisplayName("★松绑 · 座位「当下空闲」即放行——同座同区间可再代客（区间重叠不再拦，GZ-BEAN-046 只判是否空闲）")
-    void walkIn_seatFreeNow_allowedEvenIfOverlappingBookingExists() {
-        // 第一单 14:00-16:00 成功入库
-        service.walkInCreate(walkInBo(T14, T16, false, null), "staff1");
+    @DisplayName("★占用座排后面空档（未来时段）→ 建 pending 待核销单（排位），非 used（GZ-BEAN-048 核心）")
+    void walkIn_futureSlot_createsPendingReserved() {
+        // 明天的时段（future=true）：占用座排其后空档 → 排位待核销单，客人到点核销落座
+        GzBeanBookingVO vo = service.walkInCreate(walkInBoOn(FUTURE_DATE, T1634, T1750), "staff1");
+        assertNotNull(vo);
         assertEquals(1, memBookings.size());
-        // 第二单同座、落在第一单区间内 14:00-16:00 —— 当下物理在座 mock 恒空（此刻没人坐）→ 放行
-        // （旧 ③b 会 SEAT_TAKEN，松绑后区间重叠不再拦：店员对物理座现场判断为准）
-        GzBeanBookingVO vo2 = service.walkInCreate(walkInBo(T14, T16, false, null), "staff2");
-        assertNotNull(vo2);
-        assertEquals(2, memBookings.size(), "座位当下空闲即可再代客，区间重叠不再拦（松绑）");
+        GzBeanBooking saved = memBookings.get(0);
+        assertEquals("pending", saved.getStatus(), "未来时段代客 = 排位 pending 待核销，不是立刻 used");
+        assertEquals("paid", saved.getPayStatus(), "现金已付");
+        assertEquals(SEAT_ID, saved.getSeatId(), "已挂座（排位）");
+        org.junit.jupiter.api.Assertions.assertNull(saved.getVerifyTime(), "排位单未核销 → verify_time 留空");
+        org.junit.jupiter.api.Assertions.assertNull(saved.getVerifiedBy(), "排位单未核销 → verified_by 留空");
+        assertEquals("walk_in", saved.getSource());
     }
 
     @Test
-    @DisplayName("座位当下有人在坐 → SEAT_TAKEN（唯一硬约束：此刻这把椅子不能有人坐）")
-    void walkIn_seatOccupiedNow_rejected() {
-        when(bookingMapper.selectSeatOccupiedNowForUpdate(anyString(), anyLong(), anyLong(), any(), any()))
+    @DisplayName("★future 排后档 · 代客(未来)时段与该座在座 used 单区间重叠 → SEAT_TAKEN（排后档不能盖在座时段，GZ-BEAN-048）")
+    void walkIn_futureUsedOverlap_rejected() {
+        // 未来日 → future 分支走 selectSeatUsedOverlapForUpdate（区间重叠）
+        when(bookingMapper.selectSeatUsedOverlapForUpdate(anyString(), anyLong(), anyLong(), any(), any(), any()))
             .thenReturn(List.of(777L));
         ServiceException ex = assertThrows(ServiceException.class,
-            () -> service.walkInCreate(walkInBo(T1634, T1750, false, null), "staff1"));
+            () -> service.walkInCreate(walkInBoOn(FUTURE_DATE, T1634, T1750), "staff1"));
         assertEquals(GzBeanErrorCode.SEAT_TAKEN, ex.getCode());
-        assertTrue(memBookings.isEmpty(), "此刻有人在坐，必须挡住不入库");
+        assertTrue(memBookings.isEmpty(), "与在座单区间重叠必须挡住不入库");
+    }
+
+    @Test
+    @DisplayName("★★blocker 修 · 当下代客座位此刻有未放座 used 单（含超时赖座）→ SEAT_TAKEN 先放座（防同座物理撞人，GZ-BEAN-048）")
+    void walkIn_immediateOccupied_rejected() {
+        // 当天(immediate) → 走 selectSeatUnreleasedUsedForUpdate（不看 slot_end，只认未放座=有人，含 overtime 赖座）
+        when(bookingMapper.selectSeatUnreleasedUsedForUpdate(anyString(), anyLong(), anyLong(), any()))
+            .thenReturn(List.of(888L));
+        ServiceException ex = assertThrows(ServiceException.class,
+            () -> service.walkInCreate(walkInBo(T14, T16, false, null), "staff1"));
+        assertEquals(GzBeanErrorCode.SEAT_TAKEN, ex.getCode(), "座位此刻有人（含超时赖座）当下代客必须挡住，先放座");
+        assertTrue(memBookings.isEmpty(), "物理占用座当下代客不得入库（防两人同座）");
+    }
+
+    @Test
+    @DisplayName("在座单不重叠（排其后空档）→ 放行（selectSeatUsedOverlapForUpdate 空 = 不重叠，GZ-BEAN-048）")
+    void walkIn_noUsedOverlap_allowed() {
+        // used-overlap mock 恒空 = 请求时段与在座单端点相接不重叠 → 放行（当天 → 立刻 used）
+        GzBeanBookingVO vo = service.walkInCreate(walkInBo(T14, T16, false, null), "staff1");
+        assertNotNull(vo);
+        assertEquals(1, memBookings.size());
+        assertEquals("used", memBookings.get(0).getStatus());
+    }
+
+    @Test
+    @DisplayName("★排位共存 · 代客时段与未来排位重叠 → SEAT_RESERVED_OVERLAP 4026（不盖排位客人，GZ-BEAN-047）")
+    void walkIn_reservedOverlap_rejected() {
+        // 该座有未来排位（如 15:00-18:00），代客请求区间与之重叠 → selectReservedSeatOverlapForUpdate 命中
+        when(bookingMapper.selectReservedSeatOverlapForUpdate(anyString(), anyLong(), anyLong(), any(), any(), any()))
+            .thenReturn(List.of(999L));
+        ServiceException ex = assertThrows(ServiceException.class,
+            () -> service.walkInCreate(walkInBo(T1634, T1750, false, null), "staff1"));
+        assertEquals(GzBeanErrorCode.SEAT_RESERVED_OVERLAP, ex.getCode(), "与排位重叠必须报 4026，不得盖掉排位客人");
+        assertTrue(memBookings.isEmpty(), "重叠单不得入库");
+    }
+
+    @Test
+    @DisplayName("★排位共存 · 座位有未来排位但代客时段不重叠（插空档）→ 放行（GZ-BEAN-047 空档可代客）")
+    void walkIn_reservedGap_allowed() {
+        // selectReservedSeatOverlapForUpdate 返回空 = 代客时段（如 13:00-15:00）与排位（15:00-18:00）端点相接不重叠
+        when(bookingMapper.selectReservedSeatOverlapForUpdate(anyString(), anyLong(), anyLong(), any(), any(), any()))
+            .thenReturn(List.of());
+        GzBeanBookingVO vo = service.walkInCreate(walkInBo(T1634, T1750, false, null), "staff1");
+        assertNotNull(vo);
+        assertEquals(1, memBookings.size(), "空档（不与排位重叠）应放行入库");
+        assertEquals("used", memBookings.get(0).getStatus());
     }
 
     @Test

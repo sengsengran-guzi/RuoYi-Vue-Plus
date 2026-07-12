@@ -1,6 +1,7 @@
 package org.dromara.gz.recycle.controller;
 
 import cn.dev33.satoken.annotation.SaCheckPermission;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.domain.R;
@@ -8,14 +9,17 @@ import org.dromara.common.log.annotation.Log;
 import org.dromara.common.log.enums.BusinessType;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
+import org.dromara.common.satoken.utils.LoginHelper;
 import org.dromara.common.web.core.BaseController;
 import org.dromara.gz.recycle.domain.bo.GzRecycleAppointmentQueryBo;
+import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyBo;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentAdminVO;
 import org.dromara.gz.recycle.service.IGzRecycleAppointmentService;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -65,5 +69,28 @@ public class GzRecycleAppointmentController extends BaseController {
     @PostMapping("/{id}/retry-payout")
     public R<GzRecycleAppointmentAdminVO> retryPayout(@PathVariable Long id) {
         return R.ok(appointmentService.retryPayout(id));
+    }
+
+    /**
+     * admin 端核销确认 + 触发反向打款（GZ-RECYCLE-009：admin 看板也能核销，与 mp 店员端等价）。
+     *
+     * <pre>
+     * POST /system/gz/recycle/appointment/{id}/verify
+     * Body: { verifyImageIds:[..], finalAmountCent, remark? }   // appointmentId 由路径 {id} 绑定
+     * </pre>
+     *
+     * <p>复用与 mp 店员端同一 service {@link IGzRecycleAppointmentService#verifyAndPayout}（service 不绑 mp/admin）。
+     * 权限 {@code gz:recycle:appointment:verify}（与 mp 店员同一 key，owner 已授，ADR-0004）；核对人留痕取 admin
+     * 登录用户名（沿用本项目 admin 侧 {@code LoginHelper.getUsername()} 口径）。业务错误码同 mp：
+     * 4104 不存在 / 4105 非可核对态 / 4106 openid 缺失 + 金额硬上限。</p>
+     */
+    @SaCheckPermission("gz:recycle:appointment:verify")
+    @Log(title = "回收核销+触发打款(admin)", businessType = BusinessType.UPDATE)
+    @PostMapping("/{id}/verify")
+    public R<GzRecycleAppointmentAdminVO> verify(@PathVariable Long id, @Valid @RequestBody GzRecycleVerifyBo bo) {
+        // 路径 id 为准（防 body.appointmentId 与 URL 不一致）
+        bo.setAppointmentId(id);
+        String verifiedBy = LoginHelper.getUsername();
+        return R.ok(appointmentService.verifyAndPayout(bo, verifiedBy));
     }
 }

@@ -108,6 +108,9 @@ public class GzRecycleAppointment extends TenantEntity {
     /** 核对时间；本卡 NULL，RECYCLE-003 写 */
     private LocalDateTime verifyTime;
 
+    /** 核销备注（GZ-RECYCLE-009，店员核对时填，独立于顾客下单备注 remark） */
+    private String verifyRemark;
+
     /** 收款人 openid 快照（反向打款必需，提交时从 gz_user.openid 取） */
     private String receiverOpenid;
 

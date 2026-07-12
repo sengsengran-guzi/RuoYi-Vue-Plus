@@ -175,6 +175,20 @@ public final class GzBeanErrorCode {
     public static final int DAY_PASS_NOT_OPEN = 4025;
     public static final String DAY_PASS_NOT_OPEN_MSG = "该桌型暂未开放包天套餐，请重选";
 
+    // ============================================================
+    //  GZ-BEAN-047 代客预约 × 排位共存（ADR-0018 × GZ-BEAN-046）
+    // ============================================================
+
+    /**
+     * 代客预约时段与该座已有「排位」（reserved：pending + 已挂座）时段重叠（GZ-BEAN-047）。
+     *
+     * <p>座位有未来排位（如 15:00-18:00）时仍可代客插入前面的空档（如 13:00-15:00）；但代客时段一旦与排位区间
+     * 重叠（{@code slot_start < 排位 slot_end AND slot_end > 排位 slot_start}）就拒单，避免代客客人盖掉排位客人的时段
+     * （15:00 到店发现没座）。walkInCreate ③c 用 {@code selectReservedSeatOverlapForUpdate} 判定。4025 已占，4026 下一空号。</p>
+     */
+    public static final int SEAT_RESERVED_OVERLAP = 4026;
+    public static final String SEAT_RESERVED_OVERLAP_MSG = "该座位这个时段已有排位，代客时段不能与其重叠，请缩短结束时间或另选座位";
+
     private GzBeanErrorCode() {
     }
 }

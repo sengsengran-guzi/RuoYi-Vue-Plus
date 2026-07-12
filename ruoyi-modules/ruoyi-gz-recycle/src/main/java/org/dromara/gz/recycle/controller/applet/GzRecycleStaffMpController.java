@@ -15,13 +15,18 @@ import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyScanBo;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentAdminVO;
 import org.dromara.gz.recycle.service.IGzRecycleAppointmentService;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.time.LocalDate;
+import java.util.List;
 
 /**
  * GZ-RECYCLE-003 mp 店员核对 Controller（ADR-0004 mp 管理端权限底座）。
@@ -62,6 +67,24 @@ public class GzRecycleStaffMpController {
             return R.fail("回收预约单不存在");
         }
         return R.ok(vo);
+    }
+
+    /**
+     * 店员当天回收核对列表（全门店、全状态；不分页，一天量小）。
+     *
+     * <pre>
+     * GET /app/gz/recycle/staff/appointments?date=YYYY-MM-DD
+     * 200 OK { code:200, data:[ { appointmentNo, storeName, status, slotStart, slotEnd, finalAmountCent, ... }, ... ] }
+     * </pre>
+     *
+     * <p>当天（{@code appt_date = date}）全部门店、全部状态的回收预约（租户 1001 由 ruoyi 自动注入，不显式过滤门店）；
+     * 按 slot_start 升序（null 排最后）再按 id 升序。{@code date} 必填，非法格式走 ruoyi 常规参数校验（400，不 500）。</p>
+     */
+    @SaCheckPermission("gz:recycle:appointment:list")
+    @GetMapping("/appointments")
+    public R<List<GzRecycleAppointmentAdminVO>> appointmentsByDate(
+        @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        return R.ok(appointmentService.listStaffByDate(date));
     }
 
     /**

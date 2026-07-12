@@ -132,6 +132,19 @@ public interface IGzRecycleAppointmentService {
     TableDataInfo<GzRecycleAppointmentAdminVO> selectAdminPage(GzRecycleAppointmentQueryBo query, PageQuery pageQuery);
 
     /**
+     * mp 店员当天回收核对列表（全门店、全状态，不分页，doc/12 §MP-RECYCLE-STAFF-LIST）。
+     *
+     * <p>店员端「回收核对」列表：某天（{@code appt_date = date}）<b>全部门店、全部状态</b>的回收预约，
+     * 复用 {@link #getAdminDetail} 同一套 admin VO 组装（product_snapshot_json 反序列化 + storeName join +
+     * 转账段填充）。租户 1001 由 ruoyi 自动注入，不显式过滤。<b>按 slot_start 升序（null 排最后）再按 id 升序</b>；
+     * 一天量小，不分页。{@code date} 为 null → 返回空列表（不全表扫）。</p>
+     *
+     * @param date 到店日期（必传；null → 空列表）
+     * @return 当天全门店全状态回收预约 admin VO 列表（slot_start 升序 null last，再 id 升序）
+     */
+    List<GzRecycleAppointmentAdminVO> listStaffByDate(LocalDate date);
+
+    /**
      * no_show 凌晨任务兜底（GZ-RECYCLE-003 AC7，doc/10 §13.N12）：扫超 appt_date 仍 submitted 单 → no_show。
      *
      * <p>全租户扫（cron 无登录态）。店员标记优先，本任务兜底未到店未取消的过期单。</p>

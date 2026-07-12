@@ -360,7 +360,8 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         String verifyImageIdsStr = StrUtil.join(",", bo.getVerifyImageIds());
         LocalDateTime now = LocalDateTime.now();
         int confirmed = baseMapper.markConfirmedOnsite(
-            appt.getId(), appt.getVersion(), verifyImageIdsStr, bo.getFinalAmountCent(), verifiedBy, now);
+            appt.getId(), appt.getVersion(), verifyImageIdsStr, bo.getFinalAmountCent(), verifiedBy, now,
+            StrUtil.trimToNull(bo.getRemark()));
         if (confirmed == 0) {
             // version 漂移 / 已被并发核对 → 幂等拒绝（防店员重复点确认）
             throw new ServiceException(GzRecycleErrorCode.NOT_VERIFIABLE_MSG, GzRecycleErrorCode.NOT_VERIFIABLE);
@@ -510,6 +511,20 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
     }
 
     @Override
+    public List<GzRecycleAppointmentAdminVO> listStaffByDate(LocalDate date) {
+        if (date == null) {
+            return List.of();
+        }
+        // 当天全门店、全状态（租户 1001 由 ruoyi TenantLineInnerInterceptor 自动 append，软删 @TableLogic 自动过滤）。
+        // 排序：slot_start 升序（null 排最后，MySQL 默认 null first 故先按 `slot_start IS NULL` 升序），再 id 升序。
+        LambdaQueryWrapper<GzRecycleAppointment> lqw = Wrappers.<GzRecycleAppointment>lambdaQuery()
+            .eq(GzRecycleAppointment::getApptDate, date)
+            .last("ORDER BY slot_start IS NULL, slot_start ASC, id ASC");
+        // 复用 getAdminDetail 同套 admin VO 组装（product 反序列化 + storeName join + 转账段填充）。
+        return baseMapper.selectList(lqw).stream().map(this::toAdminVO).toList();
+    }
+
+    @Override
     public int markExpiredNoShow() {
         return TenantHelper.ignore(() -> {
             LocalDate today = LocalDate.now();
@@ -610,6 +625,7 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         vo.setFinalAmountCent(e.getFinalAmountCent());
         vo.setVerifiedBy(e.getVerifiedBy());
         vo.setVerifyTime(e.getVerifyTime());
+        vo.setVerifyRemark(e.getVerifyRemark());
         vo.setMobileSnapshot(e.getMobileSnapshot());
         vo.setWechatIdSnapshot(e.getWechatIdSnapshot());
         vo.setOutPayoutNo(e.getOutPayoutNo());

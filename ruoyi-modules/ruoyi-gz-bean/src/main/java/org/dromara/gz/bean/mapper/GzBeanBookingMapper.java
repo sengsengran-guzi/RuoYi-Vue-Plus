@@ -241,6 +241,89 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
                                               @Param("now") LocalTime now);
 
     /**
+     * 代客预约 × 排位共存（GZ-BEAN-047）：某具体座位 {@code seatId} 当日是否有「排位」(reserved) 单的区间
+     * 与代客请求区间 {@code [reqStart, reqEnd)} 重叠。
+     *
+     * <p><b>排位单</b> = {@code status='pending' AND seat_id 非空 AND pay_status IN ('paying','paid')}
+     * （preAssignSeat 提前挂座、未核销，激活看板 reserved 态）。pending 单 {@code actual_end_slot} 恒 NULL（未放座），
+     * 占用止界即计划 {@code slot_end}，无 GZ-BEAN-045 放座整点误判问题。重叠判定
+     * {@code slot_start < #{reqEnd} AND slot_end > #{reqStart}}。命中 → 代客时段会盖到排位客人的时段上，拒单
+     * （{@link org.dromara.gz.bean.exception.GzBeanErrorCode#SEAT_RESERVED_OVERLAP}）；无命中（如排位 15:00-18:00、
+     * 代客 13:00-15:00 端点相接不重叠）→ 放行，空档可代客。</p>
+     *
+     * <p><b>只查 pending（reserved）不查 used</b>：在座 used 单的区间重叠由 walkInCreate ③a
+     * {@link #selectSeatUsedOverlapForUpdate} 判（GZ-BEAN-048）。故本查询专司「未来排位不被代客盖」。
+     * {@code FOR UPDATE} 锁住命中的排位行串行化并发（同座并发代客 + 排位）。</p>
+     *
+     * @return 命中的排位 booking id 列表（非空即代客时段与排位重叠 → SEAT_RESERVED_OVERLAP 拒单）
+     */
+    @Select("SELECT id FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_id = #{seatId} " +
+        "  AND sess_date = #{sessDate} AND status = 'pending' AND pay_status IN ('paying','paid') AND del_flag = '0' " +
+        "  AND slot_start < #{reqEnd} AND slot_end > #{reqStart} " +
+        "FOR UPDATE")
+    List<Long> selectReservedSeatOverlapForUpdate(@Param("tenantId") String tenantId,
+                                                  @Param("storeId") Long storeId,
+                                                  @Param("seatId") Long seatId,
+                                                  @Param("sessDate") LocalDate sessDate,
+                                                  @Param("reqStart") LocalTime reqStart,
+                                                  @Param("reqEnd") LocalTime reqEnd);
+
+    /**
+     * 代客预约 × 在座单区间互斥（GZ-BEAN-048，占用座排后面空档）：某具体座位 {@code seatId} 当日<b>仍在占用的 used 单</b>
+     * 的区间与代客请求区间 {@code [reqStart, reqEnd)} 是否重叠。
+     *
+     * <p><b>占用 used 单</b> = {@code status='used' AND actual_end_time IS NULL AND pay_status IN ('paying','paid')}
+     * —— 已核销在店、未放座（放座 / 结单即 {@code actual_end_time} 非空、视为空闲不占，放座即空 GZ-BEAN-045）。占用止界用
+     * 计划 {@code slot_end}（未放座单 {@code actual_end_slot} 恒 NULL），无整点误判。重叠判定
+     * {@code slot_start < #{reqEnd} AND slot_end > #{reqStart}}（左闭右开，端点相接不算重叠）。</p>
+     *
+     * <p><b>取代 GZ-BEAN-046 的「当下物理在座」present-moment 判定</b>（{@link #selectSeatOccupiedNowForUpdate} 仍供
+     * 核销分座 / 改派用，不动）：代客预约改成<b>按请求时段</b>判占用 —— 现占 13:00-15:00 的座，代客排其后空档
+     * 15:00-17:00（不重叠）放行、盖到 14:00-16:00（重叠）拒。这样占用座也能代客排后面空档（客户 GZ-BEAN-048）。
+     * {@code FOR UPDATE} 锁串行化并发。</p>
+     *
+     * @return 命中的在座 booking id 列表（非空即代客时段与在座单重叠 → SEAT_TAKEN 拒单）
+     */
+    @Select("SELECT id FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_id = #{seatId} " +
+        "  AND sess_date = #{sessDate} AND status = 'used' AND pay_status IN ('paying','paid') AND del_flag = '0' " +
+        "  AND actual_end_time IS NULL " +
+        "  AND slot_start < #{reqEnd} AND slot_end > #{reqStart} " +
+        "FOR UPDATE")
+    List<Long> selectSeatUsedOverlapForUpdate(@Param("tenantId") String tenantId,
+                                              @Param("storeId") Long storeId,
+                                              @Param("seatId") Long seatId,
+                                              @Param("sessDate") LocalDate sessDate,
+                                              @Param("reqStart") LocalTime reqStart,
+                                              @Param("reqEnd") LocalTime reqEnd);
+
+    /**
+     * 当下代客（immediate）「座位此刻物理占用」判定（GZ-BEAN-048 blocker 修）：某具体座位当日是否有<b>任一未放座 used 单</b>。
+     *
+     * <p><b>与 {@link #selectSeatUsedOverlapForUpdate}（future 排后空档用，看计划区间重叠）和
+     * {@link #selectSeatOccupiedNowForUpdate}（含 {@code slot_end > now}，会漏「超时赖座」）都不同</b>：当下代客的客人
+     * <b>此刻就要坐下</b>，只要该座有一张 {@code status='used' AND actual_end_time IS NULL} 单（未点放座），就说明有人
+     * <b>物理还在坐</b>（无论在座中还是<b>超时未结单赖座</b> —— overtime 单 {@code slot_end} 已过但客人没走、店员没放座，
+     * {@code slot_end > now} 会漏判 → 同座物理撞人）。故本查询<b>不看 slot_end / 不看请求区间</b>，只认「未放座 = 有人」。
+     * 命中 → 先放座 / 结单再代客（拒 {@code SEAT_TAKEN}）。已放座 / 结单单（{@code actual_end_time} 非空）= 客人已离场，不占。</p>
+     *
+     * <p>{@code FOR UPDATE} 锁串行化并发（配合 Redis 座位锁）。仅当下代客（immediate）用；排后空档（future→pending）不调
+     * 本查询（未来单不要求座位此刻空）。</p>
+     *
+     * @return 该座当日未放座 used 单 id 列表（非空即此刻有人在坐/赖座 → 拒当下代客，先放座）
+     */
+    @Select("SELECT id FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND seat_id = #{seatId} " +
+        "  AND sess_date = #{sessDate} AND status = 'used' AND pay_status IN ('paying','paid') AND del_flag = '0' " +
+        "  AND actual_end_time IS NULL " +
+        "FOR UPDATE")
+    List<Long> selectSeatUnreleasedUsedForUpdate(@Param("tenantId") String tenantId,
+                                                 @Param("storeId") Long storeId,
+                                                 @Param("seatId") Long seatId,
+                                                 @Param("sessDate") LocalDate sessDate);
+
+    /**
      * 分座候选列表用「当下物理占用」批量版（GZ-BEAN-043，无锁）：某门店某日此刻仍有人在坐的具体座位 id 去重列表。
      * 判定口径同 {@link #selectSeatOccupiedNowForUpdate}（{@code used + 未放座 + slot_end > now}），
      * service 层据此从同桌型启用座中排除，给店员一份「当下真能分」的候选。

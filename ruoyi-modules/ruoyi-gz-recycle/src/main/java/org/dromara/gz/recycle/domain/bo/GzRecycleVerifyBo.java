@@ -48,4 +48,12 @@ public class GzRecycleVerifyBo implements Serializable {
     @NotNull(message = "请填写最终金额")
     @Min(value = 0, message = "金额不能为负")
     private Long finalAmountCent;
+
+    /**
+     * 核销备注（GZ-RECYCLE-009，可选）：店员核对时填的内容说明，≤500 字，落 verify_remark 列。
+     *
+     * <p>独立于顾客下单整单备注 {@code remark}（后者是用户提交时填、已回显，不复用防覆盖）。</p>
+     */
+    @Size(max = 500, message = "核销备注最多 500 字")
+    private String remark;
 }

@@ -141,7 +141,7 @@ class GzRecycleVerifyPayoutTest {
     void verify_confirmsAndTriggersPayout_toPaying() {
         GzRecycleAppointment appt = submittedAppt(7001L, 0);
         when(baseMapper.selectById(7001L)).thenReturn(appt);
-        when(baseMapper.markConfirmedOnsite(eq(7001L), eq(0), anyString(), eq(5000L), eq("成都门店运营"), any()))
+        when(baseMapper.markConfirmedOnsite(eq(7001L), eq(0), anyString(), eq(5000L), eq("成都门店运营"), any(), any()))
             .thenReturn(1);
         when(payoutService.initiatePayout(any(InitiateBo.class)))
             .thenReturn(payoutVo("PAYOUT-20260623-000001", PayoutStatus.PROCESSING));
@@ -153,12 +153,14 @@ class GzRecycleVerifyPayoutTest {
         afterPaying.setOutPayoutNo("PAYOUT-20260623-000001");
         when(baseMapper.selectById(7001L)).thenReturn(appt, afterPaying);
 
-        GzRecycleAppointmentAdminVO vo = service.verifyAndPayout(verifyBo(7001L, 5000L, 11L, 12L), "成都门店运营");
+        GzRecycleVerifyBo bo = verifyBo(7001L, 5000L, 11L, 12L);
+        bo.setRemark("品相良好");
+        GzRecycleAppointmentAdminVO vo = service.verifyAndPayout(bo, "成都门店运营");
 
         assertEquals("paying", vo.getStatus());
         assertEquals("PAYOUT-20260623-000001", vo.getOutPayoutNo());
-        // 留痕：核对照逗号分隔 + final_amount + verified_by 进 markConfirmedOnsite
-        verify(baseMapper).markConfirmedOnsite(eq(7001L), eq(0), eq("11,12"), eq(5000L), eq("成都门店运营"), any());
+        // 留痕：核对照逗号分隔 + final_amount + verified_by + 核销备注（GZ-RECYCLE-009）进 markConfirmedOnsite
+        verify(baseMapper).markConfirmedOnsite(eq(7001L), eq(0), eq("11,12"), eq(5000L), eq("成都门店运营"), any(), eq("品相良好"));
         // 触发打款金额 = final_amount_cent（doc/11 §4.8）
         verify(payoutService).initiatePayout(any(InitiateBo.class));
         verify(baseMapper).markPaying(eq(7001L), eq(1), eq("PAYOUT-20260623-000001"));
@@ -169,7 +171,7 @@ class GzRecycleVerifyPayoutTest {
     void verify_adjustedFinalAmount_persistsAdjustedNotEstimated() {
         GzRecycleAppointment appt = submittedAppt(7002L, 0); // estimated=5000
         when(baseMapper.selectById(7002L)).thenReturn(appt);
-        when(baseMapper.markConfirmedOnsite(eq(7002L), eq(0), anyString(), eq(4200L), anyString(), any()))
+        when(baseMapper.markConfirmedOnsite(eq(7002L), eq(0), anyString(), eq(4200L), anyString(), any(), any()))
             .thenReturn(1);
         when(payoutService.initiatePayout(any(InitiateBo.class)))
             .thenReturn(payoutVo("PAYOUT-20260623-000002", PayoutStatus.PROCESSING));
@@ -181,7 +183,7 @@ class GzRecycleVerifyPayoutTest {
         service.verifyAndPayout(verifyBo(7002L, 4200L, 21L), "店员A"); // 微调到 4200（< 5000 估价）
 
         // 触发打款金额取微调后 4200，不是估价 5000
-        verify(baseMapper).markConfirmedOnsite(eq(7002L), eq(0), eq("21"), eq(4200L), eq("店员A"), any());
+        verify(baseMapper).markConfirmedOnsite(eq(7002L), eq(0), eq("21"), eq(4200L), eq("店员A"), any(), any());
     }
 
     @Test
@@ -195,7 +197,7 @@ class GzRecycleVerifyPayoutTest {
             () -> service.verifyAndPayout(verifyBo(7009L, 200000L, 91L), "店员A"));
         assertEquals(GzRecycleErrorCode.FINAL_AMOUNT_EXCEEDS_LIMIT, ex.getCode());
         // 资金安全：超限即拦截，不核对、不触发真打款
-        verify(baseMapper, never()).markConfirmedOnsite(anyLong(), anyInt(), anyString(), anyLong(), anyString(), any());
+        verify(baseMapper, never()).markConfirmedOnsite(anyLong(), anyInt(), anyString(), anyLong(), anyString(), any(), any());
         verify(payoutService, never()).initiatePayout(any(InitiateBo.class));
     }
 
@@ -204,7 +206,7 @@ class GzRecycleVerifyPayoutTest {
     void verify_finalAmountAboveOldRatioCapButUnderAbsolute_passes() {
         GzRecycleAppointment appt = submittedAppt(7012L, 0); // estimated=5000，旧倍数档=15000
         when(baseMapper.selectById(7012L)).thenReturn(appt);
-        when(baseMapper.markConfirmedOnsite(eq(7012L), eq(0), anyString(), eq(30000L), anyString(), any()))
+        when(baseMapper.markConfirmedOnsite(eq(7012L), eq(0), anyString(), eq(30000L), anyString(), any(), any()))
             .thenReturn(1);
         when(payoutService.initiatePayout(any(InitiateBo.class)))
             .thenReturn(payoutVo("PAYOUT-20260623-000012", PayoutStatus.PROCESSING));
@@ -215,7 +217,7 @@ class GzRecycleVerifyPayoutTest {
 
         // 30000（¥300）> 旧倍数档 15000，但 ≤ 绝对上限 100000 → 放行（去估价后倍数档已删）
         service.verifyAndPayout(verifyBo(7012L, 30000L, 91L), "店员A");
-        verify(baseMapper).markConfirmedOnsite(eq(7012L), eq(0), anyString(), eq(30000L), anyString(), any());
+        verify(baseMapper).markConfirmedOnsite(eq(7012L), eq(0), anyString(), eq(30000L), anyString(), any(), any());
         verify(payoutService).initiatePayout(any(InitiateBo.class));
     }
 
@@ -224,7 +226,7 @@ class GzRecycleVerifyPayoutTest {
     void verify_concurrentVersionDrift_throwsNotVerifiable_noPayout() {
         GzRecycleAppointment appt = submittedAppt(7003L, 0);
         when(baseMapper.selectById(7003L)).thenReturn(appt);
-        when(baseMapper.markConfirmedOnsite(eq(7003L), eq(0), anyString(), anyLong(), anyString(), any()))
+        when(baseMapper.markConfirmedOnsite(eq(7003L), eq(0), anyString(), anyLong(), anyString(), any(), any()))
             .thenReturn(0); // 已被并发核对推进
 
         ServiceException ex = assertThrows(ServiceException.class,

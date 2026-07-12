@@ -2921,12 +2921,20 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             throw new ServiceException(GzBeanErrorCode.SLOT_RANGE_INVALID_MSG, GzBeanErrorCode.SLOT_RANGE_INVALID);
         }
 
-        // ③ 座位级占用 guard（松绑 GZ-BEAN-046，甲方口径「座位只判是否空闲、给店员充足操作空间」）：
-        //    Redis seat 锁 + FOR UPDATE + ③a 当下物理在座（selectSeatOccupiedNowForUpdate，分钟精度、放座即空）。
-        //    此刻这把椅子没人坐即可代客——**不再做整点区间重叠校验**（取代 GZ-BEAN-045 的 ③b，店员对物理座的现场
-        //    判断为准，与看板「空闲」口径完全一致）。桌型配额账（mp 线上同桌型余量）由 countActiveCoveringSlot 侧按
-        //    整点格计入本 used 单（Kevin 拍板「按整点格保护线上不超卖」），不在此拦截 —— walk-in 拿的是具体物理座，
-        //    不过桌型配额闸。并发两店员抢同空闲座由 Redis 锁串行化（第二个 tryLock=false → SEAT_TAKEN）+ ③a 兜底。
+        // 当下就坐 vs 排后空档（GZ-BEAN-048）：请求时段覆盖此刻 → immediate（立刻 used）；整段在未来 → future（排位 pending 待核销）。
+        //   座位 guard、⑥ 建单都据此分流；now/today/future 只算一次。
+        LocalDateTime now = LocalDateTime.now();
+        LocalDate today = now.toLocalDate();
+        boolean future = bo.getSessDate().isAfter(today)
+            || (bo.getSessDate().isEqual(today) && bo.getSlotStart().isAfter(now.toLocalTime()));
+
+        // ③ 座位级占用 guard（GZ-BEAN-048「占用座排后面空档」）：Redis seat 锁 + FOR UPDATE，按 immediate/future 分两口径：
+        //    - future（排后空档、pending 排位）：请求区间与该座「未放座 used 单」区间重叠 → 拒（selectSeatUsedOverlapForUpdate）。
+        //      现占 13-15 排后档 15-17（不重叠）放行、盖 14-16（重叠）拒。
+        //    - immediate（当下就坐、used）：客人此刻就坐，座位必须<b>物理空</b> —— 任一「未放座 used 单」都算有人在坐
+        //      （含<b>超时赖座</b>：overtime 单 slot_end 已过但客人没走没放座，用 slot_end 判会漏 → 同座物理撞人 blocker），
+        //      故用 selectSeatUnreleasedUsedForUpdate（不看 slot_end / 不看区间，只认未放座=有人）→ 命中「先放座再代客」。
+        //    两口径都过 ③c 排位重叠 → 不盖排位客人。已放座 / 结单单（actual_end_time 非空）= 客人已离场，不占（放座即空）。
         String seatLockKey = LOCK_SEAT_PREFIX + bo.getStoreId() + ":" + bo.getSeatId() + ":" + bo.getSessDate();
         if (!tryAcquireRedisLock(seatLockKey)) {
             log.info("[bean-walk-in] seat lock taken storeId={} seatId={} date={}",
@@ -2934,13 +2942,32 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             throw new ServiceException(GzBeanErrorCode.SEAT_TAKEN_MSG, GzBeanErrorCode.SEAT_TAKEN);
         }
         registerLockReleaseOnTxEnd(seatLockKey);
-        // ③a 当下物理在座（现场分座唯一硬约束：此刻这张椅子不能有人在坐；放座即空、分钟精度）
-        List<Long> occupiedNow = bookingMapper.selectSeatOccupiedNowForUpdate(
-            tenantId, bo.getStoreId(), bo.getSeatId(), bo.getSessDate(), LocalTime.now());
-        if (!occupiedNow.isEmpty()) {
-            log.info("[bean-walk-in] seat occupied now storeId={} seatId={} date={} occupiedIds={}",
-                bo.getStoreId(), bo.getSeatId(), bo.getSessDate(), occupiedNow);
-            throw new ServiceException(GzBeanErrorCode.SEAT_TAKEN_MSG, GzBeanErrorCode.SEAT_TAKEN);
+        if (future) {
+            // ③a-future 在座单区间互斥：请求（未来）区间与该座任一「未放座 used 单」计划区间重叠 → 拒（排后档不能盖在座时段）
+            List<Long> usedOverlap = bookingMapper.selectSeatUsedOverlapForUpdate(
+                tenantId, bo.getStoreId(), bo.getSeatId(), bo.getSessDate(), bo.getSlotStart(), bo.getSlotEnd());
+            if (!usedOverlap.isEmpty()) {
+                log.info("[bean-walk-in] future seat used-interval overlap storeId={} seatId={} date={} req={}-{} usedIds={}",
+                    bo.getStoreId(), bo.getSeatId(), bo.getSessDate(), bo.getSlotStart(), bo.getSlotEnd(), usedOverlap);
+                throw new ServiceException(GzBeanErrorCode.SEAT_TAKEN_MSG, GzBeanErrorCode.SEAT_TAKEN);
+            }
+        } else {
+            // ③a-immediate 当下物理占用：座位此刻有任一未放座 used 单（在座中 or 超时赖座）→ 先放座再代客（防同座物理撞人 blocker）
+            List<Long> occupied = bookingMapper.selectSeatUnreleasedUsedForUpdate(
+                tenantId, bo.getStoreId(), bo.getSeatId(), bo.getSessDate());
+            if (!occupied.isEmpty()) {
+                log.info("[bean-walk-in] immediate seat physically occupied storeId={} seatId={} date={} occupiedIds={}",
+                    bo.getStoreId(), bo.getSeatId(), bo.getSessDate(), occupied);
+                throw new ServiceException("该座位当前有人在坐（或超时未结单），请先放座再代客", GzBeanErrorCode.SEAT_TAKEN);
+            }
+        }
+        // ③c 排位重叠保护（GZ-BEAN-047，两口径都要）：请求区间与该座「排位 pending 单」重叠 → 拒，不盖排位客人（15:00 到店没座）。
+        List<Long> reservedOverlap = bookingMapper.selectReservedSeatOverlapForUpdate(
+            tenantId, bo.getStoreId(), bo.getSeatId(), bo.getSessDate(), bo.getSlotStart(), bo.getSlotEnd());
+        if (!reservedOverlap.isEmpty()) {
+            log.info("[bean-walk-in] seat reserved overlap storeId={} seatId={} date={} req={}-{} reservedIds={}",
+                bo.getStoreId(), bo.getSeatId(), bo.getSessDate(), bo.getSlotStart(), bo.getSlotEnd(), reservedOverlap);
+            throw new ServiceException(GzBeanErrorCode.SEAT_RESERVED_OVERLAP_MSG, GzBeanErrorCode.SEAT_RESERVED_OVERLAP);
         }
 
         // ④ 计价（甲方口径 GZ-BEAN-046）：免费单 或 店员未录金额（amountCent==null）→ 营业额 0，不臆造收入
@@ -2955,9 +2982,10 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         String mobileSnapshot = StrUtil.isNotBlank(bo.getMobile()) ? bo.getMobile() : "00000000000";
 
         // ⑥ 一次 insert 配齐全字段（严禁 insert 后 updateById 补 seat_id——@Version 内存 version 为 null 会静默不落，
-        //    memory version-entity-insert-then-updatebyid-noop）：status=used + pay_status=paid + seat_id + 核销信息。
-        LocalDateTime now = LocalDateTime.now();
-        String bookingNo = generateBookingNo(now.toLocalDate());
+        //    memory version-entity-insert-then-updatebyid-noop）：future（排后空档）=排位 pending（verify_time/verified_by
+        //    留空，待客人到店在看板下栏核销落座，复用 preAssign 两栏看板 + 核销）；immediate（当下就坐）=used（一步核销，
+        //    verify_time=now）。两者都 seat_id + pay_status=paid。future/now/today 已在 ③ 前算好。
+        String bookingNo = generateBookingNo(today);
         String seatTypeName = StrUtil.isNotBlank(config.getName()) ? config.getName() : config.getSeatType();
         GzBeanBooking entity = GzBeanBooking.builder()
             .bookingNo(bookingNo)
@@ -2975,15 +3003,15 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .mobileSnapshot(mobileSnapshot)
             .amountCent(amountCent)
             .discountAmountCent(0L)
-            .status(STATUS_USED)
+            .status(future ? STATUS_PENDING : STATUS_USED)
             .payStatus(PAY_STATUS_PAID)
             .verifyCode(qrCodeSigner.signByType(bookingNo, bo.getSessDate(), config.getSeatType()))
-            .verifyTime(now)
-            .verifiedBy(operator)
+            .verifyTime(future ? null : now)
+            .verifiedBy(future ? null : operator)
             .isFree(isFree)
             .source(SOURCE_WALK_IN)
             .dedupToken(bookingNo)
-            .remark("看板代客预约（现金到店，一步建单核销分座）")
+            .remark(future ? "看板代客排位（现金已付，排到该座后面空档，待客人到店核销落座）" : "看板代客预约（现金到店，一步建单核销分座）")
             .delFlag("0")
             .build();
         entity.setTenantId(tenantId);
@@ -2992,14 +3020,17 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         bookingLogMapper.insert(GzBeanBookingLog.builder()
             .bookingId(entity.getId())
             .fromStatus(null)
-            .toStatus(STATUS_USED)
+            .toStatus(future ? STATUS_PENDING : STATUS_USED)
             .operatorType(OPERATOR_ADMIN)
             .operatorId(operator)
-            .note("看板代客预约（线下已付，一步建单核销，分配座位 " + seat.getSeatNo() + "）")
+            .note(future
+                ? "看板代客排位（线下已付，排到座位 " + seat.getSeatNo() + " 后面空档，待客人到店核销）"
+                : "看板代客预约（线下已付，一步建单核销，分配座位 " + seat.getSeatNo() + "）")
             .delFlag("0")
             .build());
-        log.info("[bean-walk-in] OK bookingNo={} storeId={} seatId={} slot={}-{} amount={} free={} userId={} by={} → used已分座",
-            bookingNo, bo.getStoreId(), bo.getSeatId(), bo.getSlotStart(), bo.getSlotEnd(), amountCent, isFree, userId, operator);
+        log.info("[bean-walk-in] OK bookingNo={} storeId={} seatId={} slot={}-{} amount={} free={} userId={} by={} → {}",
+            bookingNo, bo.getStoreId(), bo.getSeatId(), bo.getSlotStart(), bo.getSlotEnd(), amountCent, isFree, userId, operator,
+            future ? "pending排位待核销" : "used已分座");
         return selectVoById(entity.getId());
     }
 
