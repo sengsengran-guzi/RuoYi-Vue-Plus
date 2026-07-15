@@ -118,6 +118,13 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
     private static final String KEY_FINAL_MAX_CENT = "gz.recycle.final_amount.max_cent";
     private static final long DEFAULT_FINAL_MAX_CENT = 100000L;
 
+    /**
+     * 回收自动打款开关（sys_config {@code gz.recycle.auto_payout.enabled}，默认 false）。
+     * 客户 7.15：暂屏蔽自动退款——店员核对确认后走店内现金交易，核对即终态（confirmed_onsite），不触发反向打款。
+     * 后续要恢复自动微信转账：sys_config 置 true（反向打款代码保留在 verifyAndPayout ⑤/⑥）。
+     */
+    private static final String KEY_AUTO_PAYOUT = "gz.recycle.auto_payout.enabled";
+
     @Override
     @Transactional(rollbackFor = Exception.class, isolation = Isolation.REPEATABLE_READ)
     public GzRecycleAppointmentVO submit(GzRecycleAppointmentSubmitBo bo, Long userId) {
@@ -127,11 +134,10 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             throw new ServiceException("未登录");
         }
 
-        // ① product + categories 非空（契约 §B.5 4108）
+        // ① product 非空（客户 7.15：去品类，只填点数 → 不再校验品类；点数档由 ② getEnabledByCode 兜底 4107）
         GzRecycleAppointmentSubmitBo.ProductBo product = bo.getProduct();
-        if (product == null || product.getCategories() == null
-            || product.getCategories().stream().filter(StrUtil::isNotBlank).findAny().isEmpty()) {
-            throw new ServiceException(GzRecycleErrorCode.CATEGORY_REQUIRED_MSG, GzRecycleErrorCode.CATEGORY_REQUIRED);
+        if (product == null) {
+            throw new ServiceException(GzRecycleErrorCode.QTY_BUCKET_INVALID_MSG, GzRecycleErrorCode.QTY_BUCKET_INVALID);
         }
 
         // ② 点数档命中启用档（4107）→ 取 duration_minutes + occupy_next_slot + label 快照
@@ -183,7 +189,8 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
 
         // ⑥ product_snapshot_json 落对象（放开后去 IP：ip 字段留空，兼容老 VO 结构 + 老单展示）
         GzRecycleProductVO snapshot = new GzRecycleProductVO();
-        snapshot.setCategories(product.getCategories().stream().filter(StrUtil::isNotBlank).toList());
+        snapshot.setCategories(product.getCategories() == null ? List.of()
+            : product.getCategories().stream().filter(StrUtil::isNotBlank).toList());
         snapshot.setIpIds(List.of());
         snapshot.setIpNames(List.of());
         snapshot.setCustomIps(List.of());
@@ -369,7 +376,15 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         log.info("[gz-recycle] verify confirmed appointment_no={} finalAmountCent={} verifiedBy={} verifyImages={}",
             appt.getAppointmentNo(), bo.getFinalAmountCent(), verifiedBy, bo.getVerifyImageIds().size());
 
-        // ④ 触发反向打款（PAY-105 initiatePayout，1:1 幂等内建；business_type=recycle，独立核算不计 GMV，合同 §4.1）
+        // ④ 自动打款开关（客户 7.15）：默认关闭 → 店员核对确认即终态（confirmed_onsite），不触发反向打款、不进 paying，
+        //    货款店内现金结算。sys_config gz.recycle.auto_payout.enabled 置 true 即恢复下方 ⑤/⑥ 反向微信转账（代码保留）。
+        if (!configBool(KEY_AUTO_PAYOUT, false)) {
+            log.info("[gz-recycle] verify done (auto-payout OFF → 现金结算) appointment_no={} finalAmountCent={}",
+                appt.getAppointmentNo(), bo.getFinalAmountCent());
+            return toAdminVO(baseMapper.selectById(appt.getId()));
+        }
+
+        // ⑤ 触发反向打款（PAY-105 initiatePayout，1:1 幂等内建；business_type=recycle，独立核算不计 GMV，合同 §4.1）
         GzPayPayoutTransactionVO payout = payoutService.initiatePayout(new InitiateBo(
             PAYOUT_BUSINESS_TYPE, appt.getAppointmentNo(), appt.getUserId(),
             appt.getReceiverOpenid(), bo.getFinalAmountCent(), PAYOUT_REMARK));
@@ -414,6 +429,16 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             log.warn("[gz-recycle] final_amount {} 超绝对上限 {}（拦截）", finalCent, absoluteCap);
             throw new ServiceException(GzRecycleErrorCode.FINAL_AMOUNT_EXCEEDS_LIMIT_MSG, GzRecycleErrorCode.FINAL_AMOUNT_EXCEEDS_LIMIT);
         }
+    }
+
+    /** 读 sys_config 布尔值（true/1/Y 视为真，缺失兜底 default）。 */
+    private boolean configBool(String key, boolean def) {
+        String raw = configService.getConfigValue(key);
+        if (StrUtil.isBlank(raw)) {
+            return def;
+        }
+        String v = raw.trim();
+        return "true".equalsIgnoreCase(v) || "1".equals(v) || "Y".equalsIgnoreCase(v);
     }
 
     /** 读 sys_config long 值，缺失/非法兜底 default（同 recon rateBpOf 范式）。 */

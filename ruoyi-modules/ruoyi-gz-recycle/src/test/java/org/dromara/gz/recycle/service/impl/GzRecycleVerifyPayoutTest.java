@@ -94,6 +94,9 @@ class GzRecycleVerifyPayoutTest {
             baseMapper, gzUserMapper, apptNoGenerator, qtyRangeService, timeSlotService,
             new RecycleQrSigner(new GzRecycleQrProperties()), new ObjectMapper(),
             payoutService, payoutMapper, configService);
+        // 客户 7.15 自动打款开关：反向打款链路用例默认置 true（沿用旧行为测 payout）；
+        // payout-off 终态用例单独 override 为 false。
+        lenient().when(configService.getConfigValue("gz.recycle.auto_payout.enabled")).thenReturn("true");
     }
 
     /** 把 TenantHelper.ignore(Supplier) 直接执行 supplier（脱离租户上下文）。 */
@@ -164,6 +167,26 @@ class GzRecycleVerifyPayoutTest {
         // 触发打款金额 = final_amount_cent（doc/11 §4.8）
         verify(payoutService).initiatePayout(any(InitiateBo.class));
         verify(baseMapper).markPaying(eq(7001L), eq(1), eq("PAYOUT-20260623-000001"));
+    }
+
+    @Test
+    @DisplayName("客户 7.15 自动打款关闭：核对确认即终态 confirmed_onsite，不触发反向打款、不进 paying（店内现金结算）")
+    void verify_autoPayoutOff_confirmsOnsiteNoPayout() {
+        lenient().when(configService.getConfigValue("gz.recycle.auto_payout.enabled")).thenReturn("false");
+        GzRecycleAppointment appt = submittedAppt(7100L, 0);
+        GzRecycleAppointment confirmed = submittedAppt(7100L, 1);
+        confirmed.setStatus("confirmed_onsite");
+        confirmed.setFinalAmountCent(5000L);
+        when(baseMapper.selectById(7100L)).thenReturn(appt, confirmed);
+        when(baseMapper.markConfirmedOnsite(eq(7100L), eq(0), anyString(), eq(5000L), anyString(), any(), any()))
+            .thenReturn(1);
+
+        GzRecycleAppointmentAdminVO vo = service.verifyAndPayout(verifyBo(7100L, 5000L, 11L), "店员A");
+
+        assertEquals("confirmed_onsite", vo.getStatus());
+        verify(baseMapper).markConfirmedOnsite(eq(7100L), eq(0), anyString(), eq(5000L), anyString(), any(), any());
+        verify(payoutService, never()).initiatePayout(any(InitiateBo.class));
+        verify(baseMapper, never()).markPaying(anyLong(), anyInt(), anyString());
     }
 
     @Test

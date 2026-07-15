@@ -2,7 +2,6 @@ package org.dromara.gz.recycle.domain.bo;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 import lombok.Data;
@@ -75,8 +74,7 @@ public class GzRecycleAppointmentSubmitBo implements Serializable {
         @Serial
         private static final long serialVersionUID = 1L;
 
-        /** 回收品类<b>多选</b>（字典 gz_recycle_category value，≥ 1 项） */
-        @NotEmpty(message = "请至少选择一个回收品类")
+        /** 回收品类<b>多选</b>（客户 7.15 去品类后可空 / 省略；保留字段兼容老单展示） */
         @Size(max = 10, message = "回收品类最多 10 项")
         private List<@Size(max = 32, message = "品类长度不能超过 32") String> categories;
 

@@ -288,14 +288,22 @@ class GzRecycleAppointmentServiceImplTest {
     /* ---------------- 提交校验 ---------------- */
 
     @Test
-    @DisplayName("categories 空 → 4108，不查用户/不 INSERT")
-    void submit_rejectEmptyCategories() {
+    @DisplayName("客户 7.15 去品类：categories 空也可提交（只需点数档），正常 INSERT")
+    void submit_emptyCategoriesAllowed_stillInserts() {
         GzRecycleAppointmentServiceImpl spy = spyOk();
-        ServiceException ex = assertThrows(ServiceException.class,
-            () -> spy.submit(submitBo(product(new ArrayList<>(), "pts-1-50"), 10L), 1001L));
-        assertEquals(GzRecycleErrorCode.CATEGORY_REQUIRED, ex.getCode());
-        verify(gzUserMapper, never()).selectById(any());
-        verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
+        when(qtyRangeService.getEnabledByCode("pts-1-50")).thenReturn(bucket("pts-1-50", "1-50 点", 60, 0));
+        when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx_abc123", "13800000000"));
+        when(timeSlotService.listEnabledByStore(1L)).thenReturn(threeSlots());
+        when(baseMapper.countActiveHoldingSlotForUpdate(anyString(), anyLong(), any(), eq(10L))).thenReturn(0L);
+        when(apptNoGenerator.generate()).thenReturn("RCY-20260715-000009");
+        when(baseMapper.insert(any(GzRecycleAppointment.class))).thenReturn(1);
+
+        GzRecycleAppointmentVO vo = spy.submit(submitBo(product(new ArrayList<>(), "pts-1-50"), 10L), 1001L);
+
+        assertEquals("submitted", vo.getStatus());
+        GzRecycleAppointment saved = captureInsert().getValue();
+        assertTrue(saved.getProductSnapshotJson().contains("\"categories\":[]"), "空品类 → snapshot categories 空数组");
+        assertTrue(saved.getProductSnapshotJson().contains("1-50 点"), "仍带点数档 label");
     }
 
     @Test
