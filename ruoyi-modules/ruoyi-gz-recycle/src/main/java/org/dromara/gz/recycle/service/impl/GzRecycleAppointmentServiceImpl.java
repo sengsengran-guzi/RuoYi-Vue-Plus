@@ -89,6 +89,18 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         List.of("submitted", "confirmed_onsite", "paying", "paid", "payout_failed");
     /** Redis 锁前缀：同门店同日下单串行化（时段容量防超卖，gz:recycle:lock:slot:{store}:{date}） */
     private static final String LOCK_SLOT_PREFIX = "gz:recycle:lock:slot:";
+    /** Redis 锁前缀：同用户提交串行化（客户 7.24 一人一单守卫，gz:recycle:lock:user_submit:{userId}） */
+    private static final String LOCK_USER_SUBMIT_PREFIX = "gz:recycle:lock:user_submit:";
+    /**
+     * 「一人一单」守卫的进行中态（客户 7.24）：排除 {@code paid / cancelled / no_show} 三终态（拿到钱或结束即可再约），
+     * 与 {@link #ACTIVE_HOLD_STATUSES}（含 paid，当天仍占时段档）刻意不同。
+     *
+     * <p>⚠️ 本集用于读路径 {@link #getActiveAppointment}；写路径守卫 {@code countActiveByUserForUpdate} 的
+     * {@code @Select} SQL 内联同一四态字面量（MyBatis 注解无法引用本常量）。<b>改口径必须两处同步</b>，
+     * 否则 /active 预检与 submit 拦截口径分叉（漏拦超发 / 误拦）。</p>
+     */
+    private static final List<String> USER_ACTIVE_STATUSES =
+        List.of("submitted", "confirmed_onsite", "paying", "payout_failed");
     /** Redis 锁 TTL（同拼豆 5s） */
     private static final Duration LOCK_TTL = Duration.ofSeconds(5);
 
@@ -158,6 +170,19 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             throw new ServiceException(GzRecycleErrorCode.MOBILE_REQUIRED_MSG, GzRecycleErrorCode.MOBILE_REQUIRED);
         }
         String tenantId = user.getTenantId();
+
+        // ③.5 一人一单守卫（客户 7.24）：同用户不得同时持有进行中的回收预约（已到账/已取消/已过期外全挡）。
+        //     并发正确性根基 = countActiveByUserForUpdate 在 idx_tenant_user(tenant_id,user_id) 上的 FOR UPDATE
+        //     next-key 间隙锁（REPEATABLE_READ 下阻塞并发同用户 INSERT / 读旧 count，命中 0 行也锁索引区段）；
+        //     user_submit Redis 锁只是快速失败优化（5s TTL，长事务下可能提前过期 → 退回 DB 间隙锁兜底，仍不超发）。
+        String userLockKey = LOCK_USER_SUBMIT_PREFIX + userId;
+        if (!tryAcquireRedisLock(userLockKey)) {
+            throw new ServiceException(GzRecycleErrorCode.SLOT_LOCK_BUSY_MSG, GzRecycleErrorCode.SLOT_LOCK_BUSY);
+        }
+        registerLockReleaseOnTxEnd(userLockKey);
+        if (baseMapper.countActiveByUserForUpdate(tenantId, userId) > 0) {
+            throw new ServiceException(GzRecycleErrorCode.ONE_ACTIVE_APPOINTMENT_MSG, GzRecycleErrorCode.ONE_ACTIVE_APPOINTMENT);
+        }
 
         // ④ 到店时段：本店 enabled 有序列表中定位选中档（非法/跨店/已关闭 → 4124）+ 计算下一档 + 是否大单占位。
         //    FLAT 规则（客户 7.08）：大单（occupy_next_slot=1）额外占下一 enabled 档；末档无下一档 → 不占（晚 7 点例外）。
@@ -259,6 +284,20 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             vo.setTaken(taken.contains(s.getId()));
             return vo;
         }).toList();
+    }
+
+    @Override
+    public GzRecycleAppointmentVO getActiveAppointment(Long userId) {
+        if (userId == null) {
+            return null;
+        }
+        // 进行中单（排除 paid/cancelled/no_show）取最新一条；一人一单守卫下常态 ≤ 1，历史脏数据兜底 LIMIT 1。
+        List<GzRecycleAppointment> list = baseMapper.selectList(Wrappers.<GzRecycleAppointment>lambdaQuery()
+            .eq(GzRecycleAppointment::getUserId, userId)
+            .in(GzRecycleAppointment::getStatus, USER_ACTIVE_STATUSES)
+            .orderByDesc(GzRecycleAppointment::getId)
+            .last("LIMIT 1"));
+        return list.isEmpty() ? null : toVO(list.get(0));
     }
 
     /** 在本店 enabled 时段有序列表中定位 timeSlotId 的下标（未命中返 -1）。 */

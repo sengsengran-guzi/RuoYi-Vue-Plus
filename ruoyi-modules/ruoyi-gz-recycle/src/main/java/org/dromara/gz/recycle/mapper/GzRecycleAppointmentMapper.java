@@ -80,6 +80,30 @@ public interface GzRecycleAppointmentMapper extends BaseMapperPlus<GzRecycleAppo
                                          @Param("slotId") Long slotId);
 
     /**
+     * 同一用户当前进行中的回收预约数（客户 7.24「一人一单」守卫，FOR UPDATE）。
+     *
+     * <p>「进行中」= {@code submitted / confirmed_onsite / paying / payout_failed}
+     * （{@code paid 已到账 / cancelled 已取消 / no_show 已过期} 三终态释放，可再预约）。
+     * <b>注意与 {@link #countActiveHoldingSlotForUpdate} 活跃集不同</b>：那个含 {@code paid}（当天仍占时段档），
+     * 本守卫排除 {@code paid}（拿到钱即结清，可再约）。</p>
+     *
+     * <p>并发：service 上层先抢 {@code gz:recycle:lock:user_submit:{userId}} Redis 锁串行化同用户提交（防连点两单都过），
+     * {@code FOR UPDATE} + REPEATABLE_READ 间隙锁做 DB 层双保险。tenant_id 显式传（mp JWT 无 tenant，同 submit 口径）。</p>
+     *
+     * <p>⚠️ 状态集须与 {@code GzRecycleAppointmentServiceImpl.USER_ACTIVE_STATUSES} 保持一致（MyBatis @Select
+     * 无法引用 Java 常量，故此处内联字面量）；改「进行中」口径需两处同步，否则守卫（拦下单）与 /active 预检口径分叉。</p>
+     *
+     * @param tenantId 租户 id（显式传）
+     * @param userId   提交用户 id
+     * @return 该用户当前进行中的回收预约数（≥ 1 即不可再约）
+     */
+    @Select("SELECT COUNT(*) FROM gz_recycle_appointment " +
+        "WHERE tenant_id = #{tenantId} AND user_id = #{userId} " +
+        "  AND status IN ('submitted', 'confirmed_onsite', 'paying', 'payout_failed') AND del_flag = '0' " +
+        "FOR UPDATE")
+    long countActiveByUserForUpdate(@Param("tenantId") String tenantId, @Param("userId") Long userId);
+
+    /**
      * 店员核对确认：submitted → confirmed_onsite（GZ-RECYCLE-003 AC1，doc/10 §13.N8）。
      *
      * <p>原子写入核对留痕（verify_image_ids / final_amount_cent / verified_by / verify_time）+ 推进状态 + version+1。

@@ -183,6 +183,27 @@ public class GzRecycleAppointmentMpController {
     }
 
     /**
+     * 我当前进行中的回收预约（客户 7.24「一人一单」：回收表单进入前预检，进行中则提示 + 禁止再约）。
+     *
+     * <pre>
+     * GET /app/gz/recycle/appointment/active
+     * 200 OK { "code":200, "data": { appointmentNo, status, ... } }  // 有进行中单
+     * 200 OK { "code":200, "data": null }                            // 无进行中单，可新预约
+     * </pre>
+     *
+     * <p>「进行中」= submitted / confirmed_onsite / paying / payout_failed（已到账/已取消/已过期释放，可再约）。
+     * 登录态必需（未登录 401）；literal /active 优先于 /{id} 路由，不冲突。</p>
+     */
+    @GetMapping("/active")
+    public R<GzRecycleAppointmentVO> active() {
+        Long userId = LoginHelper.getUserId();
+        if (userId == null) {
+            return R.fail(401, "未登录");
+        }
+        return R.ok(appointmentService.getActiveAppointment(userId));
+    }
+
+    /**
      * 我的回收记录列表（按提交时间倒序，顾客窄 VO 三段）。
      */
     @GetMapping("/my")

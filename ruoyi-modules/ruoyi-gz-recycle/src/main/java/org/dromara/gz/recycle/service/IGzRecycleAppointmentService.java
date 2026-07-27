@@ -70,6 +70,17 @@ public interface IGzRecycleAppointmentService {
      */
     GzRecycleAppointmentVO selectMyDetail(Long id, Long userId);
 
+    /**
+     * 我当前进行中的回收预约（客户 7.24「一人一单」：回收表单进入前预检）。
+     *
+     * <p>「进行中」= {@code submitted / confirmed_onsite / paying / payout_failed}（已到账/已取消/已过期释放，可再约）。
+     * 有进行中单 → 前端提示 + 禁止再预约；无 → null（可新预约）。取最新一条（create_time desc）。</p>
+     *
+     * @param userId 当前登录用户 id
+     * @return 进行中的预约 VO；无 → null
+     */
+    GzRecycleAppointmentVO getActiveAppointment(Long userId);
+
     /* ===================== GZ-RECYCLE-003 店员核对 + admin 管理 ===================== */
 
     /**

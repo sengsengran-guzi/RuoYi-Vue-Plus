@@ -89,6 +89,10 @@ public final class GzRecycleErrorCode {
     public static final int SLOT_LOCK_BUSY = 4126;
     public static final String SLOT_LOCK_BUSY_MSG = "预约繁忙，请稍后重试";
 
+    /** 一人一单：同用户已有进行中的回收预约（客户 7.24；已到账 paid / 已取消 cancelled / 已过期 no_show 外全挡）。 */
+    public static final int ONE_ACTIVE_APPOINTMENT = 4127;
+    public static final String ONE_ACTIVE_APPOINTMENT_MSG = "您已有进行中的回收预约，完成或取消后再约";
+
     private GzRecycleErrorCode() {
     }
 }
