@@ -82,12 +82,16 @@ public interface IGzJpProductService {
      * 场内商品分页（UI:mp.event_detail 两列网格，上拉加载）。
      *
      * <p><b>★ 可见性两层，缺一即漏</b>：{@code 商品 status = on_shelf} <b>且</b>
-     * {@code 所属场生效状态 = open}（{@link IGzJpEventService#isBookable}，读时惰性判定 end_time）。
-     * 只判商品 status 会把「未开场 / 已结束的场里的 on_shelf 商品」漏给客人
+     * {@code 所属场可浏览}（{@link IGzJpEventService#isVisible}：open / closed 都算，draft 不算）。
+     * 只判商品 status 会把「未开场的场里的 on_shelf 商品」漏给客人
      * —— FLOW:F-JP-01.step2 明确「未开场时仍不可见」。</p>
      *
-     * <p>场不可下单时返回<b>空页</b>（rows=[] / total=0）而非报错：mp 进场前已先打
-     * {@code GET /app/gz/jp/event/{id}} 拿到「该场已结束」的明确信号，此处只做兜底不抢话。</p>
+     * <p><b>★ 闸用「可浏览」不是「可下单」</b>：UI:mp.event_detail 要求「场已结束时商品仍可浏览，
+     * 加购入口置灰」，所以已结束场照常出商品；每行的 {@link GzJpProductMpVO#getEventBookable()}
+     * 告诉前端加购能不能点。用 {@code isBookable} 卡门会让已结束场的商品网格整个空掉。</p>
+     *
+     * <p>场不可浏览（draft / 不存在）时返回<b>空页</b>（rows=[] / total=0）而非报错：mp 进场前已先打
+     * {@code GET /app/gz/jp/event/{id}} 拿到明确信号，此处只做兜底不抢话。</p>
      *
      * @param eventId   场主键（必传）
      * @param pageQuery 分页参数
@@ -98,10 +102,11 @@ public interface IGzJpProductService {
     /**
      * 商品详情（UI:mp.product_detail，含 ★ noticeText 风险告知位）。
      *
-     * <p>可见性判定与 {@link #selectMpPage} 完全同口径（两层）。</p>
+     * <p>可见性判定与 {@link #selectMpPage} 完全同口径（两层），已结束场的商品同样下发，
+     * 靠 {@link GzJpProductMpVO#getEventBookable()}{@code =false} 让前端置灰 CTA。</p>
      *
      * @param id 商品主键
-     * @return VO；商品不存在 / 已下架 / 所属场不可下单一律返回 null（由 controller 转 R.fail）
+     * @return VO；商品不存在 / 已下架 / 所属场不可浏览（draft）一律返回 null（由 controller 转 R.fail）
      */
     GzJpProductMpVO selectMpDetail(Long id);
 }

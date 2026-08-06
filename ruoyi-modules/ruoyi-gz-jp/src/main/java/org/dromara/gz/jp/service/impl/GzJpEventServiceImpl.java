@@ -44,8 +44,12 @@ import java.util.stream.Collectors;
  *       但绝不写库、绝不上 cron —— 本项目 prod 未部署 SnailJob，{@code @JobExecutor} 一个都不会跑。
  *       判定逻辑集中在 {@link GzJpEventStatus#effective}，admin 展示与 mp 过滤共用同一份。</li>
  *   <li><b>admin 状态筛选下沉 SQL</b>：不做内存过滤，否则分页 total 会失真。</li>
- *   <li><b>mp 可见性 = 生效状态 open</b>，即「存库 status=open 且 end_time 未到」。不额外以
- *       start_time 卡门 —— FLOW:F-JP-01.step3 明确「开场」是店员的显式动作，开了就该可见。</li>
+ *   <li><b>mp 可见 ≠ mp 可下单</b>（两条闸粗细不同，写代码别混）：
+ *       可见 = 存库 open / closed（{@link GzJpEventStatus#isVisibleForMp}，draft 永不可见）；
+ *       可下单 = 生效状态 open（{@link GzJpEventStatus#isBookableForMp}，关场 / 到点即 false）。
+ *       已结束的场照样下发，UI:mp.home 要拿它填「已结束」分组、UI:mp.event_detail 要它显示
+ *       「本场已结束」并置灰加购。不额外以 start_time 卡门 —— FLOW:F-JP-01.step3 明确「开场」
+ *       是店员的显式动作，开了就该可见；「即将开始」是前端按 start_time 派生的展示分组，不是状态。</li>
  *   <li><b>event_no 生成含软删行</b>：uk_event_no 覆盖软删，序号必须跳过已被软删占用的号
  *       （gz_bean_booking 曾因此撞唯一键）。</li>
  * </ul>
@@ -265,15 +269,20 @@ public class GzJpEventServiceImpl implements IGzJpEventService {
 
     @Override
     public TableDataInfo<GzJpEventMpVO> selectMpPage(PageQuery pageQuery) {
-        // 可见性下沉 SQL：status=open AND end_time > now（关场 / 到点的场天然进不来，分页 total 也准）
+        LocalDateTime now = LocalDateTime.now();
+        // 可见性下沉 SQL：status IN (open, closed) —— 白名单而非「!= draft」，脏 / 未知状态值一并挡在外面
+        // （与 GzJpEventStatus.of 回落 DRAFT 同一个「最保守」口径）。分页 total 也因此是客人真看得到的条数。
+        // ★ 这里不再卡 end_time：到点的场是「已结束」不是「不存在」，UI:mp.home 的已结束分组要它
         LambdaQueryWrapper<GzJpEvent> lqw = Wrappers.<GzJpEvent>lambdaQuery()
-            .eq(GzJpEvent::getStatus, GzJpEventStatus.OPEN.getCode())
-            .gt(GzJpEvent::getEndTime, LocalDateTime.now())
+            .in(GzJpEvent::getStatus, GzJpEventStatus.OPEN.getCode(), GzJpEventStatus.CLOSED.getCode())
             .orderByAsc(GzJpEvent::getSortNo)
-            .orderByAsc(GzJpEvent::getStartTime);
+            // end_time 倒序一举两得：未结束的场（end_time 在未来）天然排在已结束之前，保证首页
+            // 「进行中置顶」在分页下也成立；组内则是「最近的场在前」（已结束组 = 刚结束的先看到）
+            .orderByDesc(GzJpEvent::getEndTime)
+            .orderByDesc(GzJpEvent::getId);
         Page<GzJpEvent> page = baseMapper.selectPage(pageQuery.build(), lqw);
         Page<GzJpEventMpVO> voPage = new Page<>(page.getCurrent(), page.getSize(), page.getTotal());
-        voPage.setRecords(page.getRecords().stream().map(this::toMpVO).toList());
+        voPage.setRecords(page.getRecords().stream().map(e -> toMpVO(e, now)).toList());
         return TableDataInfo.build(voPage);
     }
 
@@ -283,10 +292,11 @@ public class GzJpEventServiceImpl implements IGzJpEventService {
             return null;
         }
         GzJpEvent e = baseMapper.selectById(id);
-        if (e == null || !GzJpEventStatus.isBookableForMp(e.getStatus(), e.getEndTime(), LocalDateTime.now())) {
+        // 可浏览即下发（含已结束的场）；能不能下单交给 VO 的 status，前端据此置灰加购
+        if (e == null || !GzJpEventStatus.isVisibleForMp(e.getStatus())) {
             return null;
         }
-        return toMpVO(e);
+        return toMpVO(e, LocalDateTime.now());
     }
 
     @Override
@@ -297,6 +307,15 @@ public class GzJpEventServiceImpl implements IGzJpEventService {
         GzJpEvent e = baseMapper.selectById(id);
         return e != null
             && GzJpEventStatus.isBookableForMp(e.getStatus(), e.getEndTime(), LocalDateTime.now());
+    }
+
+    @Override
+    public boolean isVisible(Long id) {
+        if (ObjectUtil.isNull(id)) {
+            return false;
+        }
+        GzJpEvent e = baseMapper.selectById(id);
+        return e != null && GzJpEventStatus.isVisibleForMp(e.getStatus());
     }
 
     // ============================================================
@@ -349,15 +368,19 @@ public class GzJpEventServiceImpl implements IGzJpEventService {
         return vo;
     }
 
-    private GzJpEventMpVO toMpVO(GzJpEvent e) {
+    /**
+     * 场 → mp VO。走到这里的场必然可浏览（查询条件 / {@link #selectMpDetail} 已守），
+     * 状态给<b>生效状态</b>：{@code open} = 还能下单，{@code closed} = 已结束只可浏览。
+     * draft 永远走不到这里（可见性闸已挡），所以 mp 端拿不到 draft —— verify.sh L1 断言的就是这条。
+     */
+    private GzJpEventMpVO toMpVO(GzJpEvent e, LocalDateTime now) {
         GzJpEventMpVO vo = new GzJpEventMpVO();
         vo.setId(e.getId());
         vo.setEventNo(e.getEventNo());
         vo.setName(e.getName());
         vo.setCoverImageUrl(resolveImageUrl(e.getCoverImageId()));
         vo.setDescription(e.getDescription());
-        // 走到这里的场生效状态必然是 open（查询条件 / selectMpDetail 已守），显式回填便于回归包断言
-        vo.setStatus(GzJpEventStatus.OPEN.getCode());
+        vo.setStatus(GzJpEventStatus.effective(e.getStatus(), e.getEndTime(), now).getCode());
         vo.setStartTime(e.getStartTime());
         vo.setEndTime(e.getEndTime());
         return vo;

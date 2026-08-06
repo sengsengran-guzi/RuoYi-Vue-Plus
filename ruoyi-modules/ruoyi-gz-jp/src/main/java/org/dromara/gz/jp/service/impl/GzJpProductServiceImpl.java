@@ -47,6 +47,9 @@ import java.util.Set;
  *   <li><b>建商品不要求场已 open</b>：FLOW:F-JP-01 的正常顺序是 建场(draft) → 上架商品 → 开场，
  *       所以这里只校验「场存在」，<b>不</b>调 {@code isBookable} 卡门。可见性由
  *       {@code visibleToCustomer = 商品 on_shelf && 场生效状态 open} 在读侧表达。</li>
+ *   <li><b>mp 读侧的闸是「场可浏览」（{@code isVisible}），不是「场可下单」（{@code isBookable}）</b>：
+ *       UI:mp.event_detail 要求场已结束时商品仍可浏览、只把加购置灰，所以 closed 场照常出商品，
+ *       每行带 {@code eventBookable=false} 让前端置灰。draft 场的商品仍然一条都不下发。</li>
  *   <li><b>场信息批量回填</b>：一页商品可能跨多个场，用
  *       {@link IGzJpEventService#selectOptionMap} 一次取回，避免逐条 {@code isBookable} 的 N+1。
  *       场的「读时惰性状态判定」只有一处实现（{@code GzJpEventStatus.effective}），本类不重写。</li>
@@ -253,9 +256,11 @@ public class GzJpProductServiceImpl implements IGzJpProductService {
         if (ObjectUtil.isNull(eventId)) {
             throw new ServiceException("请选择场");
         }
-        // ── 可见性第 1 层：场必须仍可下单（读时惰性判定 end_time，判定逻辑只在场侧一处实现）
-        if (!eventService.isBookable(eventId)) {
-            log.info("[gz-jp-mp] 场不可下单，商品列表返回空页 eventId={}", eventId);
+        // ── 可见性第 1 层：场必须可浏览（open / closed 都算，draft 不算）
+        //    ★ 这里是「可浏览」不是「可下单」：UI:mp.event_detail 要求场已结束时商品仍能看，
+        //      只是加购置灰 —— 换成 isBookable 会让已结束场的商品网格整个空掉
+        if (!eventService.isVisible(eventId)) {
+            log.info("[gz-jp-mp] 场不可浏览（未开场 / 不存在），商品列表返回空页 eventId={}", eventId);
             // ★ 必须 build(List.of()) 不能 build()：无参版本不 setRows，mp 会拿到 "rows": null 直接崩
             return TableDataInfo.build(List.of());
         }
@@ -270,11 +275,14 @@ public class GzJpProductServiceImpl implements IGzJpProductService {
         List<GzJpProduct> records = page.getRecords();
 
         GzJpEventOptionVO event = eventService.selectOptionMap(List.of(eventId)).get(eventId);
+        // 整页同属一个场 → 「能不能加购」只判一次，不做逐行 isBookable 的 N+1
+        boolean eventBookable = eventService.isBookable(eventId);
         // 同一批里重复引用的图片只换一次签名（一番赏 A/B/C 赏共用同一张盒图是常态）
         Map<Long, String> urlCache = new HashMap<>();
 
         Page<GzJpProductMpVO> voPage = new Page<>(page.getCurrent(), page.getSize(), page.getTotal());
-        voPage.setRecords(records.stream().map(p -> toMpVO(p, event, urlCache, false)).toList());
+        voPage.setRecords(records.stream()
+            .map(p -> toMpVO(p, event, eventBookable, urlCache, false)).toList());
         return TableDataInfo.build(voPage);
     }
 
@@ -284,17 +292,17 @@ public class GzJpProductServiceImpl implements IGzJpProductService {
             return null;
         }
         GzJpProduct p = baseMapper.selectById(id);
-        // 可见性两层同口径：商品 on_shelf + 场仍可下单（任一不满足都当作「不存在」，不泄漏下架商品信息）
+        // 可见性两层同口径：商品 on_shelf + 场可浏览（任一不满足都当作「不存在」，不泄漏下架商品信息）
         if (p == null || GzJpProductStatus.of(p.getStatus()) != GzJpProductStatus.ON_SHELF) {
             return null;
         }
-        if (!eventService.isBookable(p.getEventId())) {
-            log.info("[gz-jp-mp] 商品所属场不可下单，详情不下发 productId={} eventId={}", id, p.getEventId());
+        if (!eventService.isVisible(p.getEventId())) {
+            log.info("[gz-jp-mp] 商品所属场不可浏览，详情不下发 productId={} eventId={}", id, p.getEventId());
             return null;
         }
         GzJpEventOptionVO event = eventService.selectOptionMap(List.of(p.getEventId())).get(p.getEventId());
         // 详情页要换主图 + 图集，主图常同时出现在图集里 —— 用同一个 cache 去重
-        return toMpVO(p, event, new HashMap<>(), true);
+        return toMpVO(p, event, eventService.isBookable(p.getEventId()), new HashMap<>(), true);
     }
 
     // ============================================================
@@ -439,14 +447,15 @@ public class GzJpProductServiceImpl implements IGzJpProductService {
     /**
      * 商品实体 → mp VO（GZ-JP-103）。
      *
-     * @param p          商品实体（调用方已确认可见性两层都过）
-     * @param event      所属场轻量信息（可为 null —— 场被删时不让整页挂掉，场字段留空即可）
-     * @param urlCache   本次请求内的 fileId → URL 缓存（同图只换一次签名）
-     * @param withGallery 是否解析图集：<b>详情 true / 列表 false</b>。
-     *                    列表卡片只用主图（UI:mp.event_detail 商品卡 = 主图+名+价+到货），
-     *                    一页 20 条 × 最多 9 张图集 = 180 次预签名查询，纯浪费
+     * @param p             商品实体（调用方已确认可见性两层都过）
+     * @param event         所属场轻量信息（可为 null —— 场被删时不让整页挂掉，场字段留空即可）
+     * @param eventBookable 所属场此刻能否下单（{@code false} = 已结束，前端置灰加购并提示「本场已结束」）
+     * @param urlCache      本次请求内的 fileId → URL 缓存（同图只换一次签名）
+     * @param withGallery   是否解析图集：<b>详情 true / 列表 false</b>。
+     *                      列表卡片只用主图（UI:mp.event_detail 商品卡 = 主图+名+价+到货），
+     *                      一页 20 条 × 最多 9 张图集 = 180 次预签名查询，纯浪费
      */
-    private GzJpProductMpVO toMpVO(GzJpProduct p, GzJpEventOptionVO event,
+    private GzJpProductMpVO toMpVO(GzJpProduct p, GzJpEventOptionVO event, boolean eventBookable,
                                    Map<Long, String> urlCache, boolean withGallery) {
         GzJpProductMpVO vo = new GzJpProductMpVO();
         vo.setId(p.getId());
@@ -462,6 +471,9 @@ public class GzJpProductServiceImpl implements IGzJpProductService {
         vo.setNoticeText(p.getNoticeText());
         // 走到这里的商品必然 on_shelf（查询条件 / selectMpDetail 已守），显式回填便于回归包断言
         vo.setStatus(GzJpProductStatus.ON_SHELF.getCode());
+        // ★ 与 status 是两码事：status 说商品自己在不在架上（恒 on_shelf），
+        //   eventBookable 说所属场此刻还收不收单（已结束场里的 on_shelf 商品 = true/false 的差别）
+        vo.setEventBookable(eventBookable);
         if (event != null) {
             vo.setEventNo(event.getEventNo());
             vo.setEventName(event.getName());

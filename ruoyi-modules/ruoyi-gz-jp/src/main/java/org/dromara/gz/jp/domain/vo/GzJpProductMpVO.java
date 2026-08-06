@@ -91,4 +91,19 @@ public class GzJpProductMpVO implements Serializable {
      * 与 {@link GzJpEventMpVO#getStatus()} 同一手法。</p>
      */
     private String status;
+
+    /**
+     * ★ 所属场此刻<b>能不能下单</b>（UI:mp.event_detail / UI:mp.product_detail.cta 的置灰依据）。
+     *
+     * <p>{@code true} = 场进行中，加购 / 下单可点；{@code false} = 场已结束（店员关场或 end_time 已过），
+     * 商品仍可浏览但加购入口必须置灰并提示「本场已结束」。</p>
+     *
+     * <p><b>★ 与 {@link #status} 是两码事，别混</b>：{@code status} 说的是<b>商品自己</b>在不在架上
+     * （mp 侧恒为 on_shelf，下架的根本查不到）；本字段说的是<b>所属场</b>还收不收单。
+     * 已结束场里的 on_shelf 商品 = {@code status="on_shelf"} + {@code eventBookable=false}。</p>
+     *
+     * <p>前端别自己拿 {@code endTime} 和本地时间比来判 —— 判定口径（含店员手动关场）收口在后端，
+     * 客户端时钟不可信。</p>
+     */
+    private Boolean eventBookable;
 }

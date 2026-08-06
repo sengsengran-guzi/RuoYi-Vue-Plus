@@ -23,8 +23,10 @@ import org.springframework.web.bind.annotation.RestController;
  * <p><b>匿名可读</b>（{@link SaIgnore}）：浏览场列表不需要登录态，与资讯一致；
  * 加购 / 下单（GZ-JP-201 / 103）才要求登录。</p>
  *
- * <p><b>可见性（AC3）</b>：只返回<b>生效状态 = open</b> 的场 —— 未开场（draft）、店员已关场（closed）、
- * 以及 end_time 已过（读时惰性判定为结束）三种情况一律查不到。</p>
+ * <p><b>可见性</b>：返回<b>开过的场</b> —— 进行中（open）与已结束（关场 / end_time 已过）都下发，
+ * 每行的 {@code status} 给生效状态；<b>未开场（draft）一律查不到</b>。
+ * UI:mp.home 要用已结束的场填「已结束」分组，UI:mp.event_detail 要它显示「本场已结束」并置灰加购，
+ * 所以已结束 ≠ 不存在。<b>能不能下单看 {@code status == "open"}</b>，别拿「查得到」当放行条件。</p>
  *
  * @author kevin-coder (sensenran-guzi · GZ-JP-101)
  */
@@ -39,7 +41,7 @@ public class GzJpEventMpController {
     private final IGzJpEventService eventService;
 
     /**
-     * 可下单场列表（分页）。
+     * 可浏览场列表（分页）—— 进行中 + 已结束，按「未结束在前、组内新场在前」排。
      *
      * <pre>
      * GET /app/gz/jp/event/list?pageNum=1&amp;pageSize=10
@@ -57,7 +59,7 @@ public class GzJpEventMpController {
      * </pre>
      *
      * @param pageQuery 分页（pageNum / pageSize，ruoyi 自动绑定）
-     * @return 场列表（无可下单场时 rows 为空数组，不是 fail）
+     * @return 场列表（无可浏览场时 rows 为空数组，不是 fail）
      */
     @GetMapping("/list")
     public TableDataInfo<GzJpEventMpVO> list(PageQuery pageQuery) {
@@ -65,16 +67,17 @@ public class GzJpEventMpController {
     }
 
     /**
-     * 场详情（进场页头）。
+     * 场详情（进场页头）—— 已结束的场同样返回 200，{@code status=closed} 供前端显示「本场已结束」。
      *
      * @param id 场主键
-     * @return R&lt;detail&gt;；场不存在 / 未开场 / 已结束 → R.fail（mp 按 code != 200 走「该场已结束」）
+     * @return R&lt;detail&gt;；场不存在 / 未开场（draft）→ R.fail（mp 按 code != 200 走「该场不存在」）
      */
     @GetMapping("/{id}")
     public R<GzJpEventMpVO> detail(@NotNull @PathVariable Long id) {
         GzJpEventMpVO vo = eventService.selectMpDetail(id);
         if (vo == null) {
-            return R.fail("该场不存在或已结束");
+            // 已结束的场走 R.ok（status=closed），只有「不存在 / 未开场」才 fail
+            return R.fail("该场不存在");
         }
         return R.ok(vo);
     }

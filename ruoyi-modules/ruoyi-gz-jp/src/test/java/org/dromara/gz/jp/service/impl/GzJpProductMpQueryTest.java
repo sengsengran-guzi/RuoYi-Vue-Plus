@@ -54,9 +54,12 @@ import static org.mockito.Mockito.when;
  *
  * <p>覆盖：</p>
  * <ul>
- *   <li><b>★ 可见性两层，缺一即错</b>：商品 on_shelf <b>且</b> 场 isBookable。
- *       只判其中一层就会把「已下架商品」或「未开场 / 已结束场里的 on_shelf 商品」漏给客人</li>
- *   <li>场不可下单时<b>不查商品表</b>直接返空页（省一次无谓查询，且 total=0 不误导上拉加载）</li>
+ *   <li><b>★ 可见性两层，缺一即错</b>：商品 on_shelf <b>且</b> 场 {@code isVisible}。
+ *       只判其中一层就会把「已下架商品」或「未开场的场里的 on_shelf 商品」漏给客人</li>
+ *   <li><b>★ 闸是「可浏览」不是「可下单」</b>：已结束的场照常出商品（UI:mp.event_detail
+ *       「场已结束时商品仍可浏览，加购入口置灰」），靠 {@code eventBookable=false} 让前端置灰；
+ *       用 isBookable 卡门会让已结束场的商品网格整个空掉</li>
+ *   <li>场不可浏览（draft）时<b>不查商品表</b>直接返空页（省一次无谓查询，且 total=0 不误导上拉加载）</li>
  *   <li>图片下发<b>可渲染 URL</b> 而非 file id；null / 解析失败 → 占位图（绝不给 null 让 mp 裂图）</li>
  *   <li>同一张图在一次请求内只换一次签名（列表跨行复用 + 详情主图落在图集里）</li>
  *   <li>列表<b>不下发图集</b>（省 N×9 次预签名），详情才展开</li>
@@ -98,7 +101,8 @@ class GzJpProductMpQueryTest {
     @BeforeEach
     void setUp() {
         service = new GzJpProductServiceImpl(baseMapper, eventService, fileService);
-        // 默认：场进行中且可下单
+        // 默认：场进行中 —— 可浏览（读侧闸）且可下单（加购闸）
+        when(eventService.isVisible(EVENT_ID)).thenReturn(true);
         when(eventService.isBookable(EVENT_ID)).thenReturn(true);
         GzJpEventOptionVO opt = new GzJpEventOptionVO();
         opt.setId(EVENT_ID);
@@ -172,16 +176,33 @@ class GzJpProductMpQueryTest {
     }
 
     @Test
-    @DisplayName("★ 列表: 场不可下单（draft/已关场/已过期）→ 空页，且根本不查商品表")
-    void listReturnsEmptyWhenEventNotBookable() {
-        when(eventService.isBookable(EVENT_ID)).thenReturn(false);
+    @DisplayName("★ 列表: 场不可浏览（draft / 已删）→ 空页，且根本不查商品表")
+    void listReturnsEmptyWhenEventNotVisible() {
+        when(eventService.isVisible(EVENT_ID)).thenReturn(false);
 
         TableDataInfo<GzJpProductMpVO> result = service.selectMpPage(EVENT_ID, new PageQuery(10, 1));
 
         assertNotNull(result.getRows(), "★ 空页也必须给 [] 不能给 null（TableDataInfo.build() 无参版本不 setRows，mp 会崩）");
-        assertTrue(result.getRows().isEmpty(), "未开场 / 已结束的场里的 on_shelf 商品绝不能漏给客人");
+        assertTrue(result.getRows().isEmpty(), "未开场的场里的 on_shelf 商品绝不能漏给客人");
         assertEquals(0L, result.getTotal());
         verify(baseMapper, never()).selectPage(any(), any());
+    }
+
+    @Test
+    @DisplayName("★★ 列表: 场已结束 → 商品照常下发，但每行 eventBookable=false（加购置灰的依据）")
+    void listStillReturnsProductsWhenEventClosed() {
+        when(eventService.isVisible(EVENT_ID)).thenReturn(true);
+        when(eventService.isBookable(EVENT_ID)).thenReturn(false);
+        stubPage(entity(GzJpProductStatus.ON_SHELF.getCode()));
+
+        TableDataInfo<GzJpProductMpVO> result = service.selectMpPage(EVENT_ID, new PageQuery(10, 1));
+
+        assertEquals(1, result.getRows().size(),
+            "★ UI:mp.event_detail「场已结束时商品仍可浏览」—— 用 isBookable 卡门这里会空掉");
+        GzJpProductMpVO vo = result.getRows().get(0);
+        assertEquals(Boolean.FALSE, vo.getEventBookable(), "已结束场的商品必须标不可加购");
+        assertEquals(GzJpProductStatus.ON_SHELF.getCode(), vo.getStatus(),
+            "★ 商品自身状态与场能否下单是两码事：商品仍在架上");
     }
 
     @Test
@@ -236,6 +257,7 @@ class GzJpProductMpQueryTest {
         assertEquals(EVENT_ID, vo.getEventId());
         assertEquals("JPP-20260807-000001", vo.getProductNo());
         assertEquals(GzJpProductStatus.ON_SHELF.getCode(), vo.getStatus(), "mp 下发的商品状态恒为 on_shelf");
+        assertEquals(Boolean.TRUE, vo.getEventBookable(), "场进行中 → 加购可点");
     }
 
     @Test
@@ -311,6 +333,7 @@ class GzJpProductMpQueryTest {
         assertEquals(MAIN_IMAGE_URL, vo.getMainImageUrl());
         assertEquals(List.of("https://oss.example.com/jp/902.png", "https://oss.example.com/jp/903.png"),
             vo.getGalleryImageUrls(), "详情必须把图集展开成可渲染 URL 数组");
+        assertEquals(Boolean.TRUE, vo.getEventBookable(), "场进行中 → CTA 可点");
     }
 
     @Test
@@ -318,18 +341,34 @@ class GzJpProductMpQueryTest {
     void detailHiddenWhenProductOffShelf() {
         when(baseMapper.selectById(PRODUCT_ID)).thenReturn(entity(GzJpProductStatus.OFF_SHELF.getCode()));
 
-        assertNull(service.selectMpDetail(PRODUCT_ID));
+        assertNull(service.selectMpDetail(PRODUCT_ID), "下架商品不下发 —— 场开着也不行");
+        verify(eventService, never()).isVisible(anyLong());
         verify(eventService, never()).isBookable(anyLong());
     }
 
     @Test
-    @DisplayName("★★ 详情: 商品 on_shelf 但场未开 / 已结束 → 不下发（可见性第 1 层，只判商品 status 就会漏）")
-    void detailHiddenWhenEventNotBookable() {
+    @DisplayName("★★ 详情: 商品 on_shelf 但场未开（draft）→ 不下发（可见性第 1 层，只判商品 status 就会漏）")
+    void detailHiddenWhenEventNotVisible() {
         when(baseMapper.selectById(PRODUCT_ID)).thenReturn(entity(GzJpProductStatus.ON_SHELF.getCode()));
-        when(eventService.isBookable(EVENT_ID)).thenReturn(false);
+        when(eventService.isVisible(EVENT_ID)).thenReturn(false);
 
         assertNull(service.selectMpDetail(PRODUCT_ID),
             "FLOW:F-JP-01.step2「商品 on_shelf；未开场时仍不可见」");
+    }
+
+    @Test
+    @DisplayName("★★ 详情: 场已结束 → 商品照常下发，eventBookable=false（UI:mp.product_detail.cta 置灰）")
+    void detailBrowsableWhenEventClosed() {
+        when(baseMapper.selectById(PRODUCT_ID)).thenReturn(entity(GzJpProductStatus.ON_SHELF.getCode()));
+        when(eventService.isVisible(EVENT_ID)).thenReturn(true);
+        when(eventService.isBookable(EVENT_ID)).thenReturn(false);
+
+        GzJpProductMpVO vo = service.selectMpDetail(PRODUCT_ID);
+
+        assertNotNull(vo, "★ 场已结束时商品详情仍要能打开（价格 / 注意事项要看得到），只是不能加购");
+        assertEquals(Boolean.FALSE, vo.getEventBookable());
+        assertEquals(GzJpProductStatus.ON_SHELF.getCode(), vo.getStatus());
+        assertEquals("日本线下采购，包装可能有轻微磨损，介意慎拍", vo.getNoticeText());
     }
 
     @Test
@@ -341,7 +380,7 @@ class GzJpProductMpQueryTest {
         assertNull(service.selectMpDetail(null));
         // 只有 PRODUCT_ID 那一次查库，null id 直接短路
         verify(baseMapper, times(1)).selectById(any());
-        verify(eventService, never()).isBookable(anyLong());
+        verify(eventService, never()).isVisible(anyLong());
     }
 
     @Test
@@ -390,7 +429,9 @@ class GzJpProductMpQueryTest {
             .map(Field::getName).collect(java.util.stream.Collectors.toSet());
 
         for (String required : List.of("noticeText", "priceCent", "deliveryDateText",
-            "id", "productNo", "name", "mainImageUrl", "galleryImageUrls", "eventId", "eventNo")) {
+            "id", "productNo", "name", "mainImageUrl", "galleryImageUrls", "eventId", "eventNo",
+            // GZ-JP-202 的加购置灰依据 —— 场已结束时商品仍下发，靠这个字段区分
+            "eventBookable")) {
             assertTrue(names.contains(required), "accept / 下游 mp 依赖字段缺失：" + required + "，实际：" + names);
         }
         for (String leaked : List.of("remark", "version", "sortNo", "visibleToCustomer",

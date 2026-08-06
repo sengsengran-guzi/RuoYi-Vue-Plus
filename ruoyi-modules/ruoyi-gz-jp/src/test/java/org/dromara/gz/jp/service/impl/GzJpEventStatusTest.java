@@ -43,9 +43,12 @@ import static org.mockito.Mockito.when;
  * <p>覆盖：</p>
  * <ul>
  *   <li>{@link GzJpEventStatus#effective} 读时惰性判定：end_time 到点即 closed，不依赖 cron</li>
- *   <li>关场（close）后 mp 详情 / isBookable 立刻不可见</li>
- *   <li>mp 列表查询条件确实带 {@code status='open' AND end_time > now}（关场 / 到点的场进不来）</li>
- *   <li>draft 场 mp 不可见（AC3：场未 open 时 mp 侧查不到）</li>
+ *   <li><b>★ 两条闸粗细不同</b>：关场 / 到点后 {@code isBookable=false}（不可下单）
+ *       但 {@code isVisible=true}（仍可浏览，UI:mp.home 要拿它填「已结束」组）</li>
+ *   <li>mp 列表查询条件是 {@code status IN (open, closed)} —— 白名单，draft 永远进不来</li>
+ *   <li><b>★★ draft 场 mp 不可见，含「窗口已过的 draft」</b>（FLOW:F-JP-01.step1）：
+ *       {@code effective} 会把它惰性算成 closed，可见性判定<b>绝不能</b>照抄 effective，
+ *       否则从未开过的场会突然出现在客人的已结束列表里</li>
  *   <li>开场 / 关场的前置校验与幂等提示</li>
  * </ul>
  *
@@ -131,13 +134,37 @@ class GzJpEventStatusTest {
         assertFalse(GzJpEventStatus.isBookableForMp("open", now.minusHours(1), now));
     }
 
+    @Test
+    @DisplayName("★ isVisibleForMp: open / closed 可浏览，draft 不可浏览（比可下单宽一档）")
+    void visibleForMpCoversOpenAndClosedOnly() {
+        assertTrue(GzJpEventStatus.isVisibleForMp("open"), "进行中的场当然能看");
+        assertTrue(GzJpEventStatus.isVisibleForMp("closed"),
+            "★ 已结束的场必须能看：UI:mp.home 的「已结束」分组 + UI:mp.event_detail「商品仍可浏览，加购置灰」");
+        assertFalse(GzJpEventStatus.isVisibleForMp("draft"), "未开场的场客人不可见（FLOW:F-JP-01.step1）");
+        assertFalse(GzJpEventStatus.isVisibleForMp(null), "null / 脏值回落 draft = 最保守的不可见");
+        assertFalse(GzJpEventStatus.isVisibleForMp("whatever"));
+    }
+
+    @Test
+    @DisplayName("★★ isVisibleForMp 不吃 end_time：窗口已过的 draft 仍不可见（照抄 effective 会漏场）")
+    void visibleForMpNeverLeaksExpiredDraft() {
+        LocalDateTime now = LocalDateTime.of(2026, 8, 7, 12, 0);
+        LocalDateTime past = now.minusDays(1);
+
+        // effective 会把「窗口已过的 draft」惰性算成 closed —— 这是既有且正确的行为
+        assertEquals(GzJpEventStatus.CLOSED, GzJpEventStatus.effective("draft", past, now));
+        // 但可见性只问「这个场公开过没有」：从未开过的场，窗口过了也绝不能出现在客人面前
+        assertFalse(GzJpEventStatus.isVisibleForMp("draft"),
+            "★ 若把 isVisibleForMp 写成 effective(...) != DRAFT，店员建完就忘的 draft 场会在到点后漏进 mp");
+    }
+
     // ============================================================
-    //  accept STATE：关场后场不再出现在 mp 可下单列表
+    //  accept STATE：关场后场不可下单（但仍可浏览）
     // ============================================================
 
     @Test
-    @DisplayName("accept: 开场 → mp 可见；关场后 → mp 详情不可见 + isBookable=false")
-    void closedEventDisappearsFromMp() {
+    @DisplayName("★ accept: 开场 → 可见可下单；关场后 → 仍可浏览（status=closed）但 isBookable=false")
+    void closedEventStaysBrowsableButNotBookable() {
         LocalDateTime end = LocalDateTime.now().plusDays(3);
 
         // 1) 开场中：mp 详情可见，isBookable=true（封面文件已删 → 回落占位图，不阻断）
@@ -146,6 +173,7 @@ class GzJpEventStatusTest {
         GzJpEventMpVO opened = service.selectMpDetail(EVENT_ID);
         assertNotNull(opened, "开场中的场 mp 必须能查到");
         assertEquals("EVT-20260807-000001", opened.getEventNo());
+        assertEquals(GzJpEventStatus.OPEN.getCode(), opened.getStatus());
         assertEquals(PLACEHOLDER_IMAGE_URL, opened.getCoverImageUrl(), "封面解析失败必须回落占位图");
         assertTrue(service.isBookable(EVENT_ID));
 
@@ -159,15 +187,19 @@ class GzJpEventStatusTest {
         verify(baseMapper, times(1)).updateById(captor.capture());
         assertEquals("closed", captor.getValue().getStatus(), "关场必须把 status 写成 closed");
 
-        // 3) 关场后：mp 详情查不到，isBookable=false
+        // 3) 关场后：不可下单，但详情仍下发且 status=closed（UI:mp.event_detail 靠它显示「本场已结束」+ 置灰加购）
         when(baseMapper.selectById(EVENT_ID)).thenReturn(event("closed", end));
-        assertNull(service.selectMpDetail(EVENT_ID), "关场后 mp 详情必须查不到");
         assertFalse(service.isBookable(EVENT_ID), "关场后不可下单");
+        assertTrue(service.isVisible(EVENT_ID), "关场后仍可浏览");
+        GzJpEventMpVO closed = service.selectMpDetail(EVENT_ID);
+        assertNotNull(closed, "★ 关场 ≠ 不存在：商品仍可浏览，前端要拿场名 / 封面渲染已结束页");
+        assertEquals(GzJpEventStatus.CLOSED.getCode(), closed.getStatus(),
+            "已结束的场必须自报 closed，前端据此置灰加购");
     }
 
     @Test
-    @DisplayName("accept: mp 可下单列表的 SQL 条件带 status=open + end_time > now（关场/到点场天然进不来）")
-    void mpListQueryFiltersClosedAndExpired() {
+    @DisplayName("★ accept: mp 列表 SQL 是 status IN (open, closed) 白名单 —— draft 永远进不来")
+    void mpListIncludesOpenAndClosedButNeverDraft() {
         Page<GzJpEvent> empty = new Page<>(1, 10, 0);
         empty.setRecords(List.of());
         when(baseMapper.selectPage(any(), any())).thenReturn(empty);
@@ -182,40 +214,75 @@ class GzJpEventStatusTest {
         verify(baseMapper).selectPage(any(), captor.capture());
         LambdaQueryWrapper<GzJpEvent> wrapper = captor.getValue();
         String sql = wrapper.getSqlSegment();
-        assertTrue(sql.contains("status"), "必须按 status 过滤，实际：" + sql);
-        assertTrue(sql.contains("end_time"), "必须按 end_time 做读时惰性过滤，实际：" + sql);
-        assertTrue(sql.contains(">"), "end_time 必须是「大于当前时间」，实际：" + sql);
-        assertTrue(wrapper.getParamNameValuePairs().containsValue(GzJpEventStatus.OPEN.getCode()),
-            "status 参数必须绑定 open，实际：" + wrapper.getParamNameValuePairs());
+        String where = sql.contains("ORDER BY") ? sql.substring(0, sql.indexOf("ORDER BY")) : sql;
+
+        assertTrue(where.contains("status"), "必须按 status 过滤，实际：" + sql);
+        assertTrue(where.contains("IN"), "必须是 IN 白名单（不是 != draft 的黑名单），实际：" + sql);
+        assertTrue(wrapper.getParamNameValuePairs().containsValue(GzJpEventStatus.OPEN.getCode())
+                && wrapper.getParamNameValuePairs().containsValue(GzJpEventStatus.CLOSED.getCode()),
+            "open + closed 都要在白名单里，实际参数：" + wrapper.getParamNameValuePairs());
+        assertFalse(wrapper.getParamNameValuePairs().containsValue(GzJpEventStatus.DRAFT.getCode()),
+            "★ draft 绝不能出现在 mp 查询条件里，实际参数：" + wrapper.getParamNameValuePairs());
+        assertFalse(where.contains("end_time"),
+            "★ end_time 不再当 WHERE 闸（到点 = 已结束，不是不存在），只允许出现在 ORDER BY，实际：" + sql);
+        assertTrue(sql.contains("ORDER BY") && sql.contains("end_time"),
+            "未结束的场要靠 end_time 倒序排在已结束之前（首页「进行中置顶」在分页下也成立），实际：" + sql);
     }
 
     @Test
-    @DisplayName("契约: mp VO 只下发 open —— 回归包断言「不下发 draft」的锚点")
-    void mpVoAlwaysReportsOpen() {
-        Page<GzJpEvent> page = new Page<>(1, 10, 1);
-        page.setRecords(List.of(event("open", LocalDateTime.now().plusDays(1))));
+    @DisplayName("★ 契约: mp VO 下发生效状态 —— 进行中给 open、已结束给 closed，永不给 draft")
+    void mpVoReportsEffectiveStatus() {
+        GzJpEvent running = event("open", LocalDateTime.now().plusDays(1));
+        GzJpEvent manuallyClosed = event("closed", LocalDateTime.now().plusDays(1));
+        manuallyClosed.setId(3002L);
+        // 存库仍是 open 但窗口已过 —— 读时惰性判定成 closed（不依赖 cron 刷库）
+        GzJpEvent expired = event("open", LocalDateTime.now().minusMinutes(1));
+        expired.setId(3003L);
+
+        Page<GzJpEvent> page = new Page<>(1, 10, 3);
+        page.setRecords(List.of(running, manuallyClosed, expired));
         when(baseMapper.selectPage(any(), any())).thenReturn(page);
         when(fileService.getPresignedUrl(COVER_FILE_ID)).thenThrow(new RuntimeException("file not found"));
 
         List<GzJpEventMpVO> rows = service.selectMpPage(new PageQuery(1, 10)).getRows();
-        assertEquals(1, rows.size());
+        assertEquals(3, rows.size());
         assertEquals(GzJpEventStatus.OPEN.getCode(), rows.get(0).getStatus());
+        assertEquals(GzJpEventStatus.CLOSED.getCode(), rows.get(1).getStatus(), "手动关场 → closed");
+        assertEquals(GzJpEventStatus.CLOSED.getCode(), rows.get(2).getStatus(), "到点 → 惰性判定 closed");
+        assertTrue(rows.stream().noneMatch(v -> GzJpEventStatus.DRAFT.getCode().equals(v.getStatus())),
+            "verify.sh L1「不下发 draft」的代码侧锚点");
     }
 
     @Test
-    @DisplayName("AC3: 未开场（draft）的场 mp 侧查不到")
+    @DisplayName("AC3: 未开场（draft）的场 mp 侧查不到 —— 列表 / 详情 / isVisible 全维度")
     void draftEventInvisibleToMp() {
         when(baseMapper.selectById(EVENT_ID)).thenReturn(event("draft", LocalDateTime.now().plusDays(3)));
         assertNull(service.selectMpDetail(EVENT_ID));
         assertFalse(service.isBookable(EVENT_ID));
+        assertFalse(service.isVisible(EVENT_ID), "draft 不可浏览 —— 商品接口靠这条把整场商品挡住");
     }
 
     @Test
-    @DisplayName("到 end_time 后（存库仍是 open）mp 侧同样查不到 —— 惰性判定，无需 cron")
-    void expiredOpenEventInvisibleToMp() {
-        when(baseMapper.selectById(EVENT_ID)).thenReturn(event("open", LocalDateTime.now().minusMinutes(1)));
+    @DisplayName("★★ 窗口已过的 draft 场仍然完全不可见（从未开过的场不许漏进「已结束」组）")
+    void expiredDraftEventStillInvisibleToMp() {
+        when(baseMapper.selectById(EVENT_ID)).thenReturn(event("draft", LocalDateTime.now().minusMinutes(1)));
+        assertFalse(service.isVisible(EVENT_ID),
+            "★ effective 会把它算成 closed，可见性判定必须只看存库状态，否则店员建完就忘的场会见客");
         assertNull(service.selectMpDetail(EVENT_ID));
         assertFalse(service.isBookable(EVENT_ID));
+    }
+
+    @Test
+    @DisplayName("★ 到 end_time 后（存库仍是 open）不可下单，但仍可浏览 —— 惰性判定，无需 cron")
+    void expiredOpenEventBrowsableButNotBookable() {
+        when(baseMapper.selectById(EVENT_ID)).thenReturn(event("open", LocalDateTime.now().minusMinutes(1)));
+        when(fileService.getPresignedUrl(COVER_FILE_ID)).thenThrow(new RuntimeException("file not found"));
+
+        assertFalse(service.isBookable(EVENT_ID), "到点即不可下单");
+        assertTrue(service.isVisible(EVENT_ID), "到点的场进「已结束」组，仍可浏览");
+        GzJpEventMpVO vo = service.selectMpDetail(EVENT_ID);
+        assertNotNull(vo);
+        assertEquals(GzJpEventStatus.CLOSED.getCode(), vo.getStatus(), "存库 open 但到点 → 对外报 closed");
     }
 
     // ============================================================

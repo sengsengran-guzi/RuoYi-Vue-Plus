@@ -15,7 +15,13 @@ import java.util.Map;
 /**
  * 拼团场服务（GZ-JP-101，FLOW:F-JP-01）。
  *
- * <p>admin 侧：建场 / 编辑 / 开场 / 关场 / 删除；mp 侧：只看得到「生效状态 = open」的场。</p>
+ * <p>admin 侧：建场 / 编辑 / 开场 / 关场 / 删除。</p>
+ *
+ * <p>mp 侧<b>两条粗细不同的闸</b>，不要混用：</p>
+ * <ul>
+ *   <li>{@link #isVisible}（宽）—— 能不能<b>看</b>：open / closed 都能看，draft 看不到。只读接口用它</li>
+ *   <li>{@link #isBookable}（严）—— 能不能<b>下单</b>：仅生效状态 open。加购 / 下单 / 支付用它</li>
+ * </ul>
  *
  * @author kevin-coder (sensenran-guzi · GZ-JP-101)
  */
@@ -114,30 +120,52 @@ public interface IGzJpEventService {
     // ============================================================
 
     /**
-     * mp 可下单场分页列表 —— 只返回<b>生效状态 = open</b> 的场（AC3：场未 open 时 mp 侧查不到；
-     * 关场后 / end_time 已过的场不再出现）。
+     * mp 可浏览场分页列表 —— 返回<b>开过的场（open / closed）</b>，draft 一律不下发。
+     *
+     * <p>UI:mp.home 要求首页把场分「进行中 / 即将开始 / 已结束」三组展示，所以已结束的场必须下发；
+     * 「能不能下单」由每行的 {@link GzJpEventMpVO#getStatus()}（生效状态）表达，
+     * {@code open} = 可下单，{@code closed} = 已结束只可浏览。
+     * 「即将开始」= {@code status=open 且 startTime &gt; now}，前端自行派生，不是第四种状态。</p>
      *
      * <p>返回 {@code TableDataInfo}（rows + total），与资讯 mp 列表一致；
      * 契约由 doc/jp/verify.sh L1「场列表结构完整且不下发 draft」守。</p>
      *
      * @param pageQuery 分页参数
-     * @return 分页结果（sort_no 升序 → start_time 升序）；无可下单场时 rows 为空数组
+     * @return 分页结果（sort_no 升序 → end_time 倒序：未结束的天然排在已结束之前，组内新场在前）；
+     *         无可浏览场时 rows 为空数组
      */
     TableDataInfo<GzJpEventMpVO> selectMpPage(PageQuery pageQuery);
 
     /**
-     * mp 场详情 —— 同样只对生效状态 open 的场开放。
+     * mp 场详情 —— 对开过的场（open / closed）开放，draft 不下发。
+     *
+     * <p>已结束的场返回的 VO 里 {@code status=closed}，UI:mp.event_detail 据此显示「本场已结束」
+     * 并置灰加购入口；不是返回 null 让前端拿不到场名封面。</p>
      *
      * @param id 场主键
-     * @return VO；场不存在 / 未开场 / 已结束 一律返回 null
+     * @return VO；场不存在 / 未开场（draft）返回 null
      */
     GzJpEventMpVO selectMpDetail(Long id);
 
     /**
-     * 场此刻是否可下单（下游 GZ-JP-102 商品上架校验 / GZ-JP-103 提交订单前置校验用，FLOW:F-JP-02.step3）。
+     * 场此刻<b>是否可下单</b>（加购 / 提交订单 / 支付前置校验，FLOW:F-JP-02.step3）。
+     *
+     * <p>★ 严格判定，写路径只认这个：关场 / 到 end_time 后立刻 false。
+     * 别拿它当可见性用 —— 那是 {@link #isVisible}。</p>
      *
      * @param id 场主键
      * @return true = 生效状态为 open
      */
     boolean isBookable(Long id);
+
+    /**
+     * 场此刻<b>是否可浏览</b>（mp 只读路径的可见性闸，比 {@link #isBookable} 宽）。
+     *
+     * <p>open / closed 都算可浏览，只有 draft（含从未开过、窗口已过的 draft）不可浏览。
+     * 商品只读接口用它卡门，用 {@link #isBookable} 派生「加购能不能点」。</p>
+     *
+     * @param id 场主键
+     * @return true = 存库状态是 open 或 closed
+     */
+    boolean isVisible(Long id);
 }

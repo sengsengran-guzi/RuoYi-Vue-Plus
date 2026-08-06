@@ -75,14 +75,40 @@ public enum GzJpEventStatus {
     }
 
     /**
-     * 生效状态是否「客人可见可下单」—— mp 侧唯一放行条件（AC3：场未 open 时 mp 侧查不到）。
+     * 生效状态是否「客人可下单」—— 加购 / 下单 / 支付的唯一放行条件（FLOW:F-JP-02.step3「下单前校验场仍 open」）。
+     *
+     * <p>比 {@link #isVisibleForMp} <b>严</b>：只有 open 且未到 end_time 才为 true。
+     * 关场 / 到点后立刻为 false，但场本身仍可浏览（见 {@link #isVisibleForMp}）。</p>
      *
      * @param stored  存库状态 code
      * @param endTime 闭场时间
      * @param now     判定基准时刻
-     * @return true = 客人可见可下单
+     * @return true = 客人可下单
      */
     public static boolean isBookableForMp(String stored, LocalDateTime endTime, LocalDateTime now) {
         return effective(stored, endTime, now) == OPEN;
+    }
+
+    /**
+     * 是否「客人可浏览」—— 比可下单宽：<b>开过的场（open / closed）都能看，只有 draft 看不到</b>。
+     *
+     * <p>UI:mp.home 的「进行中 / 即将开始 / 已结束」三组分组、UI:mp.event_detail 的
+     * 「场已结束时商品仍可浏览，加购置灰」、UI:mp.cart 的「失效项置灰标已失效」都靠这条。
+     * 「即将开始」不是第四种状态，而是 {@code status=open 且 start_time &gt; now} 的时间派生展示，
+     * 由前端用 {@code startTime} 自行判定，不进状态机。</p>
+     *
+     * <p><b>★ 只看存库状态，刻意不接 end_time / now</b>（这是本判定最容易写错的地方）：
+     * {@link #effective} 会把「窗口已过的 draft」惰性算成 CLOSED，若照抄
+     * {@code effective(...) != DRAFT}，一个<b>从未开过、店员建完就忘的 draft 场</b>会在 end_time
+     * 过后突然出现在客人的「已结束」列表里 —— 直接违反 FLOW:F-JP-01.step1「draft 客人不可见」。
+     * 可见性只问「这个场公开过没有」，到点与否只影响它<b>显示成</b>进行中还是已结束。</p>
+     *
+     * <p>null / 未知 code 走 {@link #of} 回落 DRAFT，即最保守的不可见。</p>
+     *
+     * @param stored 存库状态 code
+     * @return true = 客人可浏览（open 或 closed）
+     */
+    public static boolean isVisibleForMp(String stored) {
+        return of(stored) != DRAFT;
     }
 }
