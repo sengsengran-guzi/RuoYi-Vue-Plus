@@ -17,6 +17,7 @@ import org.dromara.gz.jp.domain.entity.GzJpEvent;
 import org.dromara.gz.jp.domain.enums.GzJpEventStatus;
 import org.dromara.gz.jp.domain.vo.GzJpEventAdminVO;
 import org.dromara.gz.jp.domain.vo.GzJpEventMpVO;
+import org.dromara.gz.jp.domain.vo.GzJpEventOptionVO;
 import org.dromara.gz.jp.mapper.GzJpEventMapper;
 import org.dromara.gz.jp.service.IGzJpEventService;
 import org.springframework.stereotype.Service;
@@ -25,7 +26,11 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * 拼团场服务实现（GZ-JP-101，FLOW:F-JP-01）。
@@ -228,6 +233,33 @@ public class GzJpEventServiceImpl implements IGzJpEventService {
     }
 
     // ============================================================
+    //  跨 ticket 复用（GZ-JP-102 商品管理 / 后续订单与履约）
+    // ============================================================
+
+    @Override
+    public List<GzJpEventOptionVO> selectOptions() {
+        LocalDateTime now = LocalDateTime.now();
+        List<GzJpEvent> events = baseMapper.selectList(Wrappers.<GzJpEvent>lambdaQuery()
+            .orderByAsc(GzJpEvent::getSortNo)
+            .orderByDesc(GzJpEvent::getId));
+        return events.stream().map(e -> toOptionVO(e, now)).toList();
+    }
+
+    @Override
+    public Map<Long, GzJpEventOptionVO> selectOptionMap(Collection<Long> ids) {
+        if (ObjectUtil.isEmpty(ids)) {
+            return Map.of();
+        }
+        LocalDateTime now = LocalDateTime.now();
+        List<Long> distinctIds = ids.stream().filter(ObjectUtil::isNotNull).distinct().toList();
+        if (distinctIds.isEmpty()) {
+            return Map.of();
+        }
+        return baseMapper.selectByIds(distinctIds).stream()
+            .collect(Collectors.toMap(GzJpEvent::getId, e -> toOptionVO(e, now), (a, b) -> a, LinkedHashMap::new));
+    }
+
+    // ============================================================
     //  mp（FLOW:F-JP-02.step1）
     // ============================================================
 
@@ -304,6 +336,16 @@ public class GzJpEventServiceImpl implements IGzJpEventService {
         vo.setCreateTime(e.getCreateTime());
         vo.setUpdateTime(e.getUpdateTime());
         vo.setRemark(e.getRemark());
+        return vo;
+    }
+
+    /** 场 → 轻量选项（状态用生效状态，与 {@link #isBookable} 同一份 effective 逻辑）。 */
+    private GzJpEventOptionVO toOptionVO(GzJpEvent e, LocalDateTime now) {
+        GzJpEventOptionVO vo = new GzJpEventOptionVO();
+        vo.setId(e.getId());
+        vo.setEventNo(e.getEventNo());
+        vo.setName(e.getName());
+        vo.setStatus(GzJpEventStatus.effective(e.getStatus(), e.getEndTime(), now).getCode());
         return vo;
     }
 

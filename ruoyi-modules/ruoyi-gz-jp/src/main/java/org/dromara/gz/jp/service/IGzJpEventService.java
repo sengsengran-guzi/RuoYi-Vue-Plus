@@ -6,8 +6,11 @@ import org.dromara.gz.jp.domain.bo.GzJpEventBo;
 import org.dromara.gz.jp.domain.bo.GzJpEventQueryBo;
 import org.dromara.gz.jp.domain.vo.GzJpEventAdminVO;
 import org.dromara.gz.jp.domain.vo.GzJpEventMpVO;
+import org.dromara.gz.jp.domain.vo.GzJpEventOptionVO;
 
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 拼团场服务（GZ-JP-101，FLOW:F-JP-01）。
@@ -81,6 +84,30 @@ public interface IGzJpEventService {
      * @return 是否成功
      */
     boolean close(Long id);
+
+    // ============================================================
+    //  跨 ticket 复用（GZ-JP-102 商品管理 / 后续订单与履约）
+    // ============================================================
+
+    /**
+     * 全部场的轻量选项（下拉用）—— 按 sort_no 升序、id 降序（新场靠前）。
+     *
+     * <p>状态给的是<b>生效状态</b>（读时惰性判定），调用方无需自己比 end_time。</p>
+     *
+     * @return 选项列表（无场时空列表）
+     */
+    List<GzJpEventOptionVO> selectOptions();
+
+    /**
+     * 按 id 批量取场轻量信息 —— 给商品列表回填「所属场名称 / 场当前状态」。
+     *
+     * <p>★ 批量而非逐条 {@code isBookable(id)}：一页商品可能跨多个场，逐条会 N+1。
+     * 状态判定仍收口在 {@code GzJpEventStatus.effective}，与 {@link #isBookable} 同一份逻辑。</p>
+     *
+     * @param ids 场主键集合（null / 空 → 空 Map）
+     * @return id → 轻量信息；已软删 / 不存在的 id 不出现在结果里
+     */
+    Map<Long, GzJpEventOptionVO> selectOptionMap(Collection<Long> ids);
 
     // ============================================================
     //  mp（FLOW:F-JP-02.step1）

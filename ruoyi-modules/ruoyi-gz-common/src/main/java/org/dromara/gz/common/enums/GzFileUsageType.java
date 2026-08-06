@@ -34,7 +34,9 @@ public enum GzFileUsageType {
     /** 回收预约店员核对存证照（V1.2，GZ-RECYCLE-003；店员到店核对实物拍照，doc/11 §12.2） */
     RECYCLE_VERIFY_IMAGE("recycle_verify_image", "回收核对照"),
     /** 拼团场封面（GZ-JP-101，FIELD:gz_jp_event.cover_image_id） */
-    JP_EVENT_IMAGE("jp_event_image", "拼团场封面");
+    JP_EVENT_IMAGE("jp_event_image", "拼团场封面"),
+    /** 拼团商品主图 + 图集（GZ-JP-102，FIELD:gz_jp_product.main_image_id / gallery_image_ids；一期用图集承载详情） */
+    JP_PRODUCT_IMAGE("jp_product_image", "拼团商品图");
 
     /** 落库枚举值 */
     private final String code;
