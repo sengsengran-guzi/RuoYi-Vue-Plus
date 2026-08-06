@@ -32,7 +32,9 @@ public enum GzFileUsageType {
     /** 回收预约用户提交实物照（V1.2，GZ-RECYCLE-002，必填；门店据实物预估 + 核对前先看实物，doc/11 §12.2） */
     RECYCLE_SUBMIT_IMAGE("recycle_submit_image", "回收实物照"),
     /** 回收预约店员核对存证照（V1.2，GZ-RECYCLE-003；店员到店核对实物拍照，doc/11 §12.2） */
-    RECYCLE_VERIFY_IMAGE("recycle_verify_image", "回收核对照");
+    RECYCLE_VERIFY_IMAGE("recycle_verify_image", "回收核对照"),
+    /** 拼团场封面（GZ-JP-101，FIELD:gz_jp_event.cover_image_id） */
+    JP_EVENT_IMAGE("jp_event_image", "拼团场封面");
 
     /** 落库枚举值 */
     private final String code;

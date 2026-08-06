@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <parent>
+        <groupId>org.dromara</groupId>
+        <artifactId>ruoyi-modules</artifactId>
+        <version>${revision}</version>
+    </parent>
+    <modelVersion>4.0.0</modelVersion>
+
+    <artifactId>ruoyi-gz-jp</artifactId>
+
+    <description>
+        谷子宇宙拼团（日本代购）业务模块 GZ-JP：场 / 商品 / 购物车 / 订单 / 履约看板。
+        包名 org.dromara.gz.jp；admin 前缀 /system/gz/jp/**，mp 前缀 /app/gz/jp/**。
+        GZ-JP-101 建模块骨架 + 场（gz_jp_event）；下游 102+ 在本模块内继续加表与端点。
+    </description>
+
+    <dependencies>
+        <!-- 谷子宇宙业务通用层（微信登录 / 支付通道 / 文件对象 / 回收站注册表），
+             并传递引入全部 ruoyi-common-*（core / mybatis / tenant / web / log / security / idempotent 等）。 -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-gz-common</artifactId>
+            <version>${revision}</version>
+        </dependency>
+
+        <!-- 单元测试（Mockito + JUnit 5），与其余 gz 业务模块同款 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+</project>

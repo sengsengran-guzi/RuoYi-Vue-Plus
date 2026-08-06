@@ -24,6 +24,7 @@
         <module>ruoyi-gz-gacha</module>
         <module>ruoyi-gz-coupon</module>
         <module>ruoyi-gz-recycle</module>
+        <module>ruoyi-gz-jp</module>
     </modules>
 
     <artifactId>ruoyi-modules</artifactId>
