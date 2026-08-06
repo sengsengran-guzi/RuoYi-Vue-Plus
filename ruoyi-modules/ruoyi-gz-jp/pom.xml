@@ -26,6 +26,16 @@
             <version>${revision}</version>
         </dependency>
 
+        <!-- 会员域：下单要校验收货地址归属 + 落地址快照（IGzUserAddressService / gz_user_address）。
+             地址簿是既有能力（GZ-USER-003），拼团域不重建一套 —— 客人在两个业务里用同一本地址簿。
+             与 ruoyi-gz-ord 引它的理由完全相同（GzOrdOrderServiceImpl.submit 同款用法）。
+             依赖方向 gz-jp → gz-user → gz-common 单向，无环。 -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-gz-user</artifactId>
+            <version>${revision}</version>
+        </dependency>
+
         <!-- 单元测试（Mockito + JUnit 5），与其余 gz 业务模块同款 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
