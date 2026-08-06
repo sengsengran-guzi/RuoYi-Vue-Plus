@@ -12,6 +12,8 @@ import org.dromara.gz.common.domain.vo.GzUserVO;
 import org.dromara.gz.common.mapper.GzUserMapper;
 import org.dromara.gz.common.service.IGzFileService;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
+import org.dromara.gz.common.wechat.WxMiniappProperties;
+import org.dromara.gz.common.wechat.WxMiniappProperties.MiniappApp;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -53,9 +55,13 @@ class GzUserServiceImplTest {
 
     private GzUserServiceImpl gzUserService;
 
+    /** 现小程序（谷子宇宙）—— 单值配置形态解析出来的那一个，register-source 继承全局默认 mp_wechat。 */
+    private MiniappApp app;
+
     @BeforeEach
     void setUp() {
         gzUserService = new GzUserServiceImpl(baseMapper, gzFileService);
+        app = new WxMiniappProperties().resolveDefaultApp();
     }
 
     @Test
@@ -73,7 +79,7 @@ class GzUserServiceImplTest {
             return 1;
         });
 
-        GzUser result = gzUserService.upsertByOpenid(session, "新用户昵称", "https://cdn.wx/avatar.jpg");
+        GzUser result = gzUserService.upsertByOpenid(session, "新用户昵称", "https://cdn.wx/avatar.jpg", app);
 
         assertNotNull(result);
         assertEquals(101L, result.getId());
@@ -82,6 +88,7 @@ class GzUserServiceImplTest {
         assertEquals("新用户昵称", result.getNickname());
         assertEquals("https://cdn.wx/avatar.jpg", result.getAvatarUrl());
         assertEquals(0, result.getGender());
+        assertEquals(app.getAppid(), result.getAppId(), "GZ-SYS-023：新用户必须落所属小程序 appid");
         assertEquals("mp_wechat", result.getRegisterSource());
         assertEquals("authorized", result.getStatus());
         assertEquals(0, result.getIsDisabled());
@@ -108,7 +115,7 @@ class GzUserServiceImplTest {
             return 1;
         });
 
-        GzUser result = gzUserService.upsertByOpenid(session, "", "");
+        GzUser result = gzUserService.upsertByOpenid(session, "", "", app);
 
         assertEquals("微信用户", result.getNickname());
     }
@@ -141,7 +148,7 @@ class GzUserServiceImplTest {
         when(baseMapper.selectOne(any())).thenReturn(existing);
         when(baseMapper.updateById(any(GzUser.class))).thenReturn(1);
 
-        GzUser result = gzUserService.upsertByOpenid(session, "新昵称", "https://new.wx/avatar.jpg");
+        GzUser result = gzUserService.upsertByOpenid(session, "新昵称", "https://new.wx/avatar.jpg", app);
 
         assertEquals(202L, result.getId());
         assertEquals("新昵称", result.getNickname());
@@ -173,7 +180,7 @@ class GzUserServiceImplTest {
         when(baseMapper.selectOne(any())).thenReturn(existing);
         when(baseMapper.updateById(any(GzUser.class))).thenReturn(1);
 
-        GzUser result = gzUserService.upsertByOpenid(session, "x", "y");
+        GzUser result = gzUserService.upsertByOpenid(session, "x", "y", app);
 
         assertEquals("union-original", result.getUnionid(), "已有 unionid 不应被新值覆盖");
     }
@@ -186,7 +193,7 @@ class GzUserServiceImplTest {
             .sessionKey("sk")
             .build();
         assertThrows(IllegalArgumentException.class,
-            () -> gzUserService.upsertByOpenid(session, "n", "a"));
+            () -> gzUserService.upsertByOpenid(session, "n", "a", app));
     }
 
     @Test

@@ -2,14 +2,11 @@ package org.dromara.gz.common.service.impl;
 
 import cn.dev33.satoken.stp.StpUtil;
 import cn.dev33.satoken.stp.parameter.SaLoginParameter;
-import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.StringUtils;
 import org.dromara.common.core.domain.model.LoginUser;
 import org.dromara.common.core.enums.UserType;
 import org.dromara.common.core.exception.ServiceException;
-import org.dromara.common.core.utils.ServletUtils;
 import org.dromara.common.satoken.utils.LoginHelper;
 import org.dromara.gz.common.domain.dto.MpStaffPermission;
 import org.dromara.gz.common.domain.dto.WxLoginRequest;
@@ -19,9 +16,11 @@ import org.dromara.gz.common.service.IGzUserService;
 import org.dromara.gz.common.service.IMpStaffPermissionService;
 import org.dromara.gz.common.service.IWxLoginService;
 import org.dromara.gz.common.wechat.SessionKeyStore;
+import org.dromara.gz.common.wechat.WxAppResolver;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
 import org.dromara.gz.common.wechat.WxLoginAdapter;
 import org.dromara.gz.common.wechat.WxMiniappProperties;
+import org.dromara.gz.common.wechat.WxMiniappProperties.MiniappApp;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -31,8 +30,8 @@ import org.springframework.transaction.annotation.Transactional;
  * <p>实现步骤（对齐 doc/10 §1 关键节点 N1-N6）：</p>
  * <ol>
  *   <li>N4: 调 {@link WxLoginAdapter#code2Session(String)} 拿 openid/sessionKey/unionid</li>
- *   <li>N5: 调 {@link IGzUserService#upsertByOpenid} UPSERT gz_user — DAO 已切换到真实 mybatis-plus
- *       （GZ-SYS-003 已落 DDL + GzUserMapper）</li>
+ *   <li>N5: 调 {@link IGzUserService#upsertByOpenid} 按 <b>(app_id, openid)</b> UPSERT gz_user —
+ *       DAO 已切换到真实 mybatis-plus（GZ-SYS-003 已落 DDL + GzUserMapper；GZ-SYS-023 加 app 维度）</li>
  *   <li>N6: sessionKey 写 Redis（TTL 24h）+ sa-token 颁发业务 token</li>
  * </ol>
  *
@@ -50,15 +49,10 @@ import org.springframework.transaction.annotation.Transactional;
 @RequiredArgsConstructor
 public class WxLoginServiceImpl implements IWxLoginService {
 
-    /**
-     * mp 端默认 clientid（与 miniapp/.env VITE_APP_CLIENT_ID 对齐）。
-     * 当 HTTP header 未带 {@code clientid} 时（如单测 / curl 兜底调试）使用此默认值，避免
-     * sa-token session 缺 clientid extra 导致后续 {@code SecurityConfig.check} 抛 NPE。
-     */
-    private static final String DEFAULT_MP_CLIENT_ID = "mp-applet-sensenran-guzi";
-
+    /** {@code @Primary} 的 {@link org.dromara.gz.common.wechat.WxAdapterDispatcher} 门面 —— 按 clientid 运行时选 real/mock。 */
     private final WxLoginAdapter wxLoginAdapter;
     private final WxMiniappProperties properties;
+    private final WxAppResolver appResolver;
     private final IGzUserService gzUserService;
     private final SessionKeyStore sessionKeyStore;
     private final IMpStaffPermissionService mpStaffPermissionService;
@@ -66,13 +60,19 @@ public class WxLoginServiceImpl implements IWxLoginService {
     @Override
     @Transactional(rollbackFor = Exception.class)
     public WxLoginVO wxLogin(WxLoginRequest request) {
-        // doc/10 §1.N4 — code2Session
+        // 本次登录属于哪个小程序 —— 全链路只解析一次（严格口径：未登记 clientid 直接抛错，
+        // 不静默拿另一个小程序的凭证 / 不把用户落进另一个小程序的命名空间）
+        MiniappApp app = appResolver.currentApp();
+
+        // doc/10 §1.N4 — code2Session（通道由 clientid → 小程序 mode 运行时决定，ADR-0019 §1）
         WxJscode2SessionResult session = wxLoginAdapter.code2Session(request.getCode());
-        log.info("[wx-login] adapter={} openid={} unionid={}",
+        log.info("[wx-login] clientid={} appid={} adapter={} openid={} unionid={}",
+            appResolver.currentClientId(), app.getAppid(),
             wxLoginAdapter.channel(), session.getOpenid(), session.getUnionid());
 
-        // doc/10 §1.N5 — UPSERT gz_user（GZ-SYS-003 起走真实 IGzUserService DAO）
-        GzUser user = gzUserService.upsertByOpenid(session, request.getNickName(), request.getAvatarUrl());
+        // doc/10 §1.N5 — UPSERT gz_user（GZ-SYS-003 起走真实 IGzUserService DAO；
+        // GZ-SYS-023 起按 (app_id, openid) UPSERT —— openid 只在单个 appid 内唯一，ADR-0019 §4）
+        GzUser user = gzUserService.upsertByOpenid(session, request.getNickName(), request.getAvatarUrl(), app);
 
         // 禁用检查（doc/11 §2.1 is_disabled）— UPSERT 之后再做（运营可见登录尝试）
         if (user.getIsDisabled() != null && user.getIsDisabled() == 1) {
@@ -132,7 +132,7 @@ public class WxLoginServiceImpl implements IWxLoginService {
                 staffPerm.getRolePermission().size(), staffPerm.getMenuPermission().size());
         }
 
-        String clientId = resolveClientId();
+        String clientId = appResolver.currentClientId();
 
         SaLoginParameter model = new SaLoginParameter();
         model.setDeviceType("mp");
@@ -147,34 +147,4 @@ public class WxLoginServiceImpl implements IWxLoginService {
         return StpUtil.getTokenValue();
     }
 
-    /**
-     * 解析 clientid：优先从当前请求 header 读取（mp 端拦截器统一注入），缺省回退到 {@link #DEFAULT_MP_CLIENT_ID}。
-     *
-     * <p>设计意图（BUG-SYS-002-01 后的健壮性选择）：</p>
-     * <ul>
-     *   <li>mp 端 H5/uni-app 请求拦截器统一注 {@code clientid: mp-applet-sensenran-guzi} → 走 header 分支</li>
-     *   <li>未来加 mp-applet-admin-debug 等多 mp 客户端 → 不用改代码（前端注新 clientid 即可）</li>
-     *   <li>单测 / curl 调试不带 header → 走 fallback 默认值，保证 happy path 可跑</li>
-     *   <li>非 web 上下文（如启动期 / @Scheduled）→ {@link ServletUtils#getRequest()} 返回 null，走 fallback</li>
-     * </ul>
-     *
-     * <p>与 {@code SecurityConfig.check} 第 69 行 {@code StringUtils.equalsAny(clientId, headerCid, paramCid)}
-     * 的契约：本方法写入 token extra 的 clientId 必须等于 mp 后续请求的 header.clientid（或 param.clientid）。
-     * 由于此处 header 优先 + mp 拦截器统一注入，两者天然相等。</p>
-     */
-    private String resolveClientId() {
-        try {
-            HttpServletRequest request = ServletUtils.getRequest();
-            if (request != null) {
-                String headerCid = request.getHeader(LoginHelper.CLIENT_KEY);
-                if (StringUtils.isNotBlank(headerCid)) {
-                    return headerCid;
-                }
-            }
-        } catch (Exception e) {
-            // 非 web 上下文或 ServletUtils 异常 — 静默走 fallback
-            log.debug("[wx-login] resolveClientId failed to read request header: {}", e.getMessage());
-        }
-        return DEFAULT_MP_CLIENT_ID;
-    }
 }

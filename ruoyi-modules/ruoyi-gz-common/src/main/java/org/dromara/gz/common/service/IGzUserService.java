@@ -6,6 +6,7 @@ import org.dromara.gz.common.domain.bo.GzUserQueryBo;
 import org.dromara.gz.common.domain.entity.GzUser;
 import org.dromara.gz.common.domain.vo.GzUserVO;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
+import org.dromara.gz.common.wechat.WxMiniappProperties.MiniappApp;
 
 import java.time.LocalDateTime;
 import java.util.Collection;
@@ -17,7 +18,7 @@ import java.util.Map;
  *
  * <p>三层契约：</p>
  * <ul>
- *   <li>{@link #upsertByOpenid(WxJscode2SessionResult, String, String)} — SYS-002 登录路径调用（INSERT 新用户 / UPDATE 已存在）</li>
+ *   <li>{@link #upsertByOpenid(WxJscode2SessionResult, String, String, MiniappApp)} — SYS-002 登录路径调用（INSERT 新用户 / UPDATE 已存在）</li>
  *   <li>{@link #selectPageList(GzUserQueryBo, PageQuery)} — admin 列表分页（{@code @SaCheckPermission("gz:user:list")}）</li>
  *   <li>{@link #selectVoById(Long)} — admin 详情 + mp /me 接口共用</li>
  * </ul>
@@ -30,14 +31,24 @@ import java.util.Map;
 public interface IGzUserService {
 
     /**
-     * 按 openid UPSERT 用户（doc/10 §1.N5）。
+     * 按 <b>小程序 + openid</b> UPSERT 用户（doc/10 §1.N5；GZ-SYS-023 起加 app 维度）。
      *
      * <ul>
-     *   <li>未找到 openid → 新建用户（status='authorized'，isDisabled=0，registerSource='mp_wechat'，
-     *       registerTime + lastLoginTime = now，user_no 由 BizCodeGenerator 生成）</li>
-     *   <li>找到 openid → 选择性更新 nickname / avatarUrl（mp 端传值时）+ lastLoginTime=now
-     *       + unionid 首次补齐（如甲方刚绑公众号）；registerTime 保持不变</li>
+     *   <li>未找到 (app_id, openid) → 新建用户（status='authorized'，isDisabled=0，
+     *       registerSource 取自该小程序配置，registerTime + lastLoginTime = now，user_no 生成）</li>
+     *   <li>找到 → 选择性更新 nickname / avatarUrl（mp 端传值时）+ lastLoginTime=now
+     *       + unionid 首次补齐（如甲方刚绑公众号）；registerTime / appId / registerSource 保持不变</li>
      * </ul>
+     *
+     * <p><b>为什么必须带 app（ADR-0019 §4）</b>：openid 是 appid 维度的标识，微信只保证它在单个 appid 内
+     * 唯一。只按 openid 查 = 两个小程序的 openid 一旦撞上，第二个小程序的用户直接登进第一个小程序某人的
+     * 账号（拿到别人的订单 / 券）。查询条件必须同时约束 app_id。</p>
+     *
+     * <p><b>为什么传整个 {@code app} 而不是一个 appid 字符串</b>：写库需要该小程序的两个属性 ——
+     * {@code appid}（落 {@code gz_user.app_id}）与 {@code registerSource}（落
+     * {@code gz_user.register_source}）。而 <b>dev 两个小程序的 appid 都是 {@code wxMOCK}</b>
+     * （拼团 appid 未到手），拿 appid 反查小程序会解析错来源，所以由已持有该配置的调用方
+     * （{@code WxAppResolver.currentApp()}）直接传进来，全链路只解析一次。</p>
      *
      * <p><b>注意</b>：本方法<b>不</b>检查 is_disabled — 登录路径的禁用检查由 WxLoginServiceImpl
      * 在 UPSERT 之后单独做（避免禁用用户被无意识地刷新 lastLoginTime 误导运营）。</p>
@@ -45,9 +56,10 @@ public interface IGzUserService {
      * @param session    微信 jscode2session 返回（含 openid / unionid）
      * @param nickname   mp 端授权拉取的昵称（可为空，已存在用户则跳过更新；新用户用 fallback "微信用户"）
      * @param avatarUrl  mp 端授权拉取的头像（可为空）
+     * @param app        本次登录所属小程序（{@code WxAppResolver#currentApp()}；appid 空 → IllegalArgumentException）
      * @return 持久化后的实体（含 id 等系统字段）
      */
-    GzUser upsertByOpenid(WxJscode2SessionResult session, String nickname, String avatarUrl);
+    GzUser upsertByOpenid(WxJscode2SessionResult session, String nickname, String avatarUrl, MiniappApp app);
 
     /**
      * admin 分页列表。

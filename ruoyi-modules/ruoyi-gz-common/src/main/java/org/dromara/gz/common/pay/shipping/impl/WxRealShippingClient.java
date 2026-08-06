@@ -9,7 +9,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.gz.common.pay.shipping.WxShippingClient;
 import org.dromara.gz.common.wechat.WxAccessTokenManager;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
+import org.dromara.gz.common.wechat.WxAdapterDispatcher;
+import org.dromara.gz.common.wechat.impl.WxRealAccessTokenManager;
 import org.springframework.stereotype.Component;
 
 import java.time.OffsetDateTime;
@@ -19,8 +20,17 @@ import java.time.format.DateTimeFormatter;
 /**
  * 微信发货信息录入 real 实现（upload_shipping_info）。
  *
- * <p>启用条件：{@code wx.miniapp.appid} 为非 wxMOCK 真实 AppID（与登录 / 手机号 real 通道互斥唯一）。
- * 调用链：access_token（{@link WxAccessTokenManager} 全局缓存）→ POST upload_shipping_info。</p>
+ * <p><b>装配</b>（ADR-0019 §1）：无条件注册，与 {@link WxMockShippingClient} 同时在容器里，由
+ * {@link WxAdapterDispatcher} 按当前 clientid 对应小程序的 mode 运行时选择。调用链：
+ * access_token（{@link WxRealAccessTokenManager} Redis 缓存）→ POST upload_shipping_info。</p>
+ *
+ * <p><b>依赖具体的 {@link WxRealAccessTokenManager} 而非 {@link WxAccessTokenManager} 接口</b>：
+ * 接口的 {@code @Primary} 实现是 dispatcher，注入它会构成 dispatcher → 本类 → dispatcher 的构造器
+ * 循环依赖（Spring Boot 3 默认禁止）。</p>
+ *
+ * <p><b>⚠️ 上报是 {@code @Async} 执行（无请求上下文）</b>：clientid 回落到
+ * {@code wx.miniapp.default-client-id}，即当前只按默认小程序取 token / 选通道。多小程序都要真上报时，
+ * 发货任务需带上自己的 clientid（见 GZ-SYS-021 / GZ-SYS-022）。</p>
  *
  * <p><b>容错</b>：本类不抛异常 —— 网络/微信错误落 {@link UploadResult#fail}；access_token 失效
  * （40001/42001/40014）强刷一次重试。</p>
@@ -38,7 +48,6 @@ import java.time.format.DateTimeFormatter;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-@ConditionalOnExpression("'${wx.miniapp.appid:wxMOCK}' != 'wxMOCK'")
 public class WxRealShippingClient implements WxShippingClient {
 
     /** 发货信息录入接口。 */
@@ -73,7 +82,7 @@ public class WxRealShippingClient implements WxShippingClient {
     /** 「支付单不存在」—— 支付后微信订单索引尚未就绪的时序竞态，可重试（非终态失败）。 */
     private static final int ERR_ORDER_NOT_READY = 10060001;
 
-    private final WxAccessTokenManager accessTokenManager;
+    private final WxRealAccessTokenManager accessTokenManager;
 
     @Override
     public UploadResult uploadShippingInfo(UploadCommand cmd) {

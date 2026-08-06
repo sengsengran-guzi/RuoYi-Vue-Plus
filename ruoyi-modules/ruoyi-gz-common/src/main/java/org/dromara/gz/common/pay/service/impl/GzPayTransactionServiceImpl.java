@@ -30,6 +30,7 @@ import org.dromara.gz.common.pay.service.internal.IWechatPayClient.CallbackResul
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.JsapiPayParams;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.NotifyContext;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.UnifiedOrderRequest;
+import org.dromara.gz.common.pay.service.internal.PayAppidResolver;
 import org.dromara.gz.common.pay.service.internal.PayOrderNoGenerator;
 import org.dromara.gz.common.pay.service.internal.WechatPayVerifyException;
 import org.dromara.gz.common.pay.service.spi.PayCallbackDispatcher;
@@ -91,6 +92,14 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
      */
     private final ObjectProvider<PayCallbackDispatcher> callbackDispatcherProvider;
 
+    /**
+     * 「本单归属哪个小程序」→ appid 解析器（ADR-0019 §3，GZ-SYS-022）。
+     *
+     * <p>统一下单与调起签名<b>共用同一个解析结果</b>：两处 appid 不一致会让下单返 200、
+     * 前端调起时才验签失败，排查方向被日志带偏。</p>
+     */
+    private final PayAppidResolver appidResolver;
+
     // ============================================================
     //  AC 4（PAY-001 test 单）/ AC 1（PAY-101 业务建单）统一下单
     // ============================================================
@@ -130,6 +139,10 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
      */
     private MpPayParamsVO createOrderInternal(String businessType, String businessOrderNo, long amountCent,
                                               String openid, Long userId, String description) {
+        // ⓪ 定下本单的小程序 appid（ADR-0019 §3）—— 解析一次，统一下单与调起签名共用同一个值。
+        //    openid 是这个 appid 签发的，两者必须同源，否则微信返「openid 与 appid 不匹配」。
+        String appid = appidResolver.resolveForCurrentApp();
+
         // ① 建单 created + expire_time=now+5min（fee_cent 留 NULL）
         GzPayTransaction tx = createCreatedTransaction(businessType, businessOrderNo, amountCent, openid, userId);
 
@@ -137,7 +150,7 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
         String prepayId;
         try {
             prepayId = wechatPayClient.createJsapiOrder(
-                new UnifiedOrderRequest(tx.getOutTradeNo(), amountCent, openid, description));
+                new UnifiedOrderRequest(tx.getOutTradeNo(), amountCent, openid, description, appid));
         } catch (Exception e) {
             // 通道失败 → 标 failed（doc/10 §2 通道失败态）
             tx.setStatus(PayStatus.FAILED);
@@ -152,10 +165,10 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
             throw new ServiceException("订单状态推进失败（created → pending）");
         }
 
-        // ④ 算 5 参签名返回 mp
-        JsapiPayParams p = wechatPayClient.buildPayParams(prepayId);
-        log.info("[gz-pay] 建单成功 business_type={} out_trade_no={} business_order_no={} amount={} prepay_id={}",
-            businessType, tx.getOutTradeNo(), businessOrderNo, amountCent, prepayId);
+        // ④ 算 5 参签名返回 mp（★ 与 ② 传同一个 appid：改造前这里读全局配置，是多 appid 最易漏的一处）
+        JsapiPayParams p = wechatPayClient.buildPayParams(prepayId, appid);
+        log.info("[gz-pay] 建单成功 business_type={} out_trade_no={} business_order_no={} amount={} appid={} prepay_id={}",
+            businessType, tx.getOutTradeNo(), businessOrderNo, amountCent, appid, prepayId);
         return MpPayParamsVO.builder()
             .timeStamp(p.timeStamp())
             .nonceStr(p.nonceStr())

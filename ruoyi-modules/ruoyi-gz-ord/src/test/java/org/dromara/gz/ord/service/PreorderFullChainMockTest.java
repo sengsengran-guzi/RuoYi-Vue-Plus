@@ -127,8 +127,13 @@ class PreorderFullChainMockTest {
         org.springframework.beans.factory.ObjectProvider<PayCallbackDispatcher> dispatcherProvider =
             org.mockito.Mockito.mock(org.springframework.beans.factory.ObjectProvider.class);
         lenient().when(dispatcherProvider.getObject()).thenReturn(dispatcher);
+        // GZ-SYS-022：appid 解析器（单值 wx.miniapp 形态 = prod 现状，无 gz_pay_channel 覆盖行）
+        org.dromara.gz.common.pay.service.internal.PayAppidResolver appidResolver =
+            new org.dromara.gz.common.pay.service.internal.PayAppidResolver(
+                new org.dromara.gz.common.wechat.WxAppResolver(new org.dromara.gz.common.wechat.WxMiniappProperties()),
+                org.mockito.Mockito.mock(org.dromara.gz.common.pay.mapper.GzPayChannelMapper.class), props);
         payService = new GzPayTransactionServiceImpl(
-            payTxMapper, callbackLogMapper, generator, mockClient, props, shippingService, dispatcherProvider);
+            payTxMapper, callbackLogMapper, generator, mockClient, props, shippingService, dispatcherProvider, appidResolver);
 
         wirePayMappers();
         wireOrderMappers();

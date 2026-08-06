@@ -21,10 +21,22 @@ import org.springframework.stereotype.Component;
 @ConfigurationProperties(prefix = "gz.pay")
 public class WechatPayProperties {
 
-    /** 客户端实现选择：mock（dev/单测/商户号未到位）/ real（商户号到位后 staging/prod） */
+    /**
+     * 客户端实现选择：mock（dev/单测/商户号未到位）/ real（商户号到位后 staging/prod）。
+     *
+     * <p><b>进程级全局开关，刻意不按小程序拆</b>（ADR-0019 §5）：同一环境下两个小程序的收款模式必然相同
+     * （dev 全 mock、prod 全 real）。且 {@code IWechatPayClient} 是单例注入，把它做成运行时按请求切换
+     * 会拿到错误实现。要「一个小程序 mock 收款、另一个 real」时再按 §3 同样的形态下沉到通道配置。</p>
+     */
     private String clientMode = "mock";
 
-    /** 小程序 appid */
+    /**
+     * 【已降级为兜底】小程序 appid。
+     *
+     * <p>统一下单与调起签名的 appid 由 {@code PayAppidResolver} 按小程序解析（ADR-0019 §3 / GZ-SYS-022），
+     * 顺序为 {@code gz_pay_channel.appid} → {@code wx.miniapp.apps.<clientid>.appid} → 本值。
+     * 本值只在前两级都取不到时兜底，保证历史配置形态下行为不劣化；<b>新环境不需要配</b>。</p>
+     */
     private String appid;
 
     /** 商户号（甲方主体；env var ${WECHAT_PAY_MCH_ID}） */

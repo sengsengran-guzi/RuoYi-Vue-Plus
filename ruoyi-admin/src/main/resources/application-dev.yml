@@ -272,13 +272,30 @@ justauth:
       client-secret: 1f7d08**********5b7**********29e
       redirect-uri: ${justauth.address}/social-callback?source=gitea
 
---- # 微信小程序登录配置（GZ-SYS-002）
+--- # 微信小程序登录配置（GZ-SYS-002 / 多小程序 ADR-0019 §1）
 wx:
   miniapp:
-    # appid=wxMOCK 时走 mock 通道（不调微信 jscode2session，由 WxMockLoginAdapter 短路）
-    # 真实 AppID 接入后改为 wx.xxxxxx，自动切换 WxRealLoginAdapter
-    appid: ${WX_MA_APPID:wxMOCK}
-    secret: ${WX_MA_SECRET:}
+    # 无 clientid 上下文（@Async 发货上报 / cron / curl 调试）时落到哪个小程序；必须是下面 apps 的 key
+    default-client-id: mp-applet-sensenran-guzi
+    # 按 clientid 索引的小程序清单（key = mp 端 VITE_APP_CLIENT_ID / 请求 header clientid）。
+    # real / mock 是每个小程序各自的属性：appid 为空或 wxMOCK → 该小程序走 mock 通道（不调微信
+    # jscode2session，由 WxMockLoginAdapter 短路），互不影响另一个小程序的真通道。
+    apps:
+      # 谷子宇宙（现小程序）：本地默认 mock；要测真登录时 WX_MA_APPID=wx2f8b93e09703f07d WX_MA_SECRET=xxx
+      mp-applet-sensenran-guzi:
+        appid: ${WX_MA_APPID:wxMOCK}
+        secret: ${WX_MA_SECRET:}
+      # 谷子宇宙拼团（日本拼团小程序）：一期没拿到 secret 前恒走 mock
+      mp-applet-gz-jp:
+        appid: ${WX_JP_MA_APPID:wxMOCK}
+        secret: ${WX_JP_MA_SECRET:}
+        # 与上面那个小程序区分开，否则两边 mock 用户 openid 相同、看起来像同一人
+        mock-stable-openid: ${WX_JP_MA_MOCK_OPENID:jp-tester}
+        # 本小程序注册的用户写进 gz_user.register_source（GZ-SYS-023）。dev 两个小程序 appid 都是
+        # wxMOCK（拼团 appid 未到手），app_id 列此时分不出来源，靠这个值区分。上面那个小程序不配
+        # → 继承全局默认 mp_wechat（= 改造前的历史取值，存量与现小程序零变化）。
+        register-source: mp_wechat_jp
+    # 以下两项为全局默认，各 app 未显式覆盖时继承。
     # dev 本地回落：true 时真手机号通道（真 appid）也直接返默认测试号 13800000000，绕过真实
     # getuserphonenumber —— 本地用真 appid 测真登录、但模拟器拿不到可换号的真 code 时仍能走通绑定。
     # 与 appid 解耦（真登录 + 假手机号）。staging/prod 不配此项 → 默认 false → 走真实微信换号。
@@ -310,7 +327,12 @@ gz:
   # 微信支付通道（GZ-PAY-001）— dev 走 mock（商户号未到位 + dev 无 HTTPS 接不了真回调）。
   # 商户号到位后 staging/prod 切 client-mode=real + 注入 env var（见 application-prod.yml）。
   pay:
+    # client-mode 是【进程级全局】mock/real 开关，与 wx.miniapp 的按小程序 appid 正交（ADR-0019 §5）：
+    # 同一环境两个小程序的收款模式必然相同（dev 全 mock / prod 全 real），刻意不做成按小程序。
     client-mode: mock
+    # ⚠️ 下单与调起签名的 appid 已【不再读这里】（ADR-0019 §3 / GZ-SYS-022）。
+    # 现在的解析顺序：gz_pay_channel.appid（按 client_id 一行）→ wx.miniapp.apps.<clientid>.appid → 本值兜底。
+    # 保留本项仅为「历史配置形态下行为不劣化」的最后一层兜底，新环境不需要配。
     appid: ${WECHAT_PAY_APPID:wx_dev_placeholder}
     test:
       amount-cent: 1

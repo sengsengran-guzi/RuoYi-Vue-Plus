@@ -103,13 +103,18 @@ public class MockWechatPayClient implements IWechatPayClient {
     @Override
     public String createJsapiOrder(UnifiedOrderRequest req) {
         String prepayId = MOCK_PREPAY_PREFIX + req.outTradeNo();
-        log.info("[gz-pay-mock] createJsapiOrder out_trade_no={} amount={} → prepay_id={}",
-            req.outTradeNo(), req.amountCent(), prepayId);
+        // appid 在 mock 通道不参与任何计算（不连微信），但要打进日志：多小程序并行 dev 时
+        // 这行是「这一单归属哪个小程序」的唯一现场（ADR-0019 §3）。
+        log.info("[gz-pay-mock] createJsapiOrder out_trade_no={} amount={} appid={} → prepay_id={}",
+            req.outTradeNo(), req.amountCent(), req.appid(), prepayId);
         return prepayId;
     }
 
     @Override
-    public JsapiPayParams buildPayParams(String prepayId) {
+    public JsapiPayParams buildPayParams(String prepayId, String appid) {
+        // mock 不做真签名（无商户私钥），appid 仅记录 —— 保持 5 参取值格式与改造前逐字一致，
+        // 以免 mp/E2E 侧对 mock_pay_sign_ 前缀的断言被打挂。
+        log.info("[gz-pay-mock] buildPayParams prepay_id={} appid={}", prepayId, appid);
         return new JsapiPayParams(
             String.valueOf(System.currentTimeMillis() / 1000),
             UUID.randomUUID().toString().replace("-", ""),

@@ -16,6 +16,7 @@ import org.dromara.gz.common.mapper.GzUserMapper;
 import org.dromara.gz.common.service.IGzFileService;
 import org.dromara.gz.common.service.IGzUserService;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
+import org.dromara.gz.common.wechat.WxMiniappProperties.MiniappApp;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -40,8 +41,15 @@ public class GzUserServiceImpl implements IGzUserService {
     /** mp 默认昵称 fallback（用户拒授权时用） */
     private static final String FALLBACK_NICKNAME = "微信用户";
 
-    /** 注册来源（V1 全部 mp_wechat） */
-    private static final String REGISTER_SOURCE = "mp_wechat";
+    /**
+     * 注册来源兜底值（GZ-SYS-023）。
+     *
+     * <p>多小程序后注册来源<b>不再是一个常量</b>，真源是各小程序自己的
+     * {@code wx.miniapp.apps.<clientid>.register-source}（默认 {@code mp_wechat} = 现小程序历史取值）。
+     * 本常量只在传入的小程序没配（理论上不会，{@code materialize()} 已回填全局默认）时兜底，
+     * 保证 NOT NULL 列不会写空。</p>
+     */
+    private static final String REGISTER_SOURCE_FALLBACK = "mp_wechat";
 
     /** 默认状态（doc/10 §1 状态机：登录成功即 authorized） */
     private static final String DEFAULT_STATUS = "authorized";
@@ -54,15 +62,24 @@ public class GzUserServiceImpl implements IGzUserService {
     private final IGzFileService gzFileService;
 
     @Override
-    public GzUser upsertByOpenid(WxJscode2SessionResult session, String nickname, String avatarUrl) {
+    public GzUser upsertByOpenid(WxJscode2SessionResult session, String nickname, String avatarUrl, MiniappApp app) {
         String openid = session.getOpenid();
         if (StrUtil.isBlank(openid)) {
             throw new IllegalArgumentException("openid is blank");
         }
+        // app_id 是唯一键的一维（ADR-0019 §4）：为空会让不同小程序的用户落进同一命名空间 → 串户。
+        // NOT NULL 列也不允许写空，所以这里直接拒绝而不是回落默认小程序。
+        if (app == null || StrUtil.isBlank(app.getAppid())) {
+            throw new IllegalArgumentException("appId is blank（登录必须带所属小程序，见 ADR-0019 §4）");
+        }
+        String appId = app.getAppid();
         LocalDateTime now = LocalDateTime.now();
 
-        // 多租户 + 软删自动注入，wrapper 只显式约束业务字段
-        LambdaQueryWrapper<GzUser> lqw = new LambdaQueryWrapper<GzUser>().eq(GzUser::getOpenid, openid);
+        // 多租户 + 软删自动注入，wrapper 只显式约束业务字段。
+        // ★ 必须同时约束 app_id：openid 只在单个 appid 内唯一，漏掉 app_id 就是跨小程序串户（ADR-0019 §4）
+        LambdaQueryWrapper<GzUser> lqw = new LambdaQueryWrapper<GzUser>()
+            .eq(GzUser::getAppId, appId)
+            .eq(GzUser::getOpenid, openid);
         Optional<GzUser> existing = Optional.ofNullable(baseMapper.selectOne(lqw));
 
         if (existing.isPresent()) {
@@ -79,28 +96,29 @@ public class GzUserServiceImpl implements IGzUserService {
                 user.setUnionid(session.getUnionid());
             }
             baseMapper.updateById(user);
-            log.info("[gz-user] UPDATE id={} openid={} lastLoginTime={}",
-                user.getId(), user.getOpenid(), user.getLastLoginTime());
+            log.info("[gz-user] UPDATE id={} appId={} openid={} lastLoginTime={}",
+                user.getId(), user.getAppId(), user.getOpenid(), user.getLastLoginTime());
             return user;
         }
 
         // 新建 — tenant_id / createTime / updateTime / createBy / updateBy / delFlag 由 mybatis-plus 自动填充
         GzUser fresh = GzUser.builder()
             .userNo(generateUserNo(now))
+            .appId(appId)
             .openid(openid)
             .unionid(session.getUnionid())
             .nickname(StrUtil.isNotBlank(nickname) ? nickname : FALLBACK_NICKNAME)
             .avatarUrl(StrUtil.nullToEmpty(avatarUrl))
             .gender(0)
-            .registerSource(REGISTER_SOURCE)
+            .registerSource(StrUtil.blankToDefault(app.getRegisterSource(), REGISTER_SOURCE_FALLBACK))
             .registerTime(now)
             .lastLoginTime(now)
             .status(DEFAULT_STATUS)
             .isDisabled(0)
             .build();
         baseMapper.insert(fresh);
-        log.info("[gz-user] INSERT id={} openid={} userNo={}",
-            fresh.getId(), fresh.getOpenid(), fresh.getUserNo());
+        log.info("[gz-user] INSERT id={} appId={} openid={} userNo={} registerSource={}",
+            fresh.getId(), fresh.getAppId(), fresh.getOpenid(), fresh.getUserNo(), fresh.getRegisterSource());
         return fresh;
     }
 

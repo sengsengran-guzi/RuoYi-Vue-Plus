@@ -8,13 +8,18 @@ import org.dromara.gz.common.pay.domain.vo.MpPayParamsVO;
 import org.dromara.gz.common.pay.enums.PayBusinessType;
 import org.dromara.gz.common.pay.enums.PayStatus;
 import org.dromara.gz.common.pay.mapper.GzPayCallbackLogMapper;
+import org.dromara.gz.common.pay.mapper.GzPayChannelMapper;
 import org.dromara.gz.common.pay.mapper.GzPayTransactionMapper;
 import org.dromara.gz.common.pay.service.impl.GzPayTransactionServiceImpl;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.NotifyContext;
+import org.dromara.gz.common.pay.service.internal.IWechatPayClient.UnifiedOrderRequest;
 import org.dromara.gz.common.pay.service.internal.MockWechatPayClient;
+import org.dromara.gz.common.pay.service.internal.PayAppidResolver;
 import org.dromara.gz.common.pay.service.internal.PayOrderNoGenerator;
 import org.dromara.gz.common.pay.service.spi.PayCallbackDispatcher;
 import org.dromara.gz.common.pay.service.spi.PayCallbackHandler;
+import org.dromara.gz.common.wechat.WxAppResolver;
+import org.dromara.gz.common.wechat.WxMiniappProperties;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -73,7 +78,12 @@ class GzPayBusinessFullChainMockTest {
     @Mock
     private IGzPayShippingService shippingService;
 
+    /** 现小程序（谷子宇宙）appid —— application-prod.yml 的 wx.miniapp.appid 默认值 */
+    private static final String GUZI_APPID = "wx2f8b93e09703f07d";
+
     private MockWechatPayClient mockClient;
+    private WxMiniappProperties miniappProperties;
+    private GzPayChannelMapper channelMapper;
     private PayCallbackDispatcher dispatcher;
     /** 测试内联 preorder 支付 handler（真实 handler 已下沉 gz-ord，此处仅验 SPI 路由命中） */
     private PayCallbackHandler preorderHandler;
@@ -89,7 +99,10 @@ class GzPayBusinessFullChainMockTest {
     void setUp() {
         WechatPayProperties props = new WechatPayProperties();
         props.setClientMode("mock");
-        mockClient = new MockWechatPayClient(props);
+        // spy 而非 mock：保留 MockWechatPayClient 的真实行为（真走 mock prepay_id / mock V3 回调解析），
+        // 同时能捕获传给通道的 appid —— GZ-SYS-022 要断言的正是「下单与调起签名拿到的是同一个、
+        // 且是当前小程序的 appid」，这件事只能在通道边界上看见。
+        mockClient = spy(new MockWechatPayClient(props));
         // SPI：真实 dispatcher + 测试内联 preorder handler（验 business_type=preorder 路由命中即可，
         // 真实出单逻辑已下沉 ruoyi-gz-ord PreorderPayCallbackHandler，gz-common 不依赖 gz-ord）
         preorderHandler = new PayCallbackHandler() {
@@ -110,8 +123,14 @@ class GzPayBusinessFullChainMockTest {
         lenient().when(dispatcherProvider.getObject()).thenReturn(dispatcher);
 
         PayOrderNoGenerator generator = new PayOrderNoGenerator(transactionMapper, refundMapper, PayGeneratorTestSupport.inMemoryRedisson());
+        // GZ-SYS-022：真实 appid 解析器（单值 wx.miniapp 形态 = prod 现状 → 现小程序 appid），
+        // 无 gz_pay_channel 覆盖行 → 走「登录侧 appid」这条默认路径。
+        miniappProperties = new WxMiniappProperties();
+        miniappProperties.setAppid(GUZI_APPID);
+        channelMapper = mock(GzPayChannelMapper.class);
         service = new GzPayTransactionServiceImpl(
-            transactionMapper, callbackLogMapper, generator, mockClient, props, shippingService, dispatcherProvider);
+            transactionMapper, callbackLogMapper, generator, mockClient, props, shippingService, dispatcherProvider,
+            new PayAppidResolver(new WxAppResolver(miniappProperties), channelMapper, props));
 
         wireInMemoryMappers();
     }
@@ -256,5 +275,100 @@ class GzPayBusinessFullChainMockTest {
         ArgumentCaptor<GzPayCallbackLog> cap = ArgumentCaptor.forClass(GzPayCallbackLog.class);
         verify(callbackLogMapper, times(2)).insert(cap.capture());
         assertEquals("processed", cap.getAllValues().get(1).getProcessStatus());
+    }
+
+    // ============================================================
+    //  GZ-SYS-022 回归：现小程序（谷子宇宙 mp-applet-sensenran-guzi）拼豆付费全链路
+    //  —— 多 appid 改造改的是线上正在收款的链路，「新小程序通了」不是验收条件，
+    //     「现小程序没坏」才是（ADR-0019 §影响面）。
+    // ============================================================
+
+    @Test
+    @DisplayName("GZ-SYS-022 回归：现小程序拼豆 下单→签名→mock 回调 全链路不变，且两处 appid 同源")
+    void pindouFullChain_existingMiniapp_unchanged() {
+        CreateOrderBo bo = CreateOrderBo.builder()
+            .businessType(PayBusinessType.PINDOU)
+            .businessOrderNo("BK20260806-000123")
+            .amountCent(3000L)
+            .openid("openid_guzi_pindou_001")
+            .userId(11L)
+            .description("谷子宇宙拼豆 - 1 小时")
+            .build();
+
+        MpPayParamsVO params = service.createBusinessOrder(bo);
+        String outTradeNo = params.getOutTradeNo();
+
+        // ① 建单行为与改造前逐字一致（前缀 / 序号 / 状态 / 通道 / fee_cent / package）
+        assertTrue(outTradeNo.startsWith("PINDOU-"), "out_trade_no 前缀 PINDOU-：" + outTradeNo);
+        assertTrue(outTradeNo.endsWith("-000001"));
+        GzPayTransaction afterCreate = db.get(outTradeNo);
+        assertEquals(PayStatus.PENDING, afterCreate.getStatus());
+        assertEquals("pindou", afterCreate.getBusinessType());
+        assertEquals("BK20260806-000123", afterCreate.getBusinessOrderNo());
+        assertEquals("wechat_pay_v3", afterCreate.getChannelCode());
+        assertNull(afterCreate.getFeeCent());
+        assertTrue(afterCreate.getPrepayId().startsWith(MockWechatPayClient.MOCK_PREPAY_PREFIX));
+        assertEquals("prepay_id=" + afterCreate.getPrepayId(), params.getPackageVal());
+        assertEquals("RSA", params.getSignType());
+        assertTrue(params.getPaySign().startsWith("mock_pay_sign_"), "mock 5 参格式未变（mp/E2E 断言依赖）");
+
+        // ② ★ 统一下单与调起签名拿到的是「同一个」且是「现小程序」的 appid
+        ArgumentCaptor<UnifiedOrderRequest> orderCap = ArgumentCaptor.forClass(UnifiedOrderRequest.class);
+        verify(mockClient).createJsapiOrder(orderCap.capture());
+        ArgumentCaptor<String> signAppidCap = ArgumentCaptor.forClass(String.class);
+        verify(mockClient).buildPayParams(anyString(), signAppidCap.capture());
+
+        assertEquals(GUZI_APPID, orderCap.getValue().appid(), "统一下单用现小程序 appid");
+        assertEquals(GUZI_APPID, signAppidCap.getValue(), "调起签名用同一个 appid（:125 最易漏的一处）");
+        assertEquals("openid_guzi_pindou_001", orderCap.getValue().openid(),
+            "payer.openid 与 appid 同源（openid 是 appid 维度标识）");
+
+        // ③ mock 回调 → paid（收款闭环不变）
+        String mockTxnId = "mock_wx_txn_" + outTradeNo;
+        NotifyContext ctx = new NotifyContext("0", "n", "s", "ser",
+            mockClient.buildMockCallbackBody(outTradeNo, mockTxnId, 3000L));
+        assertTrue(service.handlePaymentNotify(ctx));
+
+        GzPayTransaction afterPaid = db.get(outTradeNo);
+        assertEquals(PayStatus.PAID, afterPaid.getStatus());
+        assertEquals(mockTxnId, afterPaid.getTransactionId());
+        assertEquals(2, callbackLogs.size());
+        assertEquals("received", callbackLogs.get(0).getProcessStatus());
+        assertEquals("processed", callbackLogs.get(1).getProcessStatus());
+
+        // ④ 重复回调仍幂等
+        assertTrue(service.handlePaymentNotify(ctx));
+        assertEquals(PayStatus.PAID, db.get(outTradeNo).getStatus());
+        assertEquals("duplicated", callbackLogs.get(3).getProcessStatus());
+    }
+
+    @Test
+    @DisplayName("GZ-SYS-022 回归：gz_pay_channel 配了本小程序的 appid → 覆盖登录侧 appid（真源激活）")
+    void pindouFullChain_channelRowOverridesAppid() {
+        org.dromara.gz.common.pay.domain.entity.GzPayChannel row =
+            new org.dromara.gz.common.pay.domain.entity.GzPayChannel();
+        row.setId(1L);
+        row.setChannelCode("wechat_pay_v3");
+        row.setClientId("mp-applet-sensenran-guzi");
+        row.setAppid("wxCHANNEL_OVERRIDE");
+        row.setEnabled(1);
+        when(channelMapper.selectList(any())).thenReturn(List.of(row));
+
+        CreateOrderBo bo = CreateOrderBo.builder()
+            .businessType(PayBusinessType.PINDOU)
+            .businessOrderNo("BK20260806-000124")
+            .amountCent(3000L)
+            .openid("openid_guzi_pindou_002")
+            .userId(11L)
+            .description("谷子宇宙拼豆 - 通道行覆盖")
+            .build();
+        service.createBusinessOrder(bo);
+
+        ArgumentCaptor<UnifiedOrderRequest> orderCap = ArgumentCaptor.forClass(UnifiedOrderRequest.class);
+        verify(mockClient).createJsapiOrder(orderCap.capture());
+        ArgumentCaptor<String> signAppidCap = ArgumentCaptor.forClass(String.class);
+        verify(mockClient).buildPayParams(anyString(), signAppidCap.capture());
+        assertEquals("wxCHANNEL_OVERRIDE", orderCap.getValue().appid());
+        assertEquals("wxCHANNEL_OVERRIDE", signAppidCap.getValue());
     }
 }

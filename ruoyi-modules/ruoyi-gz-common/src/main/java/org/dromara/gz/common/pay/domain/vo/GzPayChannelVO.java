@@ -31,6 +31,9 @@ public class GzPayChannelVO implements Serializable {
 
     private String channelCode;
 
+    /** 归属小程序 clientid（一个小程序一行，ADR-0019 §3） */
+    private String clientId;
+
     private String displayName;
 
     private String appid;

@@ -12,8 +12,14 @@ package org.dromara.gz.common.pay.shipping;
  * <p><b>注意</b>：本接口走<b>小程序 access_token</b>（{@link org.dromara.gz.common.wechat.WxAccessTokenManager}），
  * 不是微信支付商户证书 API（与 {@link org.dromara.gz.common.pay.service.internal.IWechatPayClient} 区分）。</p>
  *
- * <p>real / mock 双实现，按 {@code wx.miniapp.appid} 条件切换（与登录 / 手机号通道同款）：real 真调微信，
- * mock 仅打日志返成功（dev 走 mock-pay 全流程时不触网）。</p>
+ * <p>real / mock 双实现都注册为 Bean，由 {@link org.dromara.gz.common.wechat.WxAdapterDispatcher}
+ * （{@code @Primary} 门面）运行时按小程序选择（ADR-0019 §1）：real 真调微信，mock 仅打日志返成功
+ * （dev 走 mock-pay 全流程时不触网）。</p>
+ *
+ * <p><b>本能力是共享能力</b>，三种调用来源：支付回调后的 {@code @Async} 线程、cron、以及后台 admin
+ * 「发货信息手动补报」（{@code POST /system/gz/pay/shipping/{id}/retry}）。后者带的是 plus-ui 的 PC
+ * clientid（不是小程序），故走 {@link org.dromara.gz.common.wechat.WxAppResolver#currentAppOrDefault()}
+ * 宽松口径 —— 用严格口径会让后台补报按钮直接报「未配置的小程序客户端」。</p>
  *
  * @author kevin-coder (sensenran-guzi)
  */

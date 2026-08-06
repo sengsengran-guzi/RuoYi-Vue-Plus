@@ -31,8 +31,9 @@ import java.io.Serializable;
  *       → UPDATE gz_user.mobile + status = 'phone_bound'</li>
  * </ol>
  *
- * <p>mock 通道（{@code wx.miniapp.appid=wxMOCK}）下 {@link WxPhoneAdapter} 忽略 code 返固定测试号，
- * 让 dev / 开发者工具走通。明文手机号绝不由前端传入（防伪造）。</p>
+ * <p>当前请求的小程序（按 header {@code clientid} 解析，ADR-0019 §1）若是 mock 通道（appid 为空或
+ * {@code wxMOCK}），{@link WxPhoneAdapter} 忽略 code 返固定测试号，让 dev / 开发者工具走通。
+ * 明文手机号绝不由前端传入（防伪造）。</p>
  *
  * @author kevin-coder (sensenran-guzi · GZ-BEAN-004)
  */

@@ -31,10 +31,16 @@ public interface IWechatPayClient {
      * <p>real 实现用商户私钥 RSA-SHA256 签 {@code appId\ntimeStamp\nnonceStr\nprepay_id={id}\n}；
      * mock 返回固定占位签名（mp dev 端只验流程不验真签）。</p>
      *
+     * <p><b>appid 必须由调用方从下单上下文传入</b>（ADR-0019 §3，多小程序）：签名的第一个因子就是 appid，
+     * 与实际调起方（哪个小程序）不一致时微信侧验签直接不过。这里刻意做成<b>必填形参而非读全局配置</b> ——
+     * 多 appid 改造中「只改了统一下单、漏了本方法」是最容易犯且最难查的错（下单返 200、日志全绿，
+     * 前端调起时才报签名错，排查方向被日志带偏）；做成形参后编译器会强制每个调用点交代 appid。</p>
+     *
      * @param prepayId 统一下单返回的 prepay_id
+     * @param appid    下单时所用的小程序 appid（<b>必须与 {@link #createJsapiOrder} 传入的同一个</b>）
      * @return 5 参签名（timeStamp / nonceStr / package / signType / paySign）
      */
-    JsapiPayParams buildPayParams(String prepayId);
+    JsapiPayParams buildPayParams(String prepayId, String appid);
 
     /**
      * 解析 + 验签微信回调（doc/10 §2.N6 → N7 / AC 6）。
@@ -161,8 +167,16 @@ public interface IWechatPayClient {
 
     /**
      * 统一下单请求。
+     *
+     * @param outTradeNo  业务订单号
+     * @param amountCent  金额（分）
+     * @param openid      付款用户 openid —— <b>必须与 {@code appid} 同源</b>（openid 是 appid 维度标识，
+     *                    跨小程序不通用），否则微信返「openid 与 appid 不匹配」
+     * @param description 商品描述
+     * @param appid       下单所用的小程序 appid（ADR-0019 §3：从下单上下文携带，不再读全局配置）
      */
-    record UnifiedOrderRequest(String outTradeNo, long amountCent, String openid, String description) {
+    record UnifiedOrderRequest(String outTradeNo, long amountCent, String openid, String description,
+                               String appid) {
     }
 
     /**

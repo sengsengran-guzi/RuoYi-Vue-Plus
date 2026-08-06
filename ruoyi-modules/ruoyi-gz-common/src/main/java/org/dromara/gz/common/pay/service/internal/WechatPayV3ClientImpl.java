@@ -24,6 +24,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.exception.ServiceException;
 import org.dromara.gz.common.pay.config.WechatPayProperties;
+import org.dromara.gz.common.wechat.WxMiniappProperties;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
@@ -89,8 +90,11 @@ public class WechatPayV3ClientImpl implements IWechatPayClient {
 
     @Override
     public String createJsapiOrder(UnifiedOrderRequest req) {
+        String appid = requireRealAppid(req.appid(), "统一下单");
         PrepayRequest request = new PrepayRequest();
-        request.setAppid(props.getAppid());
+        // ADR-0019 §3：appid 来自下单上下文（PayAppidResolver），不再读全局 gz.pay.appid ——
+        // prepay_id 与 appid 绑定，新小程序拿旧 appid 的 prepay_id 调起必失败。
+        request.setAppid(appid);
         request.setMchid(props.getMchId());
         request.setDescription(req.description());
         request.setOutTradeNo(req.outTradeNo());
@@ -110,21 +114,46 @@ public class WechatPayV3ClientImpl implements IWechatPayClient {
         // packageVal 形如 "prepay_id=wx..."，剥前缀回填 prepay_id
         String pkg = resp.getPackageVal();
         String prepayId = pkg != null && pkg.startsWith("prepay_id=") ? pkg.substring("prepay_id=".length()) : pkg;
-        log.info("[gz-pay] createJsapiOrder out_trade_no={} → prepay_id={}", req.outTradeNo(), prepayId);
+        log.info("[gz-pay] createJsapiOrder out_trade_no={} appid={} → prepay_id={}",
+            req.outTradeNo(), appid, prepayId);
         return prepayId;
     }
 
     @Override
-    public JsapiPayParams buildPayParams(String prepayId) {
+    public JsapiPayParams buildPayParams(String prepayId, String appid) {
         // SDK prepayWithRequestPayment 已能直接出 5 参，但本接口契约按 prepay_id 二次构建，
         // 为复用「一次下单一次签名」，real 路径实际由 createJsapiOrder 返回的 prepay_id 经此重签。
         // 简化：用 SDK 同款字段拼装 —— 真实联调期（buffer）若需严格一致，改 createJsapiOrder 直接缓存 5 参。
+        //
+        // ★ ADR-0019 §3：签名第一因子必须是「实际调起方那个小程序的 appid」，由调用方从下单上下文传入。
+        //   这里与 createJsapiOrder 用同一个 appid —— 两处不一致 = 微信验签必挂（且下单接口仍返 200）。
+        String signAppid = requireRealAppid(appid, "调起支付签名");
         long ts = System.currentTimeMillis() / 1000;
         String nonce = java.util.UUID.randomUUID().toString().replace("-", "");
         String pkg = "prepay_id=" + prepayId;
-        String message = props.getAppid() + "\n" + ts + "\n" + nonce + "\n" + pkg + "\n";
+        String message = signAppid + "\n" + ts + "\n" + nonce + "\n" + pkg + "\n";
         String paySign = signWithMerchantPrivateKey(message);
+        log.info("[gz-pay] buildPayParams prepay_id={} appid={}", prepayId, signAppid);
         return new JsapiPayParams(String.valueOf(ts), nonce, pkg, "RSA", paySign);
+    }
+
+    /**
+     * 校验下单上下文给的 appid 是真实可用的小程序 appid（real 通道专用）。
+     *
+     * <p>拦三类值：null / 空白（调用方忘了传）、{@code wxMOCK}（该小程序配的是 mock 通道，
+     * 却走了 real 收款）、建表 seed 占位值 {@code wx_placeholder_appid} / {@code wx_dev_placeholder}
+     * （配置没回补）。这三种情况若放行，表现是微信返「appid 不存在 / 与 mch_id 未绑定 / 验签失败」等
+     * 含糊错误，排查成本远高于此处直接报出根因。</p>
+     */
+    private String requireRealAppid(String appid, String scene) {
+        if (appid == null || appid.isBlank()
+            || WxMiniappProperties.MOCK_APPID.equalsIgnoreCase(appid)
+            || PayAppidResolver.isPlaceholderAppid(appid)) {
+            throw new ServiceException("微信支付[" + scene + "]拿到的 appid 不可用（值=" + appid
+                + "）。real 通道要求下单上下文给出真实小程序 appid：请检查 gz_pay_channel.appid（按 clientid 一行）"
+                + " 或 wx.miniapp.apps.<clientid>.appid 是否已回补（ADR-0019 §3）");
+        }
+        return appid;
     }
 
     @Override

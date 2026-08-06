@@ -1,6 +1,7 @@
 package org.dromara.gz.common.wechat.impl;
 
 import org.dromara.common.core.exception.ServiceException;
+import org.dromara.gz.common.wechat.WxAppResolver;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
 import org.dromara.gz.common.wechat.WxMiniappProperties;
 import org.junit.jupiter.api.DisplayName;
@@ -27,7 +28,8 @@ import static org.junit.jupiter.api.Assertions.*;
 class WxMockLoginAdapterTest {
 
     /** 默认 props（mockStableOpenid 空）→ 沿用 code 派生口径，下方既有断言不变。 */
-    private final WxMockLoginAdapter adapter = new WxMockLoginAdapter(new WxMiniappProperties());
+    private final WxMockLoginAdapter adapter =
+        new WxMockLoginAdapter(new WxAppResolver(new WxMiniappProperties()));
 
     @Test
     @DisplayName("AC 3: 标准 code → 派生 mock-{前8位} / mock-union-{前8位} / mock-session-{全 code}")
@@ -76,7 +78,7 @@ class WxMockLoginAdapterTest {
     void code2Session_stableOpenid_ignoresCode() {
         WxMiniappProperties stableProps = new WxMiniappProperties();
         stableProps.setMockStableOpenid("dev-tester");
-        WxMockLoginAdapter stableAdapter = new WxMockLoginAdapter(stableProps);
+        WxMockLoginAdapter stableAdapter = new WxMockLoginAdapter(new WxAppResolver(stableProps));
 
         WxJscode2SessionResult r1 = stableAdapter.code2Session("code-AAAA1111");
         WxJscode2SessionResult r2 = stableAdapter.code2Session("code-BBBB2222");

@@ -9,6 +9,7 @@ import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
 import org.dromara.gz.common.pay.domain.vo.MpPayParamsVO;
 import org.dromara.gz.common.pay.enums.PayStatus;
 import org.dromara.gz.common.pay.mapper.GzPayCallbackLogMapper;
+import org.dromara.gz.common.pay.mapper.GzPayChannelMapper;
 import org.dromara.gz.common.pay.mapper.GzPayTransactionMapper;
 import org.dromara.gz.common.pay.service.IGzPayTransactionService.ExpireResult;
 import org.dromara.gz.common.pay.service.impl.GzPayTransactionServiceImpl;
@@ -16,9 +17,12 @@ import org.dromara.gz.common.pay.service.internal.IWechatPayClient;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.CallbackResult;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.JsapiPayParams;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.NotifyContext;
+import org.dromara.gz.common.pay.service.internal.PayAppidResolver;
 import org.dromara.gz.common.pay.service.internal.PayOrderNoGenerator;
 import org.dromara.gz.common.pay.service.internal.WechatPayVerifyException;
 import org.dromara.gz.common.pay.service.spi.PayCallbackDispatcher;
+import org.dromara.gz.common.wechat.WxAppResolver;
+import org.dromara.gz.common.wechat.WxMiniappProperties;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -94,8 +98,12 @@ class GzPayTransactionServiceImplTest {
         @SuppressWarnings("unchecked")
         ObjectProvider<PayCallbackDispatcher> callbackDispatcherProvider = mock(ObjectProvider.class);
         lenient().when(callbackDispatcherProvider.getObject()).thenReturn(callbackDispatcher);
+        // appid 解析器（GZ-SYS-022）：单值 wx.miniapp 形态 + 无 gz_pay_channel 行 → 解析出 wxMOCK，
+        // 与本测试类关注的链路无关，取真实实现避免 mock 掉反而漏掉「解析结果被传下去」这件事。
+        PayAppidResolver appidResolver = new PayAppidResolver(
+            new WxAppResolver(new WxMiniappProperties()), mock(GzPayChannelMapper.class), payProperties);
         service = new GzPayTransactionServiceImpl(
-            transactionMapper, callbackLogMapper, orderNoGenerator, wechatPayClient, payProperties, shippingService, callbackDispatcherProvider);
+            transactionMapper, callbackLogMapper, orderNoGenerator, wechatPayClient, payProperties, shippingService, callbackDispatcherProvider, appidResolver);
     }
 
     // ============================================================
@@ -118,7 +126,7 @@ class GzPayTransactionServiceImplTest {
         }).when(transactionMapper).insert(any(GzPayTransaction.class));
         when(wechatPayClient.createJsapiOrder(any())).thenReturn("mock_prepay_TEST-20260604-000001");
         when(transactionMapper.markPending(eq(1001L), anyString())).thenReturn(1);
-        when(wechatPayClient.buildPayParams(anyString()))
+        when(wechatPayClient.buildPayParams(anyString(), anyString()))
             .thenReturn(new JsapiPayParams("1717480000", "noncestr", "prepay_id=mock_prepay_x", "RSA", "paysign_x"));
 
         MpPayParamsVO vo = service.createTestOrder(bo, 1L);
@@ -332,7 +340,7 @@ class GzPayTransactionServiceImplTest {
         }).when(transactionMapper).insert(insertCap.capture());
         when(wechatPayClient.createJsapiOrder(any())).thenReturn("mock_prepay_PREORD-20260604-000001");
         when(transactionMapper.markPending(eq(3001L), anyString())).thenReturn(1);
-        when(wechatPayClient.buildPayParams(anyString()))
+        when(wechatPayClient.buildPayParams(anyString(), anyString()))
             .thenReturn(new JsapiPayParams("1717480000", "noncestr", "prepay_id=mock_prepay_x", "RSA", "paysign_x"));
 
         MpPayParamsVO vo = service.createBusinessOrder(bo);
@@ -378,7 +386,7 @@ class GzPayTransactionServiceImplTest {
             .when(transactionMapper).insert(any(GzPayTransaction.class));
         when(wechatPayClient.createJsapiOrder(any())).thenReturn("mock_prepay_x");
         when(transactionMapper.markPending(eq(3009L), anyString())).thenReturn(1);
-        when(wechatPayClient.buildPayParams(anyString()))
+        when(wechatPayClient.buildPayParams(anyString(), anyString()))
             .thenReturn(new JsapiPayParams("t", "n", "prepay_id=x", "RSA", "sign_x"));
 
         MpPayParamsVO vo = service.createBusinessOrder(bo);

@@ -3,12 +3,16 @@ package org.dromara.gz.common.config;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.dromara.gz.common.wechat.WxMiniappProperties;
+import org.dromara.gz.common.wechat.WxMiniappProperties.MiniappApp;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
 import org.springframework.core.env.Environment;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -16,10 +20,14 @@ import java.util.Set;
  *
  * <p><b>背景</b>：{@code application-prod.yml} 把 {@code wx.miniapp.appid} 默认成 {@code wxMOCK}、
  * {@code gz.bean.qr.signing-secret} 默认成 {@code CHANGE_ME_BEFORE_PROD_DEPLOY}。若运维漏注入对应
- * env var（合同明确正式 AppID 待甲方 = 高风险窗口），后端会<b>静默</b>启用 mock 登录适配器
- * （{@code WxMockLoginAdapter} {@code matchIfMissing=true}）—— 任意 code 即拿稳定 mock openid + token，
- * 鉴权完全失效；核销码 HMAC 用占位密钥可被伪造。与「mock 支付是已知外部 gate」不同，这是<b>鉴权静默降级</b>，
- * 无显式提示。</p>
+ * env var（合同明确正式 AppID 待甲方 = 高风险窗口），后端会<b>静默</b>走 mock 登录通道 —— 任意 code
+ * 即拿稳定 mock openid + token，鉴权完全失效；核销码 HMAC 用占位密钥可被伪造。与「mock 支付是已知外部
+ * gate」不同，这是<b>鉴权静默降级</b>，无显式提示。</p>
+ *
+ * <p><b>多小程序后（ADR-0019 §1）</b>：appid 校验对象从「一个全局标量」变成
+ * {@link WxMiniappProperties#resolveApps()} 的<b>每一个</b>小程序 —— 单值配置形态解析出来就是
+ * 一个元素，行为与改造前完全一致；Map 形态下任何一个小程序漏配 appid 都会拒绝启动
+ * （否则那个小程序在 prod 静默走 mock，正是本守卫要防的场景）。</p>
  *
  * <p><b>对策</b>：prod profile 启动时校验上述敏感项是否仍为占位值，是则<b>拒绝启动</b>
  * （照 {@code WechatPayV3ClientImpl} real 模式 fail-fast 范式）。dev / 测试 profile 不受影响
@@ -39,14 +47,15 @@ public class ProdSecretGuard {
         "CHANGE_ME_BEFORE_PROD_DEPLOY", "dev-sensenran-guzi-qr-secret-2026");
 
     private final Environment environment;
+    private final WxMiniappProperties miniappProperties;
 
     @PostConstruct
     public void check() {
-        String appid = environment.getProperty("wx.miniapp.appid");
         String qrSecret = environment.getProperty("gz.bean.qr.signing-secret");
         String payClientMode = environment.getProperty("gz.pay.client-mode");
-        validate(appid, qrSecret, payClientMode);
-        log.info("[gz-prod-guard] 生产敏感配置校验通过（appid / qr-secret / pay client-mode 已注入正式值）");
+        validateApps(miniappProperties.resolveApps(), qrSecret, payClientMode);
+        log.info("[gz-prod-guard] 生产敏感配置校验通过（{} 个小程序 appid / qr-secret / pay client-mode 已注入正式值）",
+            miniappProperties.resolveApps().size());
     }
 
     /**
@@ -57,13 +66,33 @@ public class ProdSecretGuard {
     }
 
     /**
+     * 单小程序校验（单值配置形态 / 单测入口）。
+     */
+    static void validate(String appid, String qrSecret, String payClientMode) {
+        MiniappApp app = new MiniappApp();
+        app.setAppid(appid);
+        Map<String, MiniappApp> apps = new LinkedHashMap<>(1);
+        apps.put("mp-applet-sensenran-guzi", app);
+        validateApps(apps, qrSecret, payClientMode);
+    }
+
+    /**
      * 校验 prod 敏感项；任一仍为占位/不安全值则抛 {@link IllegalStateException}（一次列全所有漏配项）。
      * 抽成静态方法便于单测（不启 Spring context）。
      */
-    static void validate(String appid, String qrSecret, String payClientMode) {
+    static void validateApps(Map<String, MiniappApp> apps, String qrSecret, String payClientMode) {
         List<String> missing = new ArrayList<>();
-        if (appid == null || appid.isBlank() || APPID_PLACEHOLDERS.contains(appid)) {
-            missing.add("wx.miniapp.appid（env WX_MA_APPID）仍为占位/空 [" + appid + "] → mock 登录会静默生效，鉴权失效");
+        if (apps == null || apps.isEmpty()) {
+            missing.add("wx.miniapp 未配置任何小程序 → 所有 mp 登录都会失败");
+        } else {
+            apps.forEach((clientId, app) -> {
+                String appid = app.getAppid();
+                if (appid == null || appid.isBlank() || APPID_PLACEHOLDERS.contains(appid)) {
+                    missing.add("小程序 [" + clientId + "] 的 appid 仍为占位/空 [" + appid
+                        + "]（配置项 wx.miniapp.apps." + clientId + ".appid 或单值 wx.miniapp.appid，env WX_MA_APPID）"
+                        + " → 该小程序会静默走 mock 登录，鉴权失效");
+                }
+            });
         }
         if (qrSecret == null || qrSecret.isBlank() || QR_SECRET_PLACEHOLDERS.contains(qrSecret)) {
             missing.add("gz.bean.qr.signing-secret（env GZ_BEAN_QR_SECRET）仍为占位/空 → 核销码 HMAC 可被伪造");

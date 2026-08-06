@@ -8,16 +8,21 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.exception.ServiceException;
 import org.dromara.gz.common.wechat.WxAccessTokenManager;
-import org.dromara.gz.common.wechat.WxMiniappProperties;
+import org.dromara.gz.common.wechat.WxAdapterDispatcher;
+import org.dromara.gz.common.wechat.WxAppResolver;
 import org.dromara.gz.common.wechat.WxPhoneAdapter;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.stereotype.Component;
 
 /**
  * 微信手机号 real 通道实现（getuserphonenumber）。
  *
- * <p>启用条件：{@code wx.miniapp.appid} 为非 wxMOCK 真实 AppID（与 {@link WxRealLoginAdapter} 同款
- * {@code @ConditionalOnExpression}，两通道互斥）。</p>
+ * <p><b>装配</b>（ADR-0019 §1）：无条件注册，与 {@link WxMockPhoneAdapter} 同时在容器里，由
+ * {@link WxAdapterDispatcher} 按当前请求 clientid 对应小程序的 mode 运行时选择。</p>
+ *
+ * <p><b>依赖具体的 {@link WxRealAccessTokenManager} 而非 {@link WxAccessTokenManager} 接口</b>：
+ * 接口的 {@code @Primary} 实现是 dispatcher，注入它会构成 dispatcher → 本类 → dispatcher 的构造器
+ * 循环依赖（Spring Boot 3 默认禁止，启动即失败）。语义上也更准 —— real 通道只在当前 app 是 real 时
+ * 被选中，它要的就是 real token 管理器。</p>
  *
  * <p>调用链（doc/10 §3.N6 手机号强收集）：</p>
  * <pre>
@@ -36,7 +41,6 @@ import org.springframework.stereotype.Component;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-@ConditionalOnExpression("'${wx.miniapp.appid:wxMOCK}' != 'wxMOCK'")
 public class WxRealPhoneAdapter implements WxPhoneAdapter {
 
     /** 手机号获取接口。 */
@@ -48,13 +52,13 @@ public class WxRealPhoneAdapter implements WxPhoneAdapter {
     /** dev 本地回落固定测试号（与 {@link WxMockPhoneAdapter} 一致）。 */
     private static final String DEV_MOCK_PHONE = "13800000000";
 
-    private final WxAccessTokenManager accessTokenManager;
-    private final WxMiniappProperties miniappProperties;
+    private final WxRealAccessTokenManager accessTokenManager;
+    private final WxAppResolver appResolver;
 
     @Override
     public String code2Phone(String code) {
         // dev 本地回落：真 appid 下也跳过微信换号，返默认测试号（仅 application-dev.yml 置 true）。
-        if (miniappProperties.isMockPhoneFallback()) {
+        if (appResolver.currentApp().isMockPhoneFallbackEnabled()) {
             log.info("[wx-phone] dev mock-phone-fallback 开启 → 返默认测试号 {}（绕过 getuserphonenumber，code={}）",
                 DEV_MOCK_PHONE, code);
             return DEV_MOCK_PHONE;

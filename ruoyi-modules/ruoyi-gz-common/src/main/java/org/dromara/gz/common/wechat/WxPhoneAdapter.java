@@ -7,10 +7,15 @@ package org.dromara.gz.common.wechat;
  * 非明文手机号），后端用本接口把 code 换成明文手机号。两条通道与 {@link WxLoginAdapter} 同款对偶：</p>
  * <ul>
  *   <li><b>Mock 通道</b>：{@link org.dromara.gz.common.wechat.impl.WxMockPhoneAdapter} —
- *       {@code wx.miniapp.appid=wxMOCK} 时加载，忽略 code 直接返固定测试号。</li>
+ *       忽略 code 直接返固定测试号。</li>
  *   <li><b>Real 通道</b>：{@link org.dromara.gz.common.wechat.impl.WxRealPhoneAdapter} —
- *       真实 AppID 时加载，用 access_token 调微信 {@code getuserphonenumber} 换明文。</li>
+ *       用该小程序的 access_token 调微信 {@code getuserphonenumber} 换明文。</li>
  * </ul>
+ *
+ * <p><b>选哪条通道是运行时决定的</b>（ADR-0019 §1）：两个实现都注册为 Bean，由
+ * {@link WxAdapterDispatcher}（{@code @Primary} 门面）按当前请求 clientid 对应小程序的 mode 选择。
+ * 本能力<b>只可能被小程序调用</b>（控制器挂 {@code /app/**}），故走
+ * {@link WxAppResolver#currentApp()} 严格口径 —— 未登记的 clientid 直接抛错。</p>
  *
  * <p>关联文档：doc/10 §1.N8 + §3.N6 手机号强收集 / GZ-BEAN-004 任务卡</p>
  *

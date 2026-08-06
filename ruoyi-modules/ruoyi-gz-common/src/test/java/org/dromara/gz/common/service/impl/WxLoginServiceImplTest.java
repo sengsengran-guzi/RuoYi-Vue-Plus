@@ -9,14 +9,17 @@ import org.dromara.gz.common.domain.vo.WxLoginVO;
 import org.dromara.gz.common.service.IGzUserService;
 import org.dromara.gz.common.service.IMpStaffPermissionService;
 import org.dromara.gz.common.wechat.SessionKeyStore;
+import org.dromara.gz.common.wechat.WxAppResolver;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
 import org.dromara.gz.common.wechat.WxLoginAdapter;
 import org.dromara.gz.common.wechat.WxMiniappProperties;
+import org.dromara.gz.common.wechat.WxMiniappProperties.MiniappApp;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
@@ -67,7 +70,8 @@ class WxLoginServiceImplTest {
     void setUp() {
         properties = new WxMiniappProperties();
         wxLoginService = new WxLoginServiceImpl(
-            wxLoginAdapter, properties, gzUserService, sessionKeyStore, mpStaffPermissionService);
+            wxLoginAdapter, properties, new WxAppResolver(properties),
+            gzUserService, sessionKeyStore, mpStaffPermissionService);
     }
 
     @Test
@@ -93,8 +97,8 @@ class WxLoginServiceImplTest {
             .isDisabled(0)
             .build();
         fresh.setTenantId("1001");
-        when(gzUserService.upsertByOpenid(eq(mockSession), eq("测试用户"), eq("https://example.com/avatar.png")))
-            .thenReturn(fresh);
+        when(gzUserService.upsertByOpenid(eq(mockSession), eq("测试用户"), eq("https://example.com/avatar.png"),
+            any(MiniappApp.class))).thenReturn(fresh);
         // 新用户为纯顾客（未绑定店员）— issueToken 内 resolve 返回空载荷
         when(mpStaffPermissionService.resolve(any())).thenReturn(MpStaffPermission.customer());
 
@@ -116,7 +120,13 @@ class WxLoginServiceImplTest {
             assertEquals("测试用户", vo.getNickName());
             assertEquals("https://example.com/avatar.png", vo.getAvatarUrl());
 
-            verify(gzUserService).upsertByOpenid(eq(mockSession), eq("测试用户"), eq("https://example.com/avatar.png"));
+            // ★ GZ-SYS-023：UPSERT 必须带上本次登录所属小程序（不带 = 跨小程序串户）
+            ArgumentCaptor<MiniappApp> appCaptor = ArgumentCaptor.forClass(MiniappApp.class);
+            verify(gzUserService).upsertByOpenid(eq(mockSession), eq("测试用户"),
+                eq("https://example.com/avatar.png"), appCaptor.capture());
+            assertEquals(properties.getDefaultClientId(), appCaptor.getValue().getClientId(),
+                "无 clientid header（单测无请求上下文）应落默认小程序");
+            assertEquals(properties.resolveDefaultApp().getAppid(), appCaptor.getValue().getAppid());
             verify(sessionKeyStore).put("mock-abc12345", "mock-session-test-code");
         }
     }
@@ -142,7 +152,8 @@ class WxLoginServiceImplTest {
             .isDisabled(0)
             .build();
         existing.setTenantId("1001");
-        when(gzUserService.upsertByOpenid(eq(mockSession), anyString(), anyString())).thenReturn(existing);
+        when(gzUserService.upsertByOpenid(eq(mockSession), anyString(), anyString(), any(MiniappApp.class)))
+            .thenReturn(existing);
         when(mpStaffPermissionService.resolve(any())).thenReturn(MpStaffPermission.customer());
 
         WxLoginRequest req = new WxLoginRequest();
@@ -173,7 +184,7 @@ class WxLoginServiceImplTest {
         ServiceException ex = assertThrows(ServiceException.class, () -> wxLoginService.wxLogin(req));
         assertTrue(ex.getMessage().contains("微信登录失败"));
 
-        verify(gzUserService, never()).upsertByOpenid(any(), any(), any());
+        verify(gzUserService, never()).upsertByOpenid(any(), any(), any(), any());
         verify(sessionKeyStore, never()).put(anyString(), anyString());
     }
 
@@ -194,7 +205,8 @@ class WxLoginServiceImplTest {
             .isDisabled(1)
             .status("authorized")
             .build();
-        when(gzUserService.upsertByOpenid(eq(mockSession), any(), any())).thenReturn(disabledUser);
+        when(gzUserService.upsertByOpenid(eq(mockSession), any(), any(), any(MiniappApp.class)))
+            .thenReturn(disabledUser);
 
         WxLoginRequest req = new WxLoginRequest();
         req.setCode("disabled-code");

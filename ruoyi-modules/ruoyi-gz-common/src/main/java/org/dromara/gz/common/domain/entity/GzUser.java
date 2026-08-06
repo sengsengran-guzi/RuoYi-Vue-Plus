@@ -51,8 +51,20 @@ public class GzUser extends TenantEntity {
     /** 业务码 U{yyyyMMdd}{6 位序号} — UNIQUE(tenant_id, user_no) */
     private String userNo;
 
-    /** 微信小程序级 openid — UNIQUE(tenant_id, openid) */
+    /** 微信小程序级 openid — UNIQUE(tenant_id, app_id, openid)（GZ-SYS-023 起含 app_id 维度） */
     private String openid;
+
+    /**
+     * 所属小程序 appid（GZ-SYS-023 / ADR-0019 §4）。
+     *
+     * <p>openid 是 <b>appid 维度</b>的标识，微信只保证它在单个 appid 内唯一 —— 同一自然人在两个
+     * 小程序拿到的是两个不同 openid，且跨 appid 不保证不撞。因此唯一键是
+     * {@code (tenant_id, app_id, openid)}，同一自然人在两个小程序 = 两条独立记录、资产互不可见
+     * （一期不做 unionid 合并，理由见 ADR-0019「被否决的方案」；届时本列作为合并溯源依据保留）。</p>
+     *
+     * <p>登录路径由 {@code WxAppResolver.currentApp()} 按请求 clientid 解析后传入，不从全局标量取。</p>
+     */
+    private String appId;
 
     /** 微信 unionid（甲方未绑公众号/开放平台时为 null） */
     private String unionid;

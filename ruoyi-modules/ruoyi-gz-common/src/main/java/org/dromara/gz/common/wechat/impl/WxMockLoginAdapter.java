@@ -4,17 +4,17 @@ import cn.hutool.core.util.StrUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.exception.ServiceException;
+import org.dromara.gz.common.wechat.WxAdapterDispatcher;
+import org.dromara.gz.common.wechat.WxAppResolver;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
 import org.dromara.gz.common.wechat.WxLoginAdapter;
-import org.dromara.gz.common.wechat.WxMiniappProperties;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 /**
  * 微信登录 mock 通道实现。
  *
- * <p>启用条件：{@code wx.miniapp.appid=wxMOCK}（含默认值场景；任务卡 AC 3 + D2）。
- * 用 {@code @ConditionalOnProperty.matchIfMissing=true} 保证 AppID 未配时也能默认走 mock。</p>
+ * <p><b>装配</b>（ADR-0019 §1）：无条件注册；某个小程序的 {@code appid} 为空或 {@code wxMOCK} 时
+ * 由 {@link WxAdapterDispatcher} 在运行时选中本实现 —— 新小程序走 mock 不再拖累现小程序的 real 通道。</p>
  *
  * <p>Mock 规则（契约 identical to real path）：</p>
  * <ul>
@@ -34,7 +34,6 @@ import org.springframework.stereotype.Component;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-@ConditionalOnProperty(prefix = "wx.miniapp", name = "appid", havingValue = "wxMOCK", matchIfMissing = true)
 public class WxMockLoginAdapter implements WxLoginAdapter {
 
     /** mock openid 前缀（便于日志快速识别）。 */
@@ -49,7 +48,7 @@ public class WxMockLoginAdapter implements WxLoginAdapter {
     /** code 取前 N 位用于派生 openid（足够区分，且短便于日志）。 */
     private static final int CODE_PREFIX_LEN = 8;
 
-    private final WxMiniappProperties miniappProperties;
+    private final WxAppResolver appResolver;
 
     @Override
     public WxJscode2SessionResult code2Session(String code) {
@@ -57,7 +56,8 @@ public class WxMockLoginAdapter implements WxLoginAdapter {
             throw new ServiceException("微信登录 code 不能为空");
         }
         // dev 稳定 mock 用户：配了 mock-stable-openid 则忽略 code，恒返固定 openid（让本地换 code/续期仍是同一人）。
-        String stable = miniappProperties.getMockStableOpenid();
+        // 按小程序取（各 app 可各配一个，否则两个小程序的 mock 用户 openid 相同、看起来像同一人）。
+        String stable = appResolver.currentApp().getMockStableOpenid();
         String prefix = StrUtil.isNotBlank(stable)
             ? stable.trim()
             : (code.length() > CODE_PREFIX_LEN ? code.substring(0, CODE_PREFIX_LEN) : code);

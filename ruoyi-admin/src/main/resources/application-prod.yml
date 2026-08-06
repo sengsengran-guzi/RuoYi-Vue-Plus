@@ -270,9 +270,18 @@ justauth:
       client-secret: 1f7d08**********5b7**********29e
       redirect-uri: ${justauth.address}/social-callback?source=gitea
 
---- # 微信小程序登录配置（GZ-SYS-002）— prod 由 env var 注入真实 AppID/Secret
+--- # 微信小程序登录配置（GZ-SYS-002 / 多小程序 ADR-0019 §1）— prod 由 env var 注入真实 AppID/Secret
 wx:
   miniapp:
+    # 单值形态：等价于 apps: { mp-applet-sensenran-guzi: {appid, secret} }（default-client-id 默认即它）。
+    # 拼团小程序（clientid=mp-applet-gz-jp）拿到 appid/secret 后改成下面的 apps 形态再上线：
+    #   apps:
+    #     mp-applet-sensenran-guzi: { appid: "${WX_MA_APPID:wx2f8b93e09703f07d}", secret: "${WX_MA_SECRET:}" }
+    #     mp-applet-gz-jp:          { appid: "${WX_JP_MA_APPID:}",                secret: "${WX_JP_MA_SECRET:}",
+    #                                 register-source: mp_wechat_jp }
+    # 注意：未登记的 clientid 一律拒绝（不静默用另一个小程序的凭证），所以拼团 mp 上线前必须先补这里。
+    # register-source（GZ-SYS-023）写进 gz_user.register_source，新小程序必须配自己的值，否则 admin
+    # 分不清用户来自哪个小程序；不配 → 继承全局默认 mp_wechat（= 现小程序取值，单值形态天然如此）。
     appid: ${WX_MA_APPID:wx2f8b93e09703f07d}   # 谷子宇宙小程序 AppID（非机密，已绑商户 1731037015）；env var 可覆盖
     secret: ${WX_MA_SECRET:}
     session-key-ttl-seconds: ${WX_MA_SESSION_KEY_TTL:86400}
@@ -287,7 +296,15 @@ gz:
   # 微信支付通道（GZ-PAY-001）— 商户 1731037015 为「微信支付公钥」模式（RSAPublicKeyConfig）。
   # 非机密（appid / mch-id / serial / public-key-id）可入 git；机密（api-v3-key / 私钥）只走 env var，空缺时 real fail-fast（强约束 #4）。
   pay:
+    # 【进程级全局】mock/real 开关，与 wx.miniapp 的按小程序 appid 正交（ADR-0019 §5）——
+    # 同一环境两个小程序的收款模式必然相同，刻意不做成按小程序。
     client-mode: ${WECHAT_PAY_CLIENT_MODE:mock}
+    # ⚠️ 统一下单 + 调起签名的 appid 已【不再读这里】（ADR-0019 §3 / GZ-SYS-022）。解析顺序：
+    #   ① gz_pay_channel.appid（按 client_id 一行，需要「收款 appid ≠ 登录 appid」时才配）
+    #   ② wx.miniapp.apps.<clientid>.appid ← 默认走这条（payer.openid 就是它签发的，同源）
+    #   ③ 本值（兜底，保证历史配置形态行为不劣化）
+    # 拼团小程序上线 = 补 wx.miniapp（见上面 wx.miniapp 段注释）即可，本段无需再加一份 appid。
+    # 商户号（mch-id）两个小程序共用，不变。
     appid: ${WECHAT_PAY_APPID:wx2f8b93e09703f07d}
     mch-id: ${WECHAT_PAY_MCH_ID:1731037015}   # 成都谷子宇宙贸易有限公司 · 谷子宇宙
     api-v3-key: ${WECHAT_PAY_API_V3_KEY:}

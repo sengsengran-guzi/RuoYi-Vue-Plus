@@ -7,10 +7,11 @@ import cn.hutool.json.JSONUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.exception.ServiceException;
+import org.dromara.gz.common.wechat.WxAdapterDispatcher;
+import org.dromara.gz.common.wechat.WxAppResolver;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
 import org.dromara.gz.common.wechat.WxLoginAdapter;
-import org.dromara.gz.common.wechat.WxMiniappProperties;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
+import org.dromara.gz.common.wechat.WxMiniappProperties.MiniappApp;
 import org.springframework.stereotype.Component;
 
 import java.util.HashMap;
@@ -19,17 +20,12 @@ import java.util.Map;
 /**
  * 微信登录 real 通道实现（jscode2session）。
  *
- * <p>启用条件：{@code wx.miniapp.appid} 配置了非 wxMOCK 的真实 AppID。
- * 用 SpEL 表达「非空且 != wxMOCK」— Spring Boot 原生 {@code @ConditionalOnProperty} 不支持 NOT 语义，
- * 因此 mock / real 两 adapter 用对偶写法：</p>
- * <ul>
- *   <li>Mock adapter：{@code @ConditionalOnProperty(name="wx.miniapp.appid", havingValue="wxMOCK", matchIfMissing=true)}
- *       — 值=wxMOCK 或 缺省 时启用</li>
- *   <li>Real adapter：{@code @ConditionalOnExpression("'${wx.miniapp.appid:wxMOCK}' != 'wxMOCK'")}
- *       — 值显式配置且 != wxMOCK 时启用</li>
- * </ul>
+ * <p><b>装配</b>（ADR-0019 §1）：无条件注册。real / mock 不再由启动期条件 Bean 全局互斥 —— 本类与
+ * {@link WxMockLoginAdapter} 同时在容器里，由 {@link WxAdapterDispatcher} 按当前请求 clientid 对应的
+ * 小程序 mode 运行时选择。业务层注入的是 {@code @Primary} 的 dispatcher 门面，零感知。</p>
  *
- * <p>两条件互斥，启动期只会注入一个 {@link WxLoginAdapter} Bean，业务层零感知。</p>
+ * <p><b>凭证按小程序取</b>：appid / secret 来自 {@link WxAppResolver#currentApp()}，不再读全局标量 ——
+ * 两个小程序各用各的 secret 调 jscode2session（用错 appid 微信直接返 {@code invalid code}）。</p>
  *
  * <p>调用微信开放接口：</p>
  * <pre>
@@ -48,7 +44,6 @@ import java.util.Map;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-@ConditionalOnExpression("'${wx.miniapp.appid:wxMOCK}' != 'wxMOCK'")
 public class WxRealLoginAdapter implements WxLoginAdapter {
 
     /** 微信 jscode2session 接口 URL。 */
@@ -57,16 +52,17 @@ public class WxRealLoginAdapter implements WxLoginAdapter {
     /** HTTP 超时（毫秒）。 */
     private static final int HTTP_TIMEOUT_MS = 5000;
 
-    private final WxMiniappProperties properties;
+    private final WxAppResolver appResolver;
 
     @Override
     public WxJscode2SessionResult code2Session(String code) {
         if (StrUtil.isBlank(code)) {
             throw new ServiceException("微信登录 code 不能为空");
         }
+        MiniappApp app = appResolver.currentApp();
         Map<String, Object> params = new HashMap<>(4);
-        params.put("appid", properties.getAppid());
-        params.put("secret", properties.getSecret());
+        params.put("appid", app.getAppid());
+        params.put("secret", app.getSecret());
         params.put("js_code", code);
         params.put("grant_type", "authorization_code");
 
@@ -87,7 +83,9 @@ public class WxRealLoginAdapter implements WxLoginAdapter {
         Integer errcode = json.getInt("errcode");
         if (errcode != null && errcode != 0) {
             String errmsg = json.getStr("errmsg");
-            log.warn("[wx-real] jscode2session errcode={} errmsg={}", errcode, errmsg);
+            // 带上 appid：多小程序下「用错 appid/secret」的表现就是 invalid code，不打 appid 无从分辨是哪个小程序
+            log.warn("[wx-real] jscode2session errcode={} errmsg={} clientid={} appid={}",
+                errcode, errmsg, app.getClientId(), app.getAppid());
             throw new ServiceException("微信登录失败: " + errmsg);
         }
 
