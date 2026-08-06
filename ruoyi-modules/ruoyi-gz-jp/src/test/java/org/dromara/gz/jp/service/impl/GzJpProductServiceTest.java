@@ -8,6 +8,7 @@ import org.apache.ibatis.builder.MapperBuilderAssistant;
 import org.dromara.common.core.exception.ServiceException;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
+import org.dromara.gz.common.service.IGzFileService;
 import org.dromara.gz.jp.domain.bo.GzJpProductBo;
 import org.dromara.gz.jp.domain.bo.GzJpProductQueryBo;
 import org.dromara.gz.jp.domain.bo.GzJpProductStatusBo;
@@ -83,6 +84,10 @@ class GzJpProductServiceTest {
     @Mock
     private IGzJpEventService eventService;
 
+    /** GZ-JP-103 起构造器多一个文件服务（mp 侧换预签名 URL 用），admin 写路径不碰它。 */
+    @Mock
+    private IGzFileService fileService;
+
     private GzJpProductServiceImpl service;
 
     /**
@@ -100,7 +105,7 @@ class GzJpProductServiceTest {
 
     @BeforeEach
     void setUp() {
-        service = new GzJpProductServiceImpl(baseMapper, eventService);
+        service = new GzJpProductServiceImpl(baseMapper, eventService, fileService);
         // 默认：场存在且进行中
         stubEvent("open");
     }

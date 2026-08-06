@@ -6,16 +6,17 @@ import org.dromara.gz.jp.domain.bo.GzJpProductBo;
 import org.dromara.gz.jp.domain.bo.GzJpProductQueryBo;
 import org.dromara.gz.jp.domain.bo.GzJpProductStatusBo;
 import org.dromara.gz.jp.domain.vo.GzJpProductAdminVO;
+import org.dromara.gz.jp.domain.vo.GzJpProductMpVO;
 
 import java.util.List;
 
 /**
- * 拼团商品服务（GZ-JP-102，FLOW:F-JP-01.step2「店员在场内逐个上架商品」）。
+ * 拼团商品服务（GZ-JP-102 admin 写侧 + GZ-JP-103 mp 读侧，FLOW:F-JP-01.step2 / F-JP-02.step1）。
  *
- * <p>本 ticket 只覆盖 <b>admin 侧</b>（UI:admin.product）；mp 只读查询接口在 GZ-JP-103 补
- * （{@code /app/gz/jp/product/*}），届时复用本模块的实体 / 枚举 / mapper，另建 mp VO。</p>
+ * <p>admin 侧（UI:admin.product）与 mp 侧（{@code /app/gz/jp/product/*}）共用同一份实体 / 枚举 / mapper，
+ * 但<b>各自的 VO 不复用</b> —— mp 不下发 remark / version / sortNo 等运营字段，且图片给 URL 不给 file id。</p>
  *
- * @author kevin-coder (sensenran-guzi · GZ-JP-102)
+ * @author kevin-coder (sensenran-guzi · GZ-JP-102 / GZ-JP-103)
  */
 public interface IGzJpProductService {
 
@@ -72,4 +73,35 @@ public interface IGzJpProductService {
      * @return 是否成功
      */
     boolean deleteByIds(List<Long> ids);
+
+    // ============================================================
+    //  mp（GZ-JP-103，FLOW:F-JP-02.step1「进场看商品」）
+    // ============================================================
+
+    /**
+     * 场内商品分页（UI:mp.event_detail 两列网格，上拉加载）。
+     *
+     * <p><b>★ 可见性两层，缺一即漏</b>：{@code 商品 status = on_shelf} <b>且</b>
+     * {@code 所属场生效状态 = open}（{@link IGzJpEventService#isBookable}，读时惰性判定 end_time）。
+     * 只判商品 status 会把「未开场 / 已结束的场里的 on_shelf 商品」漏给客人
+     * —— FLOW:F-JP-01.step2 明确「未开场时仍不可见」。</p>
+     *
+     * <p>场不可下单时返回<b>空页</b>（rows=[] / total=0）而非报错：mp 进场前已先打
+     * {@code GET /app/gz/jp/event/{id}} 拿到「该场已结束」的明确信号，此处只做兜底不抢话。</p>
+     *
+     * @param eventId   场主键（必传）
+     * @param pageQuery 分页参数
+     * @return 分页结果（按 sort_no 升序，同序号按上架先后）
+     */
+    TableDataInfo<GzJpProductMpVO> selectMpPage(Long eventId, PageQuery pageQuery);
+
+    /**
+     * 商品详情（UI:mp.product_detail，含 ★ noticeText 风险告知位）。
+     *
+     * <p>可见性判定与 {@link #selectMpPage} 完全同口径（两层）。</p>
+     *
+     * @param id 商品主键
+     * @return VO；商品不存在 / 已下架 / 所属场不可下单一律返回 null（由 controller 转 R.fail）
+     */
+    GzJpProductMpVO selectMpDetail(Long id);
 }
