@@ -66,10 +66,27 @@ public interface GzJpOrderItemMapper extends BaseMapperPlus<GzJpOrderItem, GzJpO
      * <p>这里<b>不</b>过滤付款状态：不存在与「未支付」要给出不同的提示，
      * 所以先整批捞回来，由服务层逐行判定并给出逐行原因。</p>
      *
+     * <p><b>★★ {@code FORCE INDEX(PRIMARY)} 不是性能优化，是防死锁的必需品</b>
+     * （GZ-JP-107 真并发压测实测逮到，6 并发 3 个 500）：</p>
+     * <ul>
+     *   <li>多租户拦截器会给本句追加 {@code AND tenant_id = '1001'}，而
+     *       {@code idx_user_fulfill (tenant_id, user_id, fulfill_status)} 正好以 tenant_id 打头 ——
+     *       优化器<b>会挑走这条二级索引</b>（实测 {@code key: idx_user_fulfill, rows: 24}），
+     *       {@code ORDER BY id} 退化成 {@code Using filesort}（<b>排序发生在取完锁之后</b>，管不到加锁顺序）。</li>
+     *   <li>走二级索引时 InnoDB 按 <b>{@code (tenant_id, user_id, fulfill_status, id)}</b> 的顺序加锁，
+     *       而 {@code fulfill_status} <b>恰恰是本批操作正在改的那一列</b> ——
+     *       并发请求看到的索引位次互不相同，加锁顺序就此错开，构成死锁环。
+     *       服务层「id 去重 + 升序」的防死锁纪律<b>被执行计划架空了</b>。</li>
+     *   <li>还有个副作用：二级索引的加锁读会连<b>不在 id 列表里的行</b>一起锁
+     *       （实测锁到了 item 1 / 2 / 9011 这些无关行），凭空扩大冲突面。</li>
+     * </ul>
+     * <p>钉死主键后 {@code key: PRIMARY, rows: 10}，只锁目标行、且严格按 id 升序 ——
+     * 与调用方的排序纪律对齐，环消失。<b>任何时候都不要摘掉这个 hint</b>。</p>
+     *
      * @param ids 已去重升序的行主键
      * @return 锁定的行（不含已软删）；ids 里不存在的 id 不会出现在结果里
      */
-    @Select("<script>SELECT * FROM gz_jp_order_item WHERE del_flag = '0' AND id IN "
+    @Select("<script>SELECT * FROM gz_jp_order_item FORCE INDEX(PRIMARY) WHERE del_flag = '0' AND id IN "
         + "<foreach collection='ids' item='id' open='(' separator=',' close=')'>#{id}</foreach> "
         + "ORDER BY id FOR UPDATE</script>")
     List<GzJpOrderItem> selectByIdsForUpdate(@Param("ids") Collection<Long> ids);
@@ -98,7 +115,7 @@ public interface GzJpOrderItemMapper extends BaseMapperPlus<GzJpOrderItem, GzJpO
      * @param updateBy   操作人 sys_user.id（自定义 SQL 不走公共字段自动填充）
      * @return 实际改动行数
      */
-    @Update("<script>UPDATE gz_jp_order_item SET fulfill_status = #{target}, version = version + 1, "
+    @Update("<script>UPDATE gz_jp_order_item FORCE INDEX(PRIMARY) SET fulfill_status = #{target}, version = version + 1, "
         + "update_time = NOW(), update_by = #{updateBy} "
         + "WHERE del_flag = '0' AND fulfill_status = #{expectFrom} AND id IN "
         + "<foreach collection='ids' item='id' open='(' separator=',' close=')'>#{id}</foreach> "
@@ -124,7 +141,7 @@ public interface GzJpOrderItemMapper extends BaseMapperPlus<GzJpOrderItem, GzJpO
      * @param updateBy   操作人 sys_user.id
      * @return 实际改动行数
      */
-    @Update("<script>UPDATE gz_jp_order_item SET fulfill_status = 'delivered', carrier_code = #{carrier}, "
+    @Update("<script>UPDATE gz_jp_order_item FORCE INDEX(PRIMARY) SET fulfill_status = 'delivered', carrier_code = #{carrier}, "
         + "tracking_no = #{trackingNo}, shipped_at = #{shippedAt}, version = version + 1, "
         + "update_time = NOW(), update_by = #{updateBy} "
         + "WHERE del_flag = '0' AND fulfill_status = #{expectFrom} AND id IN "
@@ -194,6 +211,76 @@ public interface GzJpOrderItemMapper extends BaseMapperPlus<GzJpOrderItem, GzJpO
                                              @Param("userIds") Collection<Long> userIds,
                                              @Param("beginTime") LocalDateTime beginTime,
                                              @Param("endTime") LocalDateTime endTime);
+
+    // ================================================================
+    //  GZ-JP-107 行级退款 —— 行上的退款结果投影 + 订单 rollup 的两个计数
+    //  ★ 退款单本身在 gz_jp_refund；这三个方法只负责把结果落到行上 / 数给 rollup 用
+    // ================================================================
+
+    /**
+     * 把退款结果写到商品行上（{@code refund_status} + {@code refund_amount_cent}）。
+     *
+     * <p><b>为什么行上还要存一份</b>：mp 订单详情与履约看板都要显示「已退款 ¥xx」，
+     * 每次去 join {@code gz_jp_refund} 纯浪费 —— 行上这两列是<b>结果投影</b>，
+     * 退款单表才是过程与凭证（微信单号 / 失败原因 / 提交次数）。</p>
+     *
+     * <p><b>为什么<u>不</u>带状态守卫</b>（与本域其他 UPDATE 刻意不同）：调用它之前，
+     * {@code gz_jp_refund} 上那条带 {@code WHERE status='refunding'} 的守卫 UPDATE 已经决定了
+     * 「这次转移到底发生没发生」（affected=0 直接 return，根本走不到这里）。
+     * 那条守卫就是<b>唯一的串行化点</b>，这里再加一道只会在并发下互相挡掉、造成行与退款单不一致。</p>
+     *
+     * @param itemId           商品行 id
+     * @param refundStatus     refunding / refunded / refund_failed
+     * @param refundAmountCent 已退金额（分）；只有 refunded 时给值，其余传 null 保持原样为空
+     * @return 受影响行数
+     */
+    @Update("UPDATE gz_jp_order_item SET refund_status = #{refundStatus}, "
+        + "refund_amount_cent = #{refundAmountCent}, version = version + 1, update_time = NOW() "
+        + "WHERE id = #{itemId} AND del_flag = '0'")
+    int writeRefundResult(@Param("itemId") Long itemId,
+                          @Param("refundStatus") String refundStatus,
+                          @Param("refundAmountCent") Long refundAmountCent);
+
+    /**
+     * 订单下的商品行总数（rollup 的分母）。
+     *
+     * @param orderId 订单 id
+     * @return 未软删的行数
+     */
+    @Select("SELECT COUNT(*) FROM gz_jp_order_item WHERE order_id = #{orderId} AND del_flag = '0'")
+    int countByOrderId(@Param("orderId") Long orderId);
+
+    /**
+     * 订单下<b>已退款完成</b>的商品行数（rollup 的分子）。
+     *
+     * <p>★ 只数 {@code refunded}，不数 {@code refunding} / {@code refund_failed} ——
+     * 订单级 {@code business_status} 是<b>钱</b>的状态，钱还没回到客人手里就显示「部分退款」是骗人。</p>
+     *
+     * @param orderId 订单 id
+     * @return 已退款行数
+     */
+    @Select("SELECT COUNT(*) FROM gz_jp_order_item "
+        + "WHERE order_id = #{orderId} AND refund_status = 'refunded' AND del_flag = '0'")
+    int countRefundedByOrderId(@Param("orderId") Long orderId);
+
+    /**
+     * 把整单尚无退款记录的行一次性标为已退款（<b>仅用于 GZ-PAY 全额退款旁路</b>，GZ-JP-107）。
+     *
+     * <p><b>什么时候会走到这里</b>：admin 在<b>支付管理</b>页对一笔 jp 交易做了全额退款
+     * （那条链路不经过 jp 域）。钱确实整单退了，若 jp 侧不同步，客人会看到「订单已退款」
+     * 但每一行都没有退款信息。</p>
+     *
+     * <p><b>★ 只碰 {@code refund_status IS NULL} 的行</b>：已经走过行级退款的行有自己的退款单与金额，
+     * 绝不能被这一刀覆盖。<b>也不碰 {@code fulfill_status}</b> —— 货走到哪是另一根轴
+     * （ADR-0007 双状态机正交），全额退款不代表这些货没买到。</p>
+     *
+     * @param orderId 订单 id
+     * @return 受影响行数
+     */
+    @Update("UPDATE gz_jp_order_item SET refund_status = 'refunded', refund_amount_cent = amount_cent, "
+        + "version = version + 1, update_time = NOW() "
+        + "WHERE order_id = #{orderId} AND refund_status IS NULL AND del_flag = '0'")
+    int markAllRefundedForFullRefund(@Param("orderId") Long orderId);
 
     // ================================================================
     //  GZ-JP-109 admin 订单管理（只读）

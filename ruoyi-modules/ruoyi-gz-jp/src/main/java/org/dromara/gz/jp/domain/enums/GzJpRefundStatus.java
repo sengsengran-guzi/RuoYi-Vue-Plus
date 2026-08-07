@@ -53,4 +53,22 @@ public enum GzJpRefundStatus {
         }
         return code;
     }
+
+    /**
+     * code 是否是本枚举的合法取值（admin 退款单列表筛选参数校验用，GZ-JP-107）。
+     *
+     * <p>非法筛选值必须报错而不是静默忽略：忽略会让结果集看起来「更多」而不是「更少」，
+     * 店员会以为自己筛错了条件（同 {@link GzJpOrderStatus#isValid} 的口径）。</p>
+     *
+     * @param code 待校验的状态值
+     * @return true = 合法
+     */
+    public static boolean isValid(String code) {
+        for (GzJpRefundStatus s : values()) {
+            if (s.code.equals(code)) {
+                return true;
+            }
+        }
+        return false;
+    }
 }

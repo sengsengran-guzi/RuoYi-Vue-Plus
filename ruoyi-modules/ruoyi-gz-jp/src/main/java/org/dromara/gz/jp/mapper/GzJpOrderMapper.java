@@ -67,4 +67,45 @@ public interface GzJpOrderMapper extends BaseMapperPlus<GzJpOrder, GzJpOrder> {
         + "version = version + 1, update_time = NOW() "
         + "WHERE id = #{id} AND business_status = 'created' AND del_flag = '0'")
     int markCancelled(@Param("id") Long id, @Param("cancelledTime") LocalDateTime cancelledTime);
+
+    // ================================================================
+    //  GZ-JP-107 行级退款 —— 订单状态 rollup（FLOW:F-JP-04.step3）
+    // ================================================================
+
+    /**
+     * 按主键<b>行级锁</b>加载订单 —— 退款 rollup 的串行化点。
+     *
+     * <p><b>不加这把锁会出的事</b>：一单里两行的退款回调同时到达，两边都数到「已退 1 行 / 共 2 行」，
+     * 双双把订单算成 {@code partial_refunded} —— 最后一行退完的那次也不例外，订单永远到不了
+     * {@code refunded}。先锁订单行再数再写，把 rollup 串行化即可。</p>
+     *
+     * @param id 订单 id
+     * @return 锁定的订单行；不存在返回 null
+     */
+    @Select("SELECT * FROM gz_jp_order WHERE id = #{id} AND del_flag = '0' FOR UPDATE")
+    GzJpOrder selectByIdForUpdate(@Param("id") Long id);
+
+    /**
+     * 退款 rollup 推进：{@code paid / partial_refunded → partial_refunded / refunded}。
+     *
+     * <p><b>WHERE 只允许从 {@code paid} 或 {@code partial_refunded} 出发</b>：</p>
+     * <ul>
+     *   <li>{@code created} / {@code cancelled} 的单没付过钱，不该有退款态；</li>
+     *   <li>{@code refunded} 是<b>订单级终态</b> —— 不许被后到的 rollup 降级回 partial_refunded。</li>
+     * </ul>
+     *
+     * <p>{@code version = version + 1} 手写：自定义 UPDATE 不走 {@code @Version} 自增，
+     * 漏了会让版本号停滞、后续 {@code updateById} 拿着旧版本静默失败。</p>
+     *
+     * <p>★ <b>不写 {@code refunded_time} 之类的新列</b>：订单表没有这些列，退款时间在
+     * {@code gz_jp_refund.refunded_time} 上（一单可能有多笔行级退款，订单背不动一个时间点）。</p>
+     *
+     * @param id     订单 id
+     * @param target 目标状态（partial_refunded / refunded）
+     * @return 受影响行数（0 = 已是该态 / 已是终态，幂等跳过）
+     */
+    @Update("UPDATE gz_jp_order SET business_status = #{target}, version = version + 1, update_time = NOW() "
+        + "WHERE id = #{id} AND del_flag = '0' AND business_status IN ('paid','partial_refunded') "
+        + "AND business_status <> #{target}")
+    int markRefundRollup(@Param("id") Long id, @Param("target") String target);
 }
