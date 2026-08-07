@@ -62,6 +62,24 @@ public enum GzJpOrderStatus {
     }
 
     /**
+     * code 是否是本枚举的合法取值（admin 筛选参数校验用，GZ-JP-109）。
+     *
+     * <p>非法筛选值必须报错而不是静默忽略：忽略会让结果集看起来「更多」而不是「更少」，
+     * 店员会以为自己筛错了条件（同 {@code GzJpFulfillStatus.isValid} 的口径）。</p>
+     *
+     * @param code 待校验的状态值
+     * @return true = 合法
+     */
+    public static boolean isValid(String code) {
+        for (GzJpOrderStatus s : values()) {
+            if (s.code.equals(code)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * 是否已收到钱（paid 及其后的退款态都意味着「这单付过款」）。
      *
      * <p>履约看板 / 客人订单「进行中」判定用它 —— <b>created 的行虽然

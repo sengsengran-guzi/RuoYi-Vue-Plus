@@ -7,6 +7,7 @@ import org.apache.ibatis.annotations.Update;
 import org.dromara.common.mybatis.core.mapper.BaseMapperPlus;
 import org.dromara.gz.jp.domain.bo.GzJpFulfillQueryBo;
 import org.dromara.gz.jp.domain.dto.GzJpFulfillBoardRow;
+import org.dromara.gz.jp.domain.dto.GzJpOrderItemStat;
 import org.dromara.gz.jp.domain.entity.GzJpOrderItem;
 
 import java.time.LocalDateTime;
@@ -193,4 +194,28 @@ public interface GzJpOrderItemMapper extends BaseMapperPlus<GzJpOrderItem, GzJpO
                                              @Param("userIds") Collection<Long> userIds,
                                              @Param("beginTime") LocalDateTime beginTime,
                                              @Param("endTime") LocalDateTime endTime);
+
+    // ================================================================
+    //  GZ-JP-109 admin 订单管理（只读）
+    // ================================================================
+
+    /**
+     * 批量取本页订单的「款数 / 件数」（UI:admin.order 列表的两个数字列）。
+     *
+     * <p><b>为什么是聚合而不是把行捞回来数</b>：一单可 30+ 款，20 条一页就是 600 行白读，
+     * 而列表只显示两个数字。走 {@code GROUP BY order_id} 一次拿回本页全部计数 ——
+     * 相对逐单 count 是 1 次而不是 20 次（N+1），相对捞全行是几十行而不是几百行。</p>
+     *
+     * <p><b>★ 这里没有、也不该有「订单付过款」过滤</b>：订单管理是资金视角的查单页，
+     * 未支付 / 已取消的单同样要显示款数（客人问「我那单几件来着」时店员得答得出来）。
+     * 履约看板的那道 {@code isPaidLike} 闸是<b>采购视角</b>专属，别顺手抄过来。</p>
+     *
+     * @param orderIds 本页订单 id（调用方保证非空）
+     * @return 每个订单一条；<b>没有任何商品行的订单不会出现在结果里</b>（调用方按 0 兜底）
+     */
+    @Select("<script>SELECT order_id AS orderId, COUNT(*) AS itemCount, COALESCE(SUM(qty), 0) AS totalQty "
+        + "FROM gz_jp_order_item WHERE del_flag = '0' AND order_id IN "
+        + "<foreach collection='orderIds' item='oid' open='(' separator=',' close=')'>#{oid}</foreach> "
+        + "GROUP BY order_id</script>")
+    List<GzJpOrderItemStat> selectStatsByOrderIds(@Param("orderIds") Collection<Long> orderIds);
 }
