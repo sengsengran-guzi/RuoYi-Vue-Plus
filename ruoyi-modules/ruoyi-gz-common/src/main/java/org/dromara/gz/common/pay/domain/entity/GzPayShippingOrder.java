@@ -107,6 +107,16 @@ public class GzPayShippingOrder extends TenantEntity {
     /** 上报尝试次数 */
     private Integer attemptCount;
 
+    /**
+     * 内容代际：<b>只由「内容变更」触发 +1</b>（追加包裹 / 收口），只增不减。
+     *
+     * <p>上报回写的守卫条件。<b>不能拿 {@code (upload_status, attempt_count)} 当代际</b> ——
+     * 追加包裹写入的恰恰是 {@code (pending, 0)}，与首次上报读到的逐字相同，守卫会 ABA 恒命中：
+     * 「打微信期间内容被改」的陈旧回写照样落地，把新包裹的重排队覆盖成 success，
+     * 之后 cron 与手动补报都只扫 pending|failed 再也扫不到 = 静默永久丢包裹。</p>
+     */
+    private Long contentVersion;
+
     /** 最近一次失败原因 */
     private String lastError;
 

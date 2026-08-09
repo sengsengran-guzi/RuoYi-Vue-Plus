@@ -177,35 +177,34 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
     @Override
     public boolean markAllDelivered(String transactionId) {
         try {
-            GzPayShippingOrder existing = lockByTransactionId(transactionId);
-            if (existing == null) {
-                // 整单一个包裹都没发过（例如全部购买失败）—— 没有可收口的上报任务，不是异常
+            // ★★ 一条原子 UPDATE 完成「判定 + 写入」，绝不做「加锁读 → 判定 → updateById」。
+            //
+            // 本方法的调用方都在业务事务**之外**（@Async 收口 / 退款侧事务后），也就是跑在
+            // autocommit 下。autocommit 里 SELECT ... FOR UPDATE 的行锁**语句一结束就释放**，
+            // 读与写之间完全敞开 —— 读到的快照说「不是 blocked」，而此刻另一个 in-flight 的上报
+            // 刚把行写成 blocked（微信 10060002 已完成发货），陈旧快照回来无条件写 pending，
+            // 就把 blocked **复活**了，接着自动重试撞 10060003（重新发货机会已用掉），
+            // 该支付单从此再也报不上去。blocked 存在的全部意义就是防这个。
+            // （同一坑退款侧早有记录：不加 @Transactional 的 FOR UPDATE 等于没锁。）
+            int affected = TenantHelper.ignore(() -> shippingMapper.markAllDeliveredAtomic(transactionId));
+            if (affected == 0) {
+                // 没有该行（整单一个包裹都没发过，例如全部购买失败）或早已收口过 —— 都不是异常
                 return false;
             }
-            if (Boolean.TRUE.equals(existing.getIsAllDelivered())) {
-                return false;
-            }
-            GzPayShippingOrder upd = new GzPayShippingOrder();
-            upd.setId(existing.getId());
-            upd.setIsAllDelivered(Boolean.TRUE);
 
-            boolean blocked = GzPayShippingOrder.STATUS_BLOCKED.equals(existing.getUploadStatus());
-            if (blocked) {
-                // 同 appendPackage：blocked 是微信终态拒绝，自动重试只会白烧那唯一一次机会
-                upd.setLastError("微信侧已终态拒绝（blocked），整单已发完的收口标记未自动上报，需人工处理");
-                shippingMapper.updateById(upd);
+            GzPayShippingOrder row = findByTransactionId(transactionId);
+            if (row != null && GzPayShippingOrder.STATUS_BLOCKED.equals(row.getUploadStatus())) {
+                // SQL 里的 CASE WHEN 已经把 blocked 原样保住了，这里只负责让人看见
                 log.error("[gz-shipping] ★ 支付单 {} 处于 blocked，收口标记已置但不自动重试，请人工处理", transactionId);
                 return false;
             }
-            upd.setUploadStatus(GzPayShippingOrder.STATUS_PENDING);
-            upd.setAttemptCount(0);
-            shippingMapper.updateById(upd);
-            // ★ 这里**直接**触发上报，不能走 registerAfterCommitUpload。
-            //   本方法的两个调用方都已经在事务之外（退款侧在事务外调、发货侧在 afterCommit 回调里调），
-            //   而 Spring 的 triggerAfterCommit 迭代的是进入前的快照 —— 在 afterCommit 期间再注册一个
-            //   afterCommit，它**永远不会被执行**，于是「收口重报」只改了库、从没真的报给微信，
-            //   行永远停在 pending（prod 又没有 SnailJob 兜底），微信侧永远停在「部分发货」。
-            selfProvider.getObject().tryUploadAsync(existing.getId());
+            if (row != null) {
+                // ★ 这里**直接**触发上报，不能走 registerAfterCommitUpload：
+                //   本方法两个调用方都已在事务之外，而 Spring 的 triggerAfterCommit 迭代的是进入前的
+                //   快照 —— 在 afterCommit 期间再注册一个 afterCommit，它**永远不会被执行**，
+                //   于是「收口重报」只改了库、从没真报给微信，行永远停在 pending（prod 无 SnailJob 兜底）。
+                selfProvider.getObject().tryUploadAsync(row.getId());
+            }
             log.info("[gz-shipping] 整单已全部发完，收口重报 transaction_id={}", transactionId);
             return true;
         } catch (Exception e) {
@@ -298,6 +297,9 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
 
         GzPayShippingOrder upd = new GzPayShippingOrder();
         upd.setId(existing.getId());
+        // ★ 内容变了 → 代际 +1，让所有 in-flight 的上报回写守卫失效（它们报的是旧清单）。
+        //   这里可以安全地「读值 +1」：本方法跑在 ship() 的真实事务内、且已持有该行 FOR UPDATE。
+        upd.setContentVersion((existing.getContentVersion() == null ? 0L : existing.getContentVersion()) + 1);
         upd.setShippingListJson(writePackages(packages));
         upd.setLogisticsType(info.logisticsType());
         upd.setDeliveryMode(info.deliveryMode());
@@ -519,6 +521,7 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
             row.getClientId(),
             readPackages(row.getShippingListJson())));
 
+        long expectVersion = row.getContentVersion() == null ? 0L : row.getContentVersion();
         int expectAttempt = row.getAttemptCount() == null ? 0 : row.getAttemptCount();
         String newStatus;
         String lastError = null;
@@ -541,10 +544,14 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
         // 新包裹一次都没报给微信，而行是 success ⇒ cron 与手动补报都只扫 pending|failed 扫不到它，
         // admin 页面还一切正常、last_error 为空 —— 永久静默丢包裹。
         //
+        // ★ 守卫必须用 content_version，**不能用 (upload_status, attempt_count)**：
+        //   追加包裹写入的正是 (pending, 0)，与首次上报读到的逐字相同 ⇒ 典型 ABA，守卫恒命中、
+        //   等于没守。而首次上报与「追加后重排队」那次上报恰恰是最常见的两条路径。
+        //
         // 守卫命中不了 = 我上报期间内容变过 ⇒ 我这次的结果已经过时，什么都别写，
         // 让那次追加派出的新上报去报最新的整份清单（本方法幂等，重报无害）。
         int affected = shippingMapper.updateStatusGuarded(
-            row.getId(), row.getUploadStatus(), expectAttempt,
+            row.getId(), expectVersion,
             newStatus, expectAttempt + 1,
             result.success() ? LocalDateTime.now() : null, lastError);
         if (affected == 0) {

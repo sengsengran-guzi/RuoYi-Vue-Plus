@@ -68,7 +68,7 @@ class GzPayShippingServiceImplTest {
     void setUp() {
         service = new GzPayShippingServiceImpl(shippingMapper, shippingClient, selfProvider);
         // 守卫回写默认命中（=期间内容没变过）；测「被并发改掉」时单独桩成 0
-        lenient().when(shippingMapper.updateStatusGuarded(any(), any(), any(), any(), any(), any(), any()))
+        lenient().when(shippingMapper.updateStatusGuarded(any(), any(), any(), any(), any(), any()))
             .thenReturn(1);
         // 行有 id 时 registerAfterCommitUpload 会 selfProvider.getObject().tryUploadAsync(id)；
         // 不桩的话拿到 null → NPE 被 service 的兜底 catch 吞掉，测试看到的是「返回 false」而不是真实行为
@@ -123,8 +123,7 @@ class GzPayShippingServiceImplTest {
 
         // 回写走带守卫的 updateStatusGuarded（不再是无条件 updateById）
         ArgumentCaptor<String> status = ArgumentCaptor.forClass(String.class);
-        verify(shippingMapper, times(2)).updateStatusGuarded(
-            any(), any(), any(), status.capture(), any(), any(), any());
+        verify(shippingMapper, times(2)).updateStatusGuarded(any(), any(), status.capture(), any(), any(), any());
         assertEquals(GzPayShippingOrder.STATUS_SUCCESS, status.getAllValues().get(0));
         assertEquals(GzPayShippingOrder.STATUS_FAILED, status.getAllValues().get(1));
     }
@@ -190,7 +189,7 @@ class GzPayShippingServiceImplTest {
 
         assertEquals(true, result);
         ArgumentCaptor<String> status = ArgumentCaptor.forClass(String.class);
-        verify(shippingMapper).updateStatusGuarded(any(), any(), any(), status.capture(), any(), any(), any());
+        verify(shippingMapper).updateStatusGuarded(any(), any(), status.capture(), any(), any(), any());
         assertEquals(GzPayShippingOrder.STATUS_SUCCESS, status.getValue());
     }
 
@@ -301,16 +300,15 @@ class GzPayShippingServiceImplTest {
         try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
             th.when(() -> TenantHelper.ignore(any(Supplier.class)))
                 .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
-            when(shippingMapper.selectByTransactionIdForUpdate("txn-4"))
-                .thenReturn(physicalRow(4L, GzPayShippingOrder.STATUS_SUCCESS, "TRK-A"));
+            when(shippingMapper.markAllDeliveredAtomic("txn-4")).thenReturn(1);
+            when(shippingMapper.selectOne(any())).thenReturn(physicalRow(4L, GzPayShippingOrder.STATUS_PENDING, "TRK-A"));
 
             assertTrue(service.markAllDelivered("txn-4"));
 
-            ArgumentCaptor<GzPayShippingOrder> captor = ArgumentCaptor.forClass(GzPayShippingOrder.class);
-            verify(shippingMapper).updateById(captor.capture());
-            assertEquals(Boolean.TRUE, captor.getValue().getIsAllDelivered());
-            assertEquals(GzPayShippingOrder.STATUS_PENDING, captor.getValue().getUploadStatus(),
-                "要重新排队，否则改了标记也不会报给微信");
+            // ★ 判定与写入必须在同一条原子 UPDATE 里（autocommit 下 FOR UPDATE 等于没锁，
+            //   「读→判定→updateById」中间会被 in-flight 的上报把 blocked 写进来又被覆盖掉）
+            verify(shippingMapper).markAllDeliveredAtomic("txn-4");
+            verify(shippingMapper, times(0)).updateById(any(GzPayShippingOrder.class));
         }
     }
 
@@ -320,7 +318,7 @@ class GzPayShippingServiceImplTest {
         try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
             th.when(() -> TenantHelper.ignore(any(Supplier.class)))
                 .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
-            when(shippingMapper.selectByTransactionIdForUpdate("txn-5")).thenReturn(null);
+            when(shippingMapper.markAllDeliveredAtomic("txn-5")).thenReturn(0);
 
             assertEquals(false, service.markAllDelivered("txn-5"));
             verify(shippingMapper, times(0)).updateById(any(GzPayShippingOrder.class));
@@ -333,15 +331,13 @@ class GzPayShippingServiceImplTest {
         try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
             th.when(() -> TenantHelper.ignore(any(Supplier.class)))
                 .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
-            when(shippingMapper.selectByTransactionIdForUpdate("txn-6"))
-                .thenReturn(physicalRow(6L, GzPayShippingOrder.STATUS_BLOCKED, "TRK-A"));
+            when(shippingMapper.markAllDeliveredAtomic("txn-6")).thenReturn(1);
+            when(shippingMapper.selectOne(any())).thenReturn(physicalRow(6L, GzPayShippingOrder.STATUS_BLOCKED, "TRK-A"));
 
             assertEquals(false, service.markAllDelivered("txn-6"));
 
-            ArgumentCaptor<GzPayShippingOrder> captor = ArgumentCaptor.forClass(GzPayShippingOrder.class);
-            verify(shippingMapper).updateById(captor.capture());
-            assertEquals(Boolean.TRUE, captor.getValue().getIsAllDelivered());
-            assertEquals(null, captor.getValue().getUploadStatus(), "★ 不能放回 pending");
+            // blocked 的保护写在 SQL 的 CASE WHEN 里；服务层不许再补一发 updateById 把它盖掉
+            verify(shippingMapper, times(0)).updateById(any(GzPayShippingOrder.class));
         }
     }
 
@@ -371,14 +367,15 @@ class GzPayShippingServiceImplTest {
     void uploadWriteBackIsGuarded() {
         GzPayShippingOrder row = physicalRow(31L, GzPayShippingOrder.STATUS_PENDING, "TRK-A");
         row.setAttemptCount(0);
+        row.setContentVersion(7L);
         when(shippingMapper.selectById(31L)).thenReturn(row);
         when(shippingClient.uploadShippingInfo(any(UploadCommand.class))).thenReturn(UploadResult.ok());
 
         service.retryOne(31L);
 
-        // ★ 必须走带守卫的回写，且守卫用「我读到的那一代」(pending, 0) 做条件
-        verify(shippingMapper).updateStatusGuarded(eq(31L),
-            eq(GzPayShippingOrder.STATUS_PENDING), eq(0),
+        // ★ 守卫必须用 content_version 做代际 —— 不能用 (upload_status, attempt_count)：
+        //   追加包裹写入的正是 (pending, 0)，与首次上报读到的逐字相同 ⇒ ABA 恒命中、等于没守。
+        verify(shippingMapper).updateStatusGuarded(eq(31L), eq(7L),
             eq(GzPayShippingOrder.STATUS_SUCCESS), eq(1), any(), eq(null));
         // 绝不能再有无条件的 updateById 把状态盖掉
         verify(shippingMapper, times(0)).updateById(any(GzPayShippingOrder.class));
@@ -391,7 +388,7 @@ class GzPayShippingServiceImplTest {
         row.setAttemptCount(0);
         when(shippingMapper.selectById(32L)).thenReturn(row);
         when(shippingClient.uploadShippingInfo(any(UploadCommand.class))).thenReturn(UploadResult.ok());
-        when(shippingMapper.updateStatusGuarded(any(), any(), any(), any(), any(), any(), any())).thenReturn(0);
+        when(shippingMapper.updateStatusGuarded(any(), any(), any(), any(), any(), any())).thenReturn(0);
 
         // 不抛、不改成别的状态；这一笔的结果被丢弃是正确行为
         service.retryOne(32L);

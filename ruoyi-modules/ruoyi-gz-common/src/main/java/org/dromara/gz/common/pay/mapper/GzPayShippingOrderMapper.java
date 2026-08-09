@@ -69,12 +69,35 @@ public interface GzPayShippingOrderMapper extends BaseMapperPlus<GzPayShippingOr
      */
     @Update("UPDATE gz_pay_shipping_order SET upload_status = #{newStatus}, attempt_count = #{newAttempt}, "
         + "uploaded_time = #{uploadedTime}, last_error = #{lastError} "
-        + "WHERE id = #{id} AND upload_status = #{expectStatus} AND attempt_count = #{expectAttempt}")
+        + "WHERE id = #{id} AND content_version = #{expectVersion}")
     int updateStatusGuarded(@Param("id") Long id,
-                            @Param("expectStatus") String expectStatus,
-                            @Param("expectAttempt") Integer expectAttempt,
+                            @Param("expectVersion") Long expectVersion,
                             @Param("newStatus") String newStatus,
                             @Param("newAttempt") Integer newAttempt,
                             @Param("uploadedTime") LocalDateTime uploadedTime,
                             @Param("lastError") String lastError);
+
+    /**
+     * 收口为「整单已全部发完」——<b>一条原子 UPDATE 搞定，不做读-改-写</b>。
+     *
+     * <p><b>为什么必须原子</b>：本方法的调用方都在业务事务<b>之外</b>（{@code @Async} 收口 /
+     * 退款侧事务后），也就是跑在 <b>autocommit</b> 下。autocommit 里 {@code SELECT ... FOR UPDATE}
+     * 的行锁<b>语句一结束就释放</b>，「先加锁读、判定、再 updateById」中间是完全敞开的窗口。
+     * 实测后果：读到的快照说「不是 blocked」，而此刻另一个 in-flight 的上报刚把行写成
+     * {@code blocked}（微信 10060002 已完成发货），陈旧快照回来无条件写 {@code pending}
+     * → <b>把 blocked 复活</b> → 自动重试撞 {@code 10060003}（重新发货机会已用掉）
+     * → 该支付单从此再也报不上去。{@code blocked} 存在的全部意义就是防这个。</p>
+     *
+     * <p>所以 blocked 的保护写进 SQL 的 {@code CASE WHEN}，判定与写入在同一条语句里完成。
+     * {@code content_version} 同步 +1：收口是内容变更，必须让 in-flight 的陈旧回写守卫失效。</p>
+     *
+     * @param transactionId 微信支付单号
+     * @return 影响行数；0 = 没有该行、或早已收口过（幂等）
+     */
+    @Update("UPDATE gz_pay_shipping_order SET is_all_delivered = 1, "
+        + "content_version = content_version + 1, "
+        + "upload_status = CASE WHEN upload_status = 'blocked' THEN 'blocked' ELSE 'pending' END, "
+        + "attempt_count = CASE WHEN upload_status = 'blocked' THEN attempt_count ELSE 0 END "
+        + "WHERE transaction_id = #{transactionId} AND COALESCE(is_all_delivered, 0) = 0")
+    int markAllDeliveredAtomic(@Param("transactionId") String transactionId);
 }
