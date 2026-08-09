@@ -230,8 +230,9 @@ class GzPayShippingServiceImplTest {
         try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
             th.when(() -> TenantHelper.ignore(any(Supplier.class)))
                 .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
-            when(shippingMapper.selectByTransactionIdForUpdate("txn-1"))
-                .thenReturn(physicalRow(1L, GzPayShippingOrder.STATUS_SUCCESS, "TRK-A"));
+            GzPayShippingOrder row1 = physicalRow(1L, GzPayShippingOrder.STATUS_SUCCESS, "TRK-A");
+            when(shippingMapper.selectOne(any())).thenReturn(row1);
+            when(shippingMapper.selectByTransactionIdForUpdate("txn-1")).thenReturn(row1);
 
             service.enqueue(txn("txn-1"), physical("TRK-B", false));
 
@@ -252,8 +253,8 @@ class GzPayShippingServiceImplTest {
             th.when(() -> TenantHelper.ignore(any(Supplier.class)))
                 .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
             // 第一次加锁读没读到（行还没被对方提交）→ 走 insert → 撞唯一键 → 再读就有了
+            when(shippingMapper.selectOne(any())).thenReturn(null);   // 快路径读不到 → 走 insert
             when(shippingMapper.selectByTransactionIdForUpdate("txn-2"))
-                .thenReturn(null)
                 .thenReturn(physicalRow(2L, GzPayShippingOrder.STATUS_PENDING, "TRK-WINNER"));
             when(shippingMapper.insert(any(GzPayShippingOrder.class))).thenThrow(new DuplicateKeyException("uk_transaction_id"));
 
@@ -273,11 +274,11 @@ class GzPayShippingServiceImplTest {
         try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
             th.when(() -> TenantHelper.ignore(any(Supplier.class)))
                 .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
-            when(shippingMapper.selectByTransactionIdForUpdate("txn-3"))
-                .thenReturn(physicalRow(3L, GzPayShippingOrder.STATUS_SUCCESS, "TRK-A"));
-            // 追加时写库炸（模拟列装不下 / 连接问题）
+            GzPayShippingOrder row3 = physicalRow(3L, GzPayShippingOrder.STATUS_SUCCESS, "TRK-A");
+            when(shippingMapper.selectOne(any())).thenReturn(row3);
+            when(shippingMapper.selectByTransactionIdForUpdate("txn-3")).thenReturn(row3);
+            // 追加时写库炸（模拟列装不下 / 连接问题）—— 语句级失败，应被吞掉并记 last_error
             when(shippingMapper.updateById(any(GzPayShippingOrder.class))).thenThrow(new RuntimeException("Data too long for column"));
-            when(shippingMapper.selectOne(any())).thenReturn(physicalRow(3L, GzPayShippingOrder.STATUS_SUCCESS, "TRK-A"));
 
             service.enqueue(txn("txn-3"), physical("TRK-B", false));   // 不抛
 
@@ -347,6 +348,7 @@ class GzPayShippingServiceImplTest {
                 .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
             GzPayShippingOrder already = physicalRow(9L, GzPayShippingOrder.STATUS_SUCCESS, "TRK-A");
             already.setIsAllDelivered(Boolean.TRUE);          // 另一笔并发已经收过口
+            when(shippingMapper.selectOne(any())).thenReturn(already);
             when(shippingMapper.selectByTransactionIdForUpdate("txn-9")).thenReturn(already);
 
             // 晚到的这笔在自己事务里算出的是 false（看不见对方的提交）

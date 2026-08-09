@@ -21,6 +21,7 @@ import org.dromara.gz.common.pay.shipping.WxShippingClient;
 import org.dromara.gz.common.pay.shipping.WxShippingClient.UploadCommand;
 import org.dromara.gz.common.pay.shipping.WxShippingClient.UploadResult;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.dao.ConcurrencyFailureException;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
@@ -69,9 +70,21 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
     @Override
     public void enqueue(GzPayTransaction txn, ShippingInfo info) {
         try {
-            // ★ 一律先加行锁再读：追加包裹是读-改-写，不锁就会「两个店员同时发两个运单 → 丢一个」
-            //   （两边都读到 N 个、都写回 N+1 个，后写的覆盖先写的，且两个请求都返回成功）。
-            GzPayShippingOrder existing = lockByTransactionId(txn.getTransactionId());
+            // ★★ 先 INSERT，不要「先 SELECT ... FOR UPDATE 探一把再决定 INSERT」。
+            //
+            // 探不存在的行时，RR 下 FOR UPDATE 拿到的是 **gap lock**；gap lock 彼此兼容，
+            // 两笔并发都能拿到，然后各自 INSERT 又都要该 gap 的 insert-intention lock —— 互相冲突 → 死锁。
+            // 致命的是这跟「是不是同一笔单」无关：只要两个 transaction_id 落在同一个 gap 就撞，
+            // 而这张表是拼豆 / 拼团 / 预购 / 扭蛋**共用**的，等于把无关业务线拖下水。
+            // 更致命的是 InnoDB 死锁回滚的是**整个事务**（不是语句级），一旦在这里把异常吞掉，
+            // 调用方会照常 commit，而 DB 早就回滚了 —— 表现成「接口回 200、货发了、库里没这回事」。
+            //
+            // 改成 insert-first 后，谁都不先占 gap，唯一键自然仲裁：赢的插入成功，
+            // 输的拿 DuplicateKey，那时行**已存在**，再加锁读就是纯记录锁，不会再有 gap 冲突。
+            //
+            // 存在性检查仍然要做（绝大多数追加包裹的场景行都已存在），但用**不加锁**的读：
+            // 它只是快路径，真正的并发仲裁交给唯一键。
+            GzPayShippingOrder existing = findByTransactionId(txn.getTransactionId());
             if (existing == null) {
                 insertNew(txn, info);
                 return;
@@ -81,10 +94,11 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
                 log.info("[gz-shipping] 发货任务已存在跳过入队 transaction_id={}", txn.getTransactionId());
                 return;
             }
-            appendPackage(existing, info);
+            appendPackage(lockOrThrow(txn.getTransactionId(), existing), info);
         } catch (DuplicateKeyException dup) {
-            // 并发的另一笔刚抢先建了行。★ 不能就这么 return —— 那会把**本次的包裹**丢掉
-            //   （赢的那笔只带它自己的运单，我的运单再也没人报）。回头加锁读出来，把包裹并进去。
+            // 并发的另一笔刚抢先建了行（或本次快路径读时它还没提交）。
+            // ★ 不能就这么 return —— 那会把**本次的包裹**丢掉（赢的那笔只带它自己的运单）。
+            // 此刻行必然已存在 ⇒ 加锁读到的是纯记录锁，不会再有 gap 死锁。
             try {
                 GzPayShippingOrder existing = lockByTransactionId(txn.getTransactionId());
                 if (existing != null && info.shipmentPackage() != null) {
@@ -95,18 +109,47 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
                     log.info("[gz-shipping] 发货任务已存在跳过入队（并发）transaction_id={}", txn.getTransactionId());
                 }
             } catch (Exception retry) {
+                rethrowIfTransactionPoisoned(retry);
                 logEnqueueFailure(txn, info, retry);
             }
         } catch (Exception e) {
+            rethrowIfTransactionPoisoned(e);
             logEnqueueFailure(txn, info, e);
         }
+    }
+
+    /**
+     * 死锁 / 拿不到锁这类异常<b>绝不能吞</b>。
+     *
+     * <p>「上报失败不回滚发货」的前提是「失败只毁掉这一条语句」。而 InnoDB 死锁回滚的是
+     * <b>整个事务</b>：此时调用方那些业务写入（发货落库 / 支付置 paid）已经没了，
+     * 再把异常吞掉只会让调用方照常 commit 一个空事务，接口还回 200 —— 钱收了、单没了、
+     * 还告诉微信「我处理好了」。这种情况下让调用方连同一起失败，才能让客户端 / 微信重试。</p>
+     */
+    private void rethrowIfTransactionPoisoned(Exception e) {
+        if (e instanceof ConcurrencyFailureException) {
+            log.error("[gz-shipping] ★ 数据库并发失败（死锁/锁超时），整个事务已被回滚，向上抛出让调用方一起失败: {}",
+                e.getMessage());
+            throw (ConcurrencyFailureException) e;
+        }
+    }
+
+    /** 快路径读到行之后再加锁确认；行在这瞬间被删掉（理论不可达）就退回快路径那份。 */
+    private GzPayShippingOrder lockOrThrow(String transactionId, GzPayShippingOrder fallback) {
+        GzPayShippingOrder locked = lockByTransactionId(transactionId);
+        return locked != null ? locked : fallback;
     }
 
     /**
      * 入队失败的统一记账。
      *
      * <p>★ 入队失败<b>绝不回滚调用方事务</b>：支付确认（拼豆）与店员发货（拼团）都是既成事实，
-     * 上报只是次要链路。MySQL 语句级回滚，事务/连接仍可用，调用方后续写入正常提交。</p>
+     * 上报只是次要链路。</p>
+     *
+     * <p><b>⚠️ 这条只对「语句级失败」成立</b>（约束冲突 / 字段超长 / 业务校验之类）——那种失败
+     * MySQL 只回滚这一条语句，事务与连接仍可用，调用方后续写入正常提交。
+     * <b>死锁与锁超时不在此列</b>：InnoDB 回滚的是<b>整个事务</b>，吞掉就会让调用方 commit 一个
+     * 空事务还回 200。那类异常由 {@code rethrowIfTransactionPoisoned} 先行抛出，走不到这里。</p>
      *
      * <p><b>但不能只写日志就算完</b>：日志没人天天看，而这条链路的失败形态是「HTTP 200 发货成功 +
      * 包裹静默消失 + admin 列表一切正常」。所以只要行已存在，就把原因写进 {@code last_error}
@@ -157,7 +200,12 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
             upd.setUploadStatus(GzPayShippingOrder.STATUS_PENDING);
             upd.setAttemptCount(0);
             shippingMapper.updateById(upd);
-            registerAfterCommitUpload(existing.getId());
+            // ★ 这里**直接**触发上报，不能走 registerAfterCommitUpload。
+            //   本方法的两个调用方都已经在事务之外（退款侧在事务外调、发货侧在 afterCommit 回调里调），
+            //   而 Spring 的 triggerAfterCommit 迭代的是进入前的快照 —— 在 afterCommit 期间再注册一个
+            //   afterCommit，它**永远不会被执行**，于是「收口重报」只改了库、从没真的报给微信，
+            //   行永远停在 pending（prod 又没有 SnailJob 兜底），微信侧永远停在「部分发货」。
+            selfProvider.getObject().tryUploadAsync(existing.getId());
             log.info("[gz-shipping] 整单已全部发完，收口重报 transaction_id={}", transactionId);
             return true;
         } catch (Exception e) {

@@ -43,6 +43,9 @@ public interface IGzPayShippingService {
      * 已经是 {@code true} → 不重复排队。行处于 {@code blocked}（微信终态拒绝）→ 只改标记不自动重试。
      * 与 {@link #enqueue} 同口径：<b>任何异常只记日志，绝不上抛</b>，不能拖垮调用方的业务事务。</p>
      *
+     * <p><b>调用契约：必须在业务事务<u>提交之后</u>调</b>（退款侧在事务外、发货侧在 afterCommit 里）。
+     * 本方法会直接触发一次上报，事务内调会读到未提交状态。</p>
+     *
      * @param transactionId 微信支付单号
      * @return true = 确实改成了「已全部发完」并重新排队；false = 无需处理或处理失败
      */
