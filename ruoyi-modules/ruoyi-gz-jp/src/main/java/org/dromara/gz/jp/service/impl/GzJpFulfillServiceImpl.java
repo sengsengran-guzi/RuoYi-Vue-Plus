@@ -49,6 +49,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -570,7 +571,11 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
         }
 
         LocalDateTime beginTime = q.getBeginDate() == null ? null : q.getBeginDate().atStartOfDay();
-        LocalDateTime endTime = q.getEndDate() == null ? null : LocalDateTime.of(q.getEndDate(), LocalTime.MAX);
+        // ★ 不能用 LocalTime.MAX（23:59:59.999999999）：create_time 是 DATETIME(0)，
+        //   MySQL 比较时会把这个纳秒值**进位成次日 00:00:00**，于是次日零点整下的单被算进当天。
+        //   截到秒即可 —— DATETIME(0) 精度就是秒，23:59:59 才是当天真正的上界。
+        LocalDateTime endTime = q.getEndDate() == null
+            ? null : LocalDateTime.of(q.getEndDate(), LocalTime.MAX).truncatedTo(ChronoUnit.SECONDS);
 
         Page<GzJpFulfillBoardRow> page = itemMapper.selectBoardPage(
             buildPage(pageQuery), q, userIds, beginTime, endTime);

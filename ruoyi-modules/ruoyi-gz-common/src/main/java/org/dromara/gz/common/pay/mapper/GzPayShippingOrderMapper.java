@@ -2,9 +2,12 @@ package org.dromara.gz.common.pay.mapper;
 
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
+import org.apache.ibatis.annotations.Update;
 import org.dromara.common.mybatis.core.mapper.BaseMapperPlus;
 import org.dromara.gz.common.pay.domain.entity.GzPayShippingOrder;
 import org.dromara.gz.common.pay.domain.vo.GzPayShippingOrderVO;
+
+import java.time.LocalDateTime;
 
 /**
  * gz_pay_shipping_order 数据层（微信发货信息上报任务）。
@@ -37,4 +40,41 @@ public interface GzPayShippingOrderMapper extends BaseMapperPlus<GzPayShippingOr
      */
     @Select("SELECT * FROM gz_pay_shipping_order WHERE transaction_id = #{transactionId} LIMIT 1 FOR UPDATE")
     GzPayShippingOrder selectByTransactionIdForUpdate(@Param("transactionId") String transactionId);
+
+    /**
+     * 上报结果回写，<b>带乐观守卫</b>：只有该行仍停在「我开始上报时那个代际」才写。
+     *
+     * <p><b>为什么不能直接 {@code updateById}</b>：调用方在写这一笔之前刚做完一次**真实 HTTP 往返**
+     * （prod 几百 ms）。这段窗口里另一个店员的「追加包裹」完全可能已经把该行改成
+     * 「新清单 + is_all_delivered=true + upload_status=pending + attempt_count=0」并提交。
+     * 盲写 {@code success} 会把那次<b>重新排队</b>静默覆盖掉：新包裹一次都没报给微信，
+     * 而行是 {@code success} ⇒ cron 与手动补报（都只扫 pending|failed）永远扫不到它，
+     * admin 页面还一切正常、{@code last_error} 为空 —— 永久静默丢包裹。
+     * 实测 dev（mock 微秒级）40 笔并发命中 7 笔；prod 真网络窗口大几个数量级。</p>
+     *
+     * <p>守卫用 {@code (upload_status, attempt_count)} 做代际标识：追加包裹会把它们重置成
+     * {@code (pending, 0)}，与我读到的那一份必然不同 ⇒ affected=0 ⇒ 调用方放弃写入，
+     * 由那次追加派出的新上报去报最新的整份清单（上报本身幂等，重报无害）。</p>
+     *
+     * <p>成功时顺带清空 {@code last_error} —— 否则「已成功却挂着上次的错误原因」会让 owner 误判。</p>
+     *
+     * @param id            主键
+     * @param expectStatus  我开始上报时看到的状态
+     * @param expectAttempt 我开始上报时看到的尝试次数
+     * @param newStatus     要写入的新状态
+     * @param newAttempt    要写入的新尝试次数
+     * @param uploadedTime  成功时的上报时间（失败传 null）
+     * @param lastError     失败原因（成功传 null，会把该列清空）
+     * @return 影响行数；0 = 守卫未命中（期间内容变过），调用方应放弃本次结果
+     */
+    @Update("UPDATE gz_pay_shipping_order SET upload_status = #{newStatus}, attempt_count = #{newAttempt}, "
+        + "uploaded_time = #{uploadedTime}, last_error = #{lastError} "
+        + "WHERE id = #{id} AND upload_status = #{expectStatus} AND attempt_count = #{expectAttempt}")
+    int updateStatusGuarded(@Param("id") Long id,
+                            @Param("expectStatus") String expectStatus,
+                            @Param("expectAttempt") Integer expectAttempt,
+                            @Param("newStatus") String newStatus,
+                            @Param("newAttempt") Integer newAttempt,
+                            @Param("uploadedTime") LocalDateTime uploadedTime,
+                            @Param("lastError") String lastError);
 }

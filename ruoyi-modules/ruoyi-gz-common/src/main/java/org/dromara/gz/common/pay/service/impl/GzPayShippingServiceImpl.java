@@ -519,20 +519,38 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
             row.getClientId(),
             readPackages(row.getShippingListJson())));
 
-        GzPayShippingOrder upd = new GzPayShippingOrder();
-        upd.setId(row.getId());
-        upd.setAttemptCount((row.getAttemptCount() == null ? 0 : row.getAttemptCount()) + 1);
+        int expectAttempt = row.getAttemptCount() == null ? 0 : row.getAttemptCount();
+        String newStatus;
+        String lastError = null;
         if (result.success()) {
-            upd.setUploadStatus(GzPayShippingOrder.STATUS_SUCCESS);
-            upd.setUploadedTime(LocalDateTime.now());
+            newStatus = GzPayShippingOrder.STATUS_SUCCESS;
         } else {
             // ★ 终态失败落 blocked 而不是 failed：cron / 手动补报都只扫 pending|failed，
             //   继续重试会烧掉微信每笔单仅有一次的「重新发货」机会（10060002 → 10060003 → 永久失败）
-            upd.setUploadStatus(result.terminal()
-                ? GzPayShippingOrder.STATUS_BLOCKED : GzPayShippingOrder.STATUS_FAILED);
-            upd.setLastError(StrUtil.format("errcode={} errmsg={}", result.errcode(), result.errmsg()));
+            newStatus = result.terminal()
+                ? GzPayShippingOrder.STATUS_BLOCKED : GzPayShippingOrder.STATUS_FAILED;
+            lastError = StrUtil.format("errcode={} errmsg={}", result.errcode(), result.errmsg());
         }
-        shippingMapper.updateById(upd);
+
+        // ★★ 带守卫回写，绝不能无脑 updateById。
+        //
+        // 上面那次 uploadShippingInfo 是**真实 HTTP 往返**（prod 几百 ms），这段时间里
+        // 另一个店员的「追加包裹」完全可能已经把这行改成
+        // 「新包裹清单 + is_all_delivered=true + upload_status=pending + attempt_count=0」并提交。
+        // 此时若把 success 盲写回去，就把那次「重新排队」标记**静默覆盖**掉：
+        // 新包裹一次都没报给微信，而行是 success ⇒ cron 与手动补报都只扫 pending|failed 扫不到它，
+        // admin 页面还一切正常、last_error 为空 —— 永久静默丢包裹。
+        //
+        // 守卫命中不了 = 我上报期间内容变过 ⇒ 我这次的结果已经过时，什么都别写，
+        // 让那次追加派出的新上报去报最新的整份清单（本方法幂等，重报无害）。
+        int affected = shippingMapper.updateStatusGuarded(
+            row.getId(), row.getUploadStatus(), expectAttempt,
+            newStatus, expectAttempt + 1,
+            result.success() ? LocalDateTime.now() : null, lastError);
+        if (affected == 0) {
+            log.info("[gz-shipping] 上报回写被跳过（期间包裹清单已变，交给新一次上报）id={} transaction_id={}",
+                row.getId(), row.getTransactionId());
+        }
         return result.success();
     }
 }

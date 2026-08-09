@@ -31,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
@@ -66,6 +67,9 @@ class GzPayShippingServiceImplTest {
     @BeforeEach
     void setUp() {
         service = new GzPayShippingServiceImpl(shippingMapper, shippingClient, selfProvider);
+        // 守卫回写默认命中（=期间内容没变过）；测「被并发改掉」时单独桩成 0
+        lenient().when(shippingMapper.updateStatusGuarded(any(), any(), any(), any(), any(), any(), any()))
+            .thenReturn(1);
         // 行有 id 时 registerAfterCommitUpload 会 selfProvider.getObject().tryUploadAsync(id)；
         // 不桩的话拿到 null → NPE 被 service 的兜底 catch 吞掉，测试看到的是「返回 false」而不是真实行为
         lenient().when(selfProvider.getObject()).thenReturn(mock(IGzPayShippingService.class));
@@ -117,11 +121,12 @@ class GzPayShippingServiceImplTest {
             assertEquals(1, stats.failed());
         }
 
-        ArgumentCaptor<GzPayShippingOrder> captor = ArgumentCaptor.forClass(GzPayShippingOrder.class);
-        verify(shippingMapper, times(2)).updateById(captor.capture());
-        List<GzPayShippingOrder> updates = captor.getAllValues();
-        assertEquals(GzPayShippingOrder.STATUS_SUCCESS, updates.get(0).getUploadStatus());
-        assertEquals(GzPayShippingOrder.STATUS_FAILED, updates.get(1).getUploadStatus());
+        // 回写走带守卫的 updateStatusGuarded（不再是无条件 updateById）
+        ArgumentCaptor<String> status = ArgumentCaptor.forClass(String.class);
+        verify(shippingMapper, times(2)).updateStatusGuarded(
+            any(), any(), any(), status.capture(), any(), any(), any());
+        assertEquals(GzPayShippingOrder.STATUS_SUCCESS, status.getAllValues().get(0));
+        assertEquals(GzPayShippingOrder.STATUS_FAILED, status.getAllValues().get(1));
     }
 
     @Test
@@ -184,9 +189,9 @@ class GzPayShippingServiceImplTest {
         }
 
         assertEquals(true, result);
-        ArgumentCaptor<GzPayShippingOrder> captor = ArgumentCaptor.forClass(GzPayShippingOrder.class);
-        verify(shippingMapper).updateById(captor.capture());
-        assertEquals(GzPayShippingOrder.STATUS_SUCCESS, captor.getValue().getUploadStatus());
+        ArgumentCaptor<String> status = ArgumentCaptor.forClass(String.class);
+        verify(shippingMapper).updateStatusGuarded(any(), any(), any(), status.capture(), any(), any(), any());
+        assertEquals(GzPayShippingOrder.STATUS_SUCCESS, status.getValue());
     }
 
     @Test
@@ -359,6 +364,39 @@ class GzPayShippingServiceImplTest {
             assertEquals(Boolean.TRUE, captor.getValue().getIsAllDelivered(),
                 "★ 被踩回 false 的话，整单其实已发完、微信侧却永远停在「部分发货」");
         }
+    }
+
+    @Test
+    @DisplayName("★★ 上报回写必须带守卫：期间被追加包裹改过 → 不许把 success 盖上去（否则新包裹永不上报）")
+    void uploadWriteBackIsGuarded() {
+        GzPayShippingOrder row = physicalRow(31L, GzPayShippingOrder.STATUS_PENDING, "TRK-A");
+        row.setAttemptCount(0);
+        when(shippingMapper.selectById(31L)).thenReturn(row);
+        when(shippingClient.uploadShippingInfo(any(UploadCommand.class))).thenReturn(UploadResult.ok());
+
+        service.retryOne(31L);
+
+        // ★ 必须走带守卫的回写，且守卫用「我读到的那一代」(pending, 0) 做条件
+        verify(shippingMapper).updateStatusGuarded(eq(31L),
+            eq(GzPayShippingOrder.STATUS_PENDING), eq(0),
+            eq(GzPayShippingOrder.STATUS_SUCCESS), eq(1), any(), eq(null));
+        // 绝不能再有无条件的 updateById 把状态盖掉
+        verify(shippingMapper, times(0)).updateById(any(GzPayShippingOrder.class));
+    }
+
+    @Test
+    @DisplayName("守卫未命中（并发追加已把行改回 pending/0）→ 静默放弃本次结果，交给新一次上报")
+    void guardMissDropsStaleResult() {
+        GzPayShippingOrder row = physicalRow(32L, GzPayShippingOrder.STATUS_PENDING, "TRK-A");
+        row.setAttemptCount(0);
+        when(shippingMapper.selectById(32L)).thenReturn(row);
+        when(shippingClient.uploadShippingInfo(any(UploadCommand.class))).thenReturn(UploadResult.ok());
+        when(shippingMapper.updateStatusGuarded(any(), any(), any(), any(), any(), any(), any())).thenReturn(0);
+
+        // 不抛、不改成别的状态；这一笔的结果被丢弃是正确行为
+        service.retryOne(32L);
+
+        verify(shippingMapper, times(0)).updateById(any(GzPayShippingOrder.class));
     }
 
     private static GzPayTransaction txn(String transactionId) {
