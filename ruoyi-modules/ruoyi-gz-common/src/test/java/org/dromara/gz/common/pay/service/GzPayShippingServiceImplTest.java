@@ -339,6 +339,26 @@ class GzPayShippingServiceImplTest {
         }
     }
 
+    @Test
+    @DisplayName("★★ is_all_delivered 单调收敛：已 true 的行不能被后到的 false 踩回去")
+    void isAllDeliveredNeverGoesBackToFalse() {
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(() -> TenantHelper.ignore(any(Supplier.class)))
+                .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
+            GzPayShippingOrder already = physicalRow(9L, GzPayShippingOrder.STATUS_SUCCESS, "TRK-A");
+            already.setIsAllDelivered(Boolean.TRUE);          // 另一笔并发已经收过口
+            when(shippingMapper.selectByTransactionIdForUpdate("txn-9")).thenReturn(already);
+
+            // 晚到的这笔在自己事务里算出的是 false（看不见对方的提交）
+            service.enqueue(txn("txn-9"), physical("TRK-B", false));
+
+            ArgumentCaptor<GzPayShippingOrder> captor = ArgumentCaptor.forClass(GzPayShippingOrder.class);
+            verify(shippingMapper).updateById(captor.capture());
+            assertEquals(Boolean.TRUE, captor.getValue().getIsAllDelivered(),
+                "★ 被踩回 false 的话，整单其实已发完、微信侧却永远停在「部分发货」");
+        }
+    }
+
     private static GzPayTransaction txn(String transactionId) {
         return GzPayTransaction.builder()
             .transactionId(transactionId).outTradeNo("JPO-x").businessType("jp").openid("o_jp")

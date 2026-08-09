@@ -225,6 +225,48 @@ class GzJpShippingUploadTest {
     }
 
     @Test
+    @DisplayName("★★ 发完最后一款后必须再收口一次 —— 事务内的快照算不准并发（QA 第 3 轮缺陷）")
+    void shipSettlesAfterCommit() {
+        GzJpFulfillFixture fx = new GzJpFulfillFixture()
+            .paidOrderWithTxn(1L, 10L, 501L, "4200WX0001", "13812345678")
+            .item(11L, 1L, GzJpFulfillStatus.CN_SORTING.getCode());
+
+        fx.service.ship(shipBo(List.of(11L), "sf", "SF0001"), 99L);
+
+        // 光靠 enqueue 里那个事务内快照不够：两个店员并发发最后两款时双方都算 false。
+        // 提交后（单测里无事务上下文 → 就地执行）必须再算一次并收口。
+        org.mockito.Mockito.verify(fx.shippingService).markAllDelivered("4200WX0001");
+    }
+
+    @Test
+    @DisplayName("还有款没发完 → 提交后那次也不能收口")
+    void shipDoesNotSettleWhenItemsRemain() {
+        GzJpFulfillFixture fx = new GzJpFulfillFixture()
+            .paidOrderWithTxn(1L, 10L, 501L, "4200WX0001", "13812345678")
+            .item(11L, 1L, GzJpFulfillStatus.CN_SORTING.getCode())
+            .item(12L, 1L, GzJpFulfillStatus.PURCHASING.getCode());
+
+        fx.service.ship(shipBo(List.of(11L), "sf", "SF0001"), 99L);
+
+        org.mockito.Mockito.verify(fx.shippingService, org.mockito.Mockito.never())
+            .markAllDelivered(org.mockito.ArgumentMatchers.anyString());
+    }
+
+    @Test
+    @DisplayName("★ 总开关 gz.pay.shipping-upload-enabled=false 能一键停掉拼团上报（与拼豆同一个闸）")
+    void killSwitchStopsUpload() {
+        GzJpFulfillFixture fx = new GzJpFulfillFixture()
+            .paidOrderWithTxn(1L, 10L, 501L, "4200WX0001", "13812345678")
+            .item(11L, 1L, GzJpFulfillStatus.CN_SORTING.getCode());
+        fx.payProperties.setShippingUploadEnabled(false);
+
+        fx.service.ship(shipBo(List.of(11L), "sf", "SF0001"), 99L);
+
+        assertTrue(fx.shippingEnqueues.isEmpty(), "关了闸就不该再入队");
+        assertEquals(GzJpFulfillStatus.DELIVERED.getCode(), fx.statusOf(11L), "但发货本身照常");
+    }
+
+    @Test
     @DisplayName("掩码规则：11 位保留前 3 后 4；非 11 位只留后 4；已掩码不二次打码")
     void maskContactRules() {
         assertEquals("138****5678", ShippingPackage.maskContact("13812345678"));

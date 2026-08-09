@@ -11,6 +11,7 @@ import org.dromara.common.core.service.DictService;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.common.domain.vo.GzUserVO;
+import org.dromara.gz.common.pay.config.WechatPayProperties;
 import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
 import org.dromara.gz.common.pay.mapper.GzPayTransactionMapper;
 import org.dromara.gz.common.pay.service.IGzPayShippingService;
@@ -39,6 +40,8 @@ import org.dromara.gz.jp.service.IGzJpFulfillService;
 import org.dromara.gz.jp.service.internal.GzJpFulfillStateMachine;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -116,6 +119,8 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
     private final IGzPayShippingService shippingService;
     /** 拼团小程序 clientid（上报要用对 appid 的 access_token） */
     private final GzJpPayProperties jpPayProperties;
+    /** 发货上报总开关（与拼豆同一个闸：类目/资质出问题时要能一键停掉） */
+    private final WechatPayProperties payProperties;
 
     // ============================================================
     //  批量推进（FLOW:F-JP-03.step2）
@@ -208,6 +213,10 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
      * @param trackingNo   运单号
      */
     private void enqueueShippingUpload(List<Long> ids, String carrier, String carrierLabel, String trackingNo) {
+        // 与拼豆同一个总开关：类目/资质/商户号出问题时要能一键停掉上报，而不是改代码重发版
+        if (!payProperties.isShippingUploadEnabled()) {
+            return;
+        }
         try {
             // 回读本事务内的最新值：只认「真的落到 delivered 且运单号就是这一单」的行。
             // 用回读而不是让 applyBatch 返回 id 列表，是因为「本来就已 delivered 且同运单号」的幂等行
@@ -226,9 +235,64 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
             for (Map.Entry<Long, List<GzJpOrderItem>> entry : byOrder.entrySet()) {
                 enqueueOneOrder(entry.getKey(), entry.getValue(), carrier, carrierLabel, trackingNo);
             }
+            // ★★ 事务提交后再算一次「整单发完了没」并收口。
+            //   上面 enqueueOneOrder 里的 isOrderAllDelivered 是**本事务快照**：两个店员同时发最后两款时，
+            //   RR 下双方都看不见对方在飞的那笔，于是都算出 false —— 整单其实已经发完，
+            //   微信侧却永远停在「部分发货」（只有 is_all_delivered=true 才收口）。
+            //   提交之后再查就能看见彼此的结果；markAllDelivered 本身幂等，两笔都跑也无妨。
+            registerAfterCommitSettle(byOrder.keySet());
         } catch (Exception e) {
             log.error("[gz-jp-fulfill] ★ 发货上报入队失败（已忽略，发货本身不受影响）tracking={}: {}",
                 trackingNo, e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 注册「事务提交后重算收口」——并发发最后两款时，事务内的快照必然算不准。
+     *
+     * <p>不在事务里跑的原因：{@code markAllDelivered} 要看见<b>别人刚提交</b>的行状态，
+     * 而 RR 快照看不见；且它内部会加行锁，放在本事务里等于把锁持有到事务结束。</p>
+     *
+     * <p>没有事务上下文时（单测 / 直接调用）就地执行，语义一致。</p>
+     */
+    private void registerAfterCommitSettle(Collection<Long> orderIds) {
+        List<Long> snapshot = new ArrayList<>(orderIds);
+        if (snapshot.isEmpty()) {
+            return;
+        }
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    settleOrders(snapshot);
+                }
+            });
+        } else {
+            settleOrders(snapshot);
+        }
+    }
+
+    /** 逐单：真的全部落定了才收口（异常只记日志，发货已经是既成事实）。 */
+    private void settleOrders(List<Long> orderIds) {
+        for (Long orderId : orderIds) {
+            try {
+                if (itemMapper.countUnfinishedByOrderId(orderId) != 0) {
+                    continue;
+                }
+                GzJpOrder order = orderMapper.selectById(orderId);
+                if (order == null || order.getPayTransactionId() == null) {
+                    continue;
+                }
+                GzPayTransaction txn = payTransactionMapper.selectById(order.getPayTransactionId());
+                if (txn == null || StrUtil.isBlank(txn.getTransactionId())) {
+                    continue;
+                }
+                if (shippingService.markAllDelivered(txn.getTransactionId())) {
+                    log.info("[gz-jp-fulfill] 订单 {} 已全部发完，发货上报收口", orderId);
+                }
+            } catch (Exception e) {
+                log.error("[gz-jp-fulfill] 订单 {} 发货收口失败（已忽略）: {}", orderId, e.getMessage(), e);
+            }
         }
     }
 

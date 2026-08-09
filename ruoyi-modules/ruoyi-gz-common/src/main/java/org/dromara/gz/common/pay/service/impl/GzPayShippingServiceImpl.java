@@ -253,7 +253,12 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
         upd.setShippingListJson(writePackages(packages));
         upd.setLogisticsType(info.logisticsType());
         upd.setDeliveryMode(info.deliveryMode());
-        upd.setIsAllDelivered(info.allDelivered());
+        // ★ 单调收敛：只允许 false→true，绝不让 true 被后到的 false 踩回去。
+        //   调用方的 allDelivered 是它自己事务内的快照，两个店员并发收尾时双方都可能算出 false；
+        //   谁最后写谁说了算的话，整单其实已经发完、微信侧却永远停在「部分发货」。
+        //   （真正把 true 算准的是 ship() 提交之后补的那次 markAllDelivered，见 GzJpFulfillServiceImpl。）
+        upd.setIsAllDelivered(Boolean.TRUE.equals(existing.getIsAllDelivered())
+            ? Boolean.TRUE : info.allDelivered());
         upd.setItemDesc(info.itemDesc());
         if (StrUtil.isNotBlank(info.clientId())) {
             upd.setClientId(info.clientId());

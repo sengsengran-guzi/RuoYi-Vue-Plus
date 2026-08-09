@@ -2,6 +2,7 @@ package org.dromara.gz.jp.service.impl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.dromara.common.core.service.DictService;
+import org.dromara.gz.common.pay.config.WechatPayProperties;
 import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
 import org.dromara.gz.common.pay.mapper.GzPayTransactionMapper;
 import org.dromara.gz.common.pay.service.IGzPayShippingService;
@@ -52,6 +53,8 @@ class GzJpFulfillFixture {
     final GzPayTransactionMapper payTransactionMapper = org.mockito.Mockito.mock(GzPayTransactionMapper.class);
     final IGzPayShippingService shippingService = org.mockito.Mockito.mock(IGzPayShippingService.class);
     final GzJpPayProperties jpPayProperties = new GzJpPayProperties();
+    /** 发货上报总开关（默认开；测「一键停」时置 false） */
+    final WechatPayProperties payProperties = new WechatPayProperties();
 
     /** 支付流水（id → 行），{@link #paidOrderWithTxn} 建 */
     final Map<Long, GzPayTransaction> transactions = new LinkedHashMap<>();
@@ -68,7 +71,7 @@ class GzJpFulfillFixture {
         org.mockito.Mockito.when(dictService.getAllDictByDictType(any()))
             .thenReturn(Map.of("sf", "顺丰速运", "yto", "圆通速递", "jd", "京东快递"));
         service = new GzJpFulfillServiceImpl(itemMapper, orderMapper, userService, dictService, new ObjectMapper(),
-            payTransactionMapper, shippingService, jpPayProperties);
+            payTransactionMapper, shippingService, jpPayProperties, payProperties);
     }
 
     // ============================================================
