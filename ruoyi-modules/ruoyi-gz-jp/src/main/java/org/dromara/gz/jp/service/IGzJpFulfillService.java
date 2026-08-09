@@ -65,5 +65,19 @@ public interface IGzJpFulfillService {
      * @param pageQuery 分页
      * @return 看板行分页（{@code rows} 不是 {@code data}）
      */
+    /**
+     * 发货提交后的<b>收口</b>：整单已全部落定的订单，把发货上报置为「已全部发完」并重报微信。
+     *
+     * <p><b>为什么必须 {@code @Async}（而不是在 afterCommit 里直接做）</b>：afterCommit 回调跑在
+     * <b>刚提交那条事务的连接</b>上，这时再写库，写的是一个要等连接归还才提交的隐式事务 ——
+     * 紧接着派出去的异步上报用的是<b>另一条连接</b>，读到的还是旧值（`upload_status=success`）
+     * 于是直接早退，「收口重报」只改了库、从没真报给微信。换个线程 = 换条连接 = 读得到已提交的数据。</p>
+     *
+     * <p>best-effort：任何异常只记日志。发货是既成事实，收口失败不该影响它。</p>
+     *
+     * @param orderIds 本次发货涉及的订单 id
+     */
+    void settleShippingAsync(java.util.List<Long> orderIds);
+
     TableDataInfo<GzJpFulfillBoardItemVO> selectBoardPage(GzJpFulfillQueryBo query, PageQuery pageQuery);
 }

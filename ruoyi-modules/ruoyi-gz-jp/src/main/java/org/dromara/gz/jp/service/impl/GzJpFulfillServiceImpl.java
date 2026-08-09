@@ -38,6 +38,9 @@ import org.dromara.gz.jp.mapper.GzJpOrderItemMapper;
 import org.dromara.gz.jp.mapper.GzJpOrderMapper;
 import org.dromara.gz.jp.service.IGzJpFulfillService;
 import org.dromara.gz.jp.service.internal.GzJpFulfillStateMachine;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.dao.ConcurrencyFailureException;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -121,6 +124,8 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
     private final GzJpPayProperties jpPayProperties;
     /** 发货上报总开关（与拼豆同一个闸：类目/资质出问题时要能一键停掉） */
     private final WechatPayProperties payProperties;
+    /** 自引用 Provider —— afterCommit 里取本 Bean 的代理调 @Async 方法（self-invocation 会失效） */
+    private final ObjectProvider<IGzJpFulfillService> selfProvider;
 
     // ============================================================
     //  批量推进（FLOW:F-JP-03.step2）
@@ -241,6 +246,11 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
             //   微信侧却永远停在「部分发货」（只有 is_all_delivered=true 才收口）。
             //   提交之后再查就能看见彼此的结果；markAllDelivered 本身幂等，两笔都跑也无妨。
             registerAfterCommitSettle(byOrder.keySet());
+        } catch (ConcurrencyFailureException poisoned) {
+            // ★ 死锁/锁超时必须穿透：InnoDB 已经把**整个事务**回滚了，这里再吞掉，
+            //   发货那几行的 UPDATE 也一起没了，而接口还会回「发货成功」。
+            //   店员以为发了、货真交寄了、系统里没这回事 —— 只能让本次请求失败让人重试。
+            throw poisoned;
         } catch (Exception e) {
             log.error("[gz-jp-fulfill] ★ 发货上报入队失败（已忽略，发货本身不受影响）tracking={}: {}",
                 trackingNo, e.getMessage(), e);
@@ -264,12 +274,21 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
                 public void afterCommit() {
-                    settleOrders(snapshot);
+                    // ★ 走自身代理的 @Async：afterCommit 仍跑在刚提交那条事务的连接上，
+                    //   在这里直接写库，写的是个要等连接归还才提交的隐式事务，
+                    //   紧接着派出去的异步上报用另一条连接读不到 → 收口永远不会真的报给微信。
+                    selfProvider.getObject().settleShippingAsync(snapshot);
                 }
             });
         } else {
             settleOrders(snapshot);
         }
+    }
+
+    @Override
+    @Async
+    public void settleShippingAsync(List<Long> orderIds) {
+        settleOrders(orderIds);
     }
 
     /** 逐单：真的全部落定了才收口（异常只记日志，发货已经是既成事实）。 */
@@ -317,6 +336,8 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
             ShippingInfo info = ShippingInfo.physicalPackage(
                 buildItemDesc(shipped), pkg, isOrderAllDelivered(orderId), jpPayProperties.getClientId());
             shippingService.enqueue(txn, info);
+        } catch (ConcurrencyFailureException poisoned) {
+            throw poisoned;   // 同上：事务已被 InnoDB 回滚，不能吞
         } catch (Exception e) {
             log.error("[gz-jp-fulfill] ★ 订单 {} 发货上报入队失败（已忽略）tracking={}: {}",
                 orderId, trackingNo, e.getMessage(), e);

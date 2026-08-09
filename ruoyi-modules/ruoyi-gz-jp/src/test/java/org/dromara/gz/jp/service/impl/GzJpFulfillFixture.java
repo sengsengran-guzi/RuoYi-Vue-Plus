@@ -15,6 +15,8 @@ import org.dromara.gz.jp.domain.enums.GzJpFulfillStatus;
 import org.dromara.gz.jp.domain.enums.GzJpOrderStatus;
 import org.dromara.gz.jp.mapper.GzJpOrderItemMapper;
 import org.dromara.gz.jp.mapper.GzJpOrderMapper;
+import org.dromara.gz.jp.service.IGzJpFulfillService;
+import org.springframework.beans.factory.ObjectProvider;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -70,8 +72,12 @@ class GzJpFulfillFixture {
         wireShipping();
         org.mockito.Mockito.when(dictService.getAllDictByDictType(any()))
             .thenReturn(Map.of("sf", "顺丰速运", "yto", "圆通速递", "jd", "京东快递"));
+        @SuppressWarnings("unchecked")
+        ObjectProvider<IGzJpFulfillService> selfProvider = org.mockito.Mockito.mock(ObjectProvider.class);
         service = new GzJpFulfillServiceImpl(itemMapper, orderMapper, userService, dictService, new ObjectMapper(),
-            payTransactionMapper, shippingService, jpPayProperties, payProperties);
+            payTransactionMapper, shippingService, jpPayProperties, payProperties, selfProvider);
+        // 单测无事务上下文 → 走同步分支，selfProvider 用不到；配上以防将来改路径
+        org.mockito.Mockito.lenient().when(selfProvider.getObject()).thenReturn(service);
     }
 
     // ============================================================
