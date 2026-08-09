@@ -4,6 +4,7 @@ import org.dromara.gz.common.pay.config.WechatPayProperties;
 import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
 import org.dromara.gz.common.pay.mapper.GzPayCallbackLogMapper;
 import org.dromara.gz.common.pay.mapper.GzPayTransactionMapper;
+import org.dromara.gz.common.pay.service.IGzPayShippingService;
 import org.dromara.gz.common.pay.service.internal.MockWechatPayClient;
 import org.dromara.gz.common.service.IGzUserService;
 import org.dromara.gz.jp.config.GzJpPayProperties;
@@ -73,6 +74,8 @@ class GzJpRefundFixture {
     final GzPayCallbackLogMapper callbackLogMapper = Mockito.mock(GzPayCallbackLogMapper.class);
     final IGzUserService userService = Mockito.mock(IGzUserService.class);
     final GzJpRefundNoGenerator noGenerator = Mockito.mock(GzJpRefundNoGenerator.class);
+    /** 发货上报（标购买失败可能让整单就此发完 → 收口重报，GZ-JP-301） */
+    final IGzPayShippingService shippingService = Mockito.mock(IGzPayShippingService.class);
 
     final WechatPayProperties payProperties = new WechatPayProperties();
     final GzJpPayProperties jpPayProperties = new GzJpPayProperties();
@@ -90,7 +93,8 @@ class GzJpRefundFixture {
         wireTxnMapper();
         txService = new GzJpRefundTxService(itemMapper, orderMapper, refundMapper, txnMapper, noGenerator);
         service = new GzJpRefundServiceImpl(txService, refundMapper, orderMapper, itemMapper,
-            payClient, payProperties, jpPayProperties, callbackLogMapper, userService);
+            payClient, payProperties, jpPayProperties, callbackLogMapper, userService,
+            txnMapper, shippingService);
     }
 
     // ============================================================
@@ -122,6 +126,8 @@ class GzJpRefundFixture {
             t.setId(txnId);
             t.setOutTradeNo("JPO-20260807-" + String.format("%06d", orderId + 1));
             t.setBusinessType("jp");
+            // 已支付单必然有微信支付单号（发货上报按它定位；缺了会被当成「无微信流水」跳过）
+            t.setTransactionId("4200MOCK" + orderId);
             t.setBusinessOrderNo(o.getOrderNo());
             t.setAmountCent(totalCent);
             t.setStatus("paid");
@@ -227,6 +233,31 @@ class GzJpRefundFixture {
             it.setRefundAmountCent(inv.getArgument(2));
             it.setVersion(it.getVersion() + 1);
             return 1;
+        });
+
+        // GZ-JP-301 发货收口用：本订单还有几行既没发货、也没购买失败（逐字照搬 SQL 的 NOT IN）
+        Mockito.when(itemMapper.countUnfinishedByOrderId(anyLong())).thenAnswer(inv -> {
+            Long orderId = inv.getArgument(0);
+            int n = 0;
+            for (GzJpOrderItem it : items.values()) {
+                if (orderId.equals(it.getOrderId()) && "0".equals(it.getDelFlag())
+                    && !GzJpFulfillStatus.DELIVERED.getCode().equals(it.getFulfillStatus())
+                    && !GzJpFulfillStatus.PURCHASE_FAILED.getCode().equals(it.getFulfillStatus())) {
+                    n++;
+                }
+            }
+            return n;
+        });
+        Mockito.when(itemMapper.selectByIds(any())).thenAnswer(inv -> {
+            Collection<?> ids = inv.getArgument(0);
+            List<GzJpOrderItem> out = new ArrayList<>();
+            for (Object id : ids) {
+                GzJpOrderItem it = items.get((Long) id);
+                if (it != null && "0".equals(it.getDelFlag())) {
+                    out.add(it);
+                }
+            }
+            return out;
         });
 
         Mockito.when(itemMapper.countByOrderId(anyLong())).thenAnswer(inv -> {

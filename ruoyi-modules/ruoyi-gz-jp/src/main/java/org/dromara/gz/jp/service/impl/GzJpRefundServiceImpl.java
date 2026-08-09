@@ -11,7 +11,10 @@ import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.common.domain.vo.GzUserVO;
 import org.dromara.gz.common.pay.config.WechatPayProperties;
 import org.dromara.gz.common.pay.domain.entity.GzPayCallbackLog;
+import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
 import org.dromara.gz.common.pay.mapper.GzPayCallbackLogMapper;
+import org.dromara.gz.common.pay.mapper.GzPayTransactionMapper;
+import org.dromara.gz.common.pay.service.IGzPayShippingService;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.NotifyContext;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.RefundCallbackResult;
@@ -23,6 +26,7 @@ import org.dromara.gz.jp.domain.bo.GzJpMarkFailedBo;
 import org.dromara.gz.jp.domain.bo.GzJpRefundQueryBo;
 import org.dromara.gz.jp.domain.dto.GzJpRefundRow;
 import org.dromara.gz.jp.domain.entity.GzJpOrder;
+import org.dromara.gz.jp.domain.entity.GzJpOrderItem;
 import org.dromara.gz.jp.domain.entity.GzJpRefund;
 import org.dromara.gz.jp.domain.enums.GzJpOrderStatus;
 import org.dromara.gz.jp.domain.enums.GzJpRefundStatus;
@@ -44,6 +48,7 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -115,6 +120,9 @@ public class GzJpRefundServiceImpl implements IGzJpRefundService {
     private final GzJpPayProperties jpPayProperties;
     private final GzPayCallbackLogMapper callbackLogMapper;
     private final IGzUserService userService;
+    /** 发货上报收口（标了购买失败可能让整单就此发完，见 {@link #settleShippingIfAllDone}） */
+    private final GzPayTransactionMapper payTransactionMapper;
+    private final IGzPayShippingService shippingService;
 
     // ============================================================
     //  标记购买失败 + 发起行级退款（FLOW:F-JP-04.step1/step2）
@@ -134,6 +142,12 @@ public class GzJpRefundServiceImpl implements IGzJpRefundService {
 
         // ── 事务① ──（提交后才调微信）
         GzJpRefundPlan plan = txService.markFailedAndCreateRefunds(ids, bo.getReason(), operatorId, triggeredBy);
+
+        // ★ 标了购买失败之后，整单可能就此「全部落定」了 —— 拼团最典型的收尾正是
+        //   「边到边发，最后剩几款买不到、标失败退款」。那条路径上原先一次发货上报都没有，
+        //   于是订单实际结束、微信侧却永远停在「部分发货」（只有 is_all_delivered=true 才收口）。
+        //   放在事务①提交之后：此刻 purchase_failed 已落库，countUnfinished 才算得准。
+        settleShippingIfAllDone(ids);
 
         // ── 事务外：逐张提交微信 ──
         int accepted = 0;
@@ -177,6 +191,47 @@ public class GzJpRefundServiceImpl implements IGzJpRefundService {
         }
 
         return buildResult(plan, acceptedLines, accepted, failed);
+    }
+
+    /**
+     * 标完购买失败后，把「已经全部落定」的订单的发货上报收口为 {@code is_all_delivered=true}。
+     *
+     * <p>「落定」= 该订单再没有 {@code fulfill_status} 处于 delivered / purchase_failed 之外的行。
+     * 整单一个包裹都没发过（全部购买失败）时没有发货任务行，{@code markAllDelivered} 自己会跳过。</p>
+     *
+     * <p><b>全程吞异常</b>：购买失败与退款是既成事实，收口只是上报侧的次要动作，
+     * 任何问题都不能让本次操作失败（同 {@code IGzPayShippingService.enqueue} 的口径）。</p>
+     *
+     * @param requestedIds 本次请求的商品行 id（用它反查涉及哪些订单；被拒的行一起查也无害，收口是幂等的）
+     */
+    private void settleShippingIfAllDone(List<Long> requestedIds) {
+        try {
+            List<GzJpOrderItem> rows = itemMapper.selectByIds(requestedIds);
+            Set<Long> orderIds = new LinkedHashSet<>();
+            for (GzJpOrderItem row : rows) {
+                if (row.getOrderId() != null) {
+                    orderIds.add(row.getOrderId());
+                }
+            }
+            for (Long orderId : orderIds) {
+                if (itemMapper.countUnfinishedByOrderId(orderId) != 0) {
+                    continue;
+                }
+                GzJpOrder order = orderMapper.selectById(orderId);
+                if (order == null || order.getPayTransactionId() == null) {
+                    continue;
+                }
+                GzPayTransaction txn = payTransactionMapper.selectById(order.getPayTransactionId());
+                if (txn == null || StrUtil.isBlank(txn.getTransactionId())) {
+                    continue;
+                }
+                if (shippingService.markAllDelivered(txn.getTransactionId())) {
+                    log.info("[gz-jp-refund] 订单 {} 因购买失败而全部落定，发货上报已收口", orderId);
+                }
+            }
+        } catch (Exception e) {
+            log.error("[gz-jp-refund] 发货收口检查失败（已忽略，不影响购买失败/退款）: {}", e.getMessage(), e);
+        }
     }
 
     /**

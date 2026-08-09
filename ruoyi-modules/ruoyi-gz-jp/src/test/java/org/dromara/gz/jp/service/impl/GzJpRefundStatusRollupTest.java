@@ -439,4 +439,39 @@ class GzJpRefundStatusRollupTest {
         assertEquals(GzJpRefundFixture.CUSTOMS, f.row(182L).getFulfillStatus());
         System.out.println("[全额退款旁路] 订单 → refunded、两行补已退金额；fulfill_status 保持 delivered / customs 不变");
     }
+
+    // ============================================================
+    //  GZ-JP-301 发货收口（D6 QA 第 2 轮逮到的缺陷回归）
+    // ============================================================
+
+    @Test
+    @DisplayName("★★ 最后一款买不到 → 整单就此发完，发货上报必须收口（否则微信侧永远停在「部分发货」）")
+    void markFailedOnLastItemSettlesShipping() {
+        GzJpRefundFixture f = new GzJpRefundFixture()
+            .paidOrder(1L, 10L, 20000L)
+            .item(11L, 1L, 10000L, GzJpRefundFixture.DELIVERED)      // 已发货
+            .item(12L, 1L, 10000L, GzJpRefundFixture.PURCHASING);    // 还没买到
+
+        f.service.markPurchaseFailedAndRefund(bo("日方缺货", 12L), 99L, "admin");
+
+        // 12 落到 purchase_failed ⇒ 整单再没有「既没发货也没购买失败」的行 ⇒ 该收口
+        assertEquals(GzJpRefundFixture.PURCHASE_FAILED, f.row(12L).getFulfillStatus());
+        org.mockito.Mockito.verify(f.shippingService)
+            .markAllDelivered("4200MOCK1");
+    }
+
+    @Test
+    @DisplayName("还有款没发完时不能提前收口 —— 提前置 true 会让后续包裹只剩那唯一一次「重新发货」机会")
+    void doesNotSettleWhileItemsStillPending() {
+        GzJpRefundFixture f = new GzJpRefundFixture()
+            .paidOrder(2L, 10L, 30000L)
+            .item(21L, 2L, 10000L, GzJpRefundFixture.DELIVERED)
+            .item(22L, 2L, 10000L, GzJpRefundFixture.PURCHASING)
+            .item(23L, 2L, 10000L, GzJpRefundFixture.CUSTOMS);       // 还在清关，之后还会有包裹
+
+        f.service.markPurchaseFailedAndRefund(bo("日方缺货", 22L), 99L, "admin");
+
+        org.mockito.Mockito.verify(f.shippingService, org.mockito.Mockito.never())
+            .markAllDelivered(org.mockito.ArgumentMatchers.anyString());
+    }
 }

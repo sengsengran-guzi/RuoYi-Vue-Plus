@@ -7,6 +7,7 @@ import org.dromara.gz.common.pay.mapper.GzPayShippingOrderMapper;
 import org.dromara.gz.common.pay.service.IGzPayShippingService.UploadStats;
 import org.dromara.gz.common.pay.service.impl.GzPayShippingServiceImpl;
 import org.dromara.gz.common.pay.shipping.ShippingInfo;
+import org.dromara.gz.common.pay.shipping.ShippingPackage;
 import org.dromara.gz.common.pay.shipping.WxShippingClient;
 import org.dromara.gz.common.pay.shipping.WxShippingClient.UploadCommand;
 import org.dromara.gz.common.pay.shipping.WxShippingClient.UploadResult;
@@ -20,13 +21,18 @@ import org.mockito.Mock;
 import org.mockito.MockedStatic;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.dao.DuplicateKeyException;
 
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -60,6 +66,9 @@ class GzPayShippingServiceImplTest {
     @BeforeEach
     void setUp() {
         service = new GzPayShippingServiceImpl(shippingMapper, shippingClient, selfProvider);
+        // 行有 id 时 registerAfterCommitUpload 会 selfProvider.getObject().tryUploadAsync(id)；
+        // 不桩的话拿到 null → NPE 被 service 的兜底 catch 吞掉，测试看到的是「返回 false」而不是真实行为
+        lenient().when(selfProvider.getObject()).thenReturn(mock(IGzPayShippingService.class));
     }
 
     @Test
@@ -185,6 +194,155 @@ class GzPayShippingServiceImplTest {
     void retryOne_nullIdReturnsFalse() {
         assertEquals(false, service.retryOne(null));
         verify(shippingMapper, times(0)).selectById(any());
+    }
+
+    // ============================================================
+    //  多包裹并发与收口（D6 QA 第 2 轮逮到的三个「静默丢数据」缺陷的回归）
+    // ============================================================
+
+    /** 造一行实物件发货任务（已带 N 个包裹）。 */
+    private GzPayShippingOrder physicalRow(Long id, String status, String... trackings) {
+        StringBuilder json = new StringBuilder("[");
+        for (int i = 0; i < trackings.length; i++) {
+            json.append(i > 0 ? "," : "")
+                .append("{\"trackingNo\":\"").append(trackings[i]).append("\",\"carrierName\":\"顺丰速运\"}");
+        }
+        return GzPayShippingOrder.builder()
+            .id(id).transactionId("txn-" + id).outTradeNo("JPO-" + id).businessType("jp")
+            .openid("o_jp").clientId("mp-applet-gz-jp")
+            .logisticsType(ShippingInfo.PHYSICAL).deliveryMode(ShippingInfo.DELIVERY_MODE_SPLIT)
+            .isAllDelivered(Boolean.FALSE)
+            .shippingListJson(json.append("]").toString())
+            .uploadStatus(status).attemptCount(0)
+            .paidTime(LocalDateTime.now().minusMinutes(5))
+            .build();
+    }
+
+    private static ShippingInfo physical(String tracking, boolean allDelivered) {
+        return ShippingInfo.physicalPackage("货",
+            new ShippingPackage(tracking, "sf", "顺丰速运", "货", "138****5678"),
+            allDelivered, "mp-applet-gz-jp");
+    }
+
+    @Test
+    @DisplayName("★★ 追加包裹走行锁读（FOR UPDATE），不是普通 selectOne —— 不然并发会丢包裹")
+    void appendPackage_readsWithRowLock() {
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(() -> TenantHelper.ignore(any(Supplier.class)))
+                .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
+            when(shippingMapper.selectByTransactionIdForUpdate("txn-1"))
+                .thenReturn(physicalRow(1L, GzPayShippingOrder.STATUS_SUCCESS, "TRK-A"));
+
+            service.enqueue(txn("txn-1"), physical("TRK-B", false));
+
+            // ★ 必须走加锁读；一旦有人改回 selectOne，这条就红
+            verify(shippingMapper).selectByTransactionIdForUpdate("txn-1");
+            ArgumentCaptor<GzPayShippingOrder> captor = ArgumentCaptor.forClass(GzPayShippingOrder.class);
+            verify(shippingMapper).updateById(captor.capture());
+            String json = captor.getValue().getShippingListJson();
+            assertTrue(json.contains("TRK-A") && json.contains("TRK-B"),
+                "两个包裹都要在清单里，实际=" + json);
+        }
+    }
+
+    @Test
+    @DisplayName("★★ 并发建行撞唯一键 → 回头把包裹并进既有行，绝不能直接 return（那会丢掉本次运单）")
+    void enqueue_duplicateKeyThenAppends() {
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(() -> TenantHelper.ignore(any(Supplier.class)))
+                .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
+            // 第一次加锁读没读到（行还没被对方提交）→ 走 insert → 撞唯一键 → 再读就有了
+            when(shippingMapper.selectByTransactionIdForUpdate("txn-2"))
+                .thenReturn(null)
+                .thenReturn(physicalRow(2L, GzPayShippingOrder.STATUS_PENDING, "TRK-WINNER"));
+            when(shippingMapper.insert(any(GzPayShippingOrder.class))).thenThrow(new DuplicateKeyException("uk_transaction_id"));
+
+            service.enqueue(txn("txn-2"), physical("TRK-MINE", false));
+
+            ArgumentCaptor<GzPayShippingOrder> captor = ArgumentCaptor.forClass(GzPayShippingOrder.class);
+            verify(shippingMapper).updateById(captor.capture());
+            String json = captor.getValue().getShippingListJson();
+            assertTrue(json.contains("TRK-WINNER") && json.contains("TRK-MINE"),
+                "★ 输的那一笔的运单不能凭空消失，实际=" + json);
+        }
+    }
+
+    @Test
+    @DisplayName("★ 入队炸了要把原因写进 last_error（只写日志的话运营完全看不见包裹丢了）")
+    void enqueueFailure_writesLastError() {
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(() -> TenantHelper.ignore(any(Supplier.class)))
+                .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
+            when(shippingMapper.selectByTransactionIdForUpdate("txn-3"))
+                .thenReturn(physicalRow(3L, GzPayShippingOrder.STATUS_SUCCESS, "TRK-A"));
+            // 追加时写库炸（模拟列装不下 / 连接问题）
+            when(shippingMapper.updateById(any(GzPayShippingOrder.class))).thenThrow(new RuntimeException("Data too long for column"));
+            when(shippingMapper.selectOne(any())).thenReturn(physicalRow(3L, GzPayShippingOrder.STATUS_SUCCESS, "TRK-A"));
+
+            service.enqueue(txn("txn-3"), physical("TRK-B", false));   // 不抛
+
+            ArgumentCaptor<GzPayShippingOrder> captor = ArgumentCaptor.forClass(GzPayShippingOrder.class);
+            verify(shippingMapper, atLeastOnce()).updateById(captor.capture());
+            boolean wroteError = captor.getAllValues().stream()
+                .anyMatch(r -> r.getLastError() != null && r.getLastError().contains("TRK-B"));
+            assertTrue(wroteError, "★ 必须把失败原因落到 last_error，admin 才看得见");
+        }
+    }
+
+    @Test
+    @DisplayName("★★ markAllDelivered：整单发完（最后一款是购买失败）→ 收口并重新排队")
+    void markAllDelivered_setsFlagAndRequeues() {
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(() -> TenantHelper.ignore(any(Supplier.class)))
+                .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
+            when(shippingMapper.selectByTransactionIdForUpdate("txn-4"))
+                .thenReturn(physicalRow(4L, GzPayShippingOrder.STATUS_SUCCESS, "TRK-A"));
+
+            assertTrue(service.markAllDelivered("txn-4"));
+
+            ArgumentCaptor<GzPayShippingOrder> captor = ArgumentCaptor.forClass(GzPayShippingOrder.class);
+            verify(shippingMapper).updateById(captor.capture());
+            assertEquals(Boolean.TRUE, captor.getValue().getIsAllDelivered());
+            assertEquals(GzPayShippingOrder.STATUS_PENDING, captor.getValue().getUploadStatus(),
+                "要重新排队，否则改了标记也不会报给微信");
+        }
+    }
+
+    @Test
+    @DisplayName("markAllDelivered：没有发货任务行（整单全部购买失败）→ 什么都不做，不报错")
+    void markAllDelivered_noRowIsNoop() {
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(() -> TenantHelper.ignore(any(Supplier.class)))
+                .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
+            when(shippingMapper.selectByTransactionIdForUpdate("txn-5")).thenReturn(null);
+
+            assertEquals(false, service.markAllDelivered("txn-5"));
+            verify(shippingMapper, times(0)).updateById(any(GzPayShippingOrder.class));
+        }
+    }
+
+    @Test
+    @DisplayName("★ markAllDelivered：blocked 行只置标记、不自动重试（那次机会不能烧在 cron 上）")
+    void markAllDelivered_blockedDoesNotRequeue() {
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(() -> TenantHelper.ignore(any(Supplier.class)))
+                .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
+            when(shippingMapper.selectByTransactionIdForUpdate("txn-6"))
+                .thenReturn(physicalRow(6L, GzPayShippingOrder.STATUS_BLOCKED, "TRK-A"));
+
+            assertEquals(false, service.markAllDelivered("txn-6"));
+
+            ArgumentCaptor<GzPayShippingOrder> captor = ArgumentCaptor.forClass(GzPayShippingOrder.class);
+            verify(shippingMapper).updateById(captor.capture());
+            assertEquals(Boolean.TRUE, captor.getValue().getIsAllDelivered());
+            assertEquals(null, captor.getValue().getUploadStatus(), "★ 不能放回 pending");
+        }
+    }
+
+    private static GzPayTransaction txn(String transactionId) {
+        return GzPayTransaction.builder()
+            .transactionId(transactionId).outTradeNo("JPO-x").businessType("jp").openid("o_jp")
+            .paidTime(LocalDateTime.now()).build();
     }
 
     private GzPayShippingOrder row(Long id, String status) {

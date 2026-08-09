@@ -31,6 +31,24 @@ public interface IGzPayShippingService {
     void enqueue(GzPayTransaction txn, ShippingInfo info);
 
     /**
+     * 把某笔支付单的发货任务<b>收口</b>为「整单已全部发完」（{@code is_all_delivered=true}）并重新排队上报。
+     *
+     * <p><b>为什么单独要这么个方法</b>：{@code is_all_delivered} 原先只在「发货」那一刻算一次快照，
+     * 而一单最后一款的落定<b>未必是发货</b> —— 拼团最典型的收尾恰恰是「边到边发，最后剩几款买不到、
+     * 标购买失败并退款」。那条路径上一次 {@link #enqueue} 都没有，于是整单其实已经结束，
+     * 微信侧却永远停在「部分发货」，而按代码口径只有 {@code true} 才触发微信「发货完成」，
+     * 后果是发货状态永不收敛（历史上拼豆已经因为发货未收口吃过微信警告 + 影响资金结算）。</p>
+     *
+     * <p><b>幂等 + 无副作用</b>：没有该支付单的发货任务行（整单都没发过货，比如全部购买失败）→ 什么都不做；
+     * 已经是 {@code true} → 不重复排队。行处于 {@code blocked}（微信终态拒绝）→ 只改标记不自动重试。
+     * 与 {@link #enqueue} 同口径：<b>任何异常只记日志，绝不上抛</b>，不能拖垮调用方的业务事务。</p>
+     *
+     * @param transactionId 微信支付单号
+     * @return true = 确实改成了「已全部发完」并重新排队；false = 无需处理或处理失败
+     */
+    boolean markAllDelivered(String transactionId);
+
+    /**
      * 异步即时上报单条任务（提交后触发，best-effort，不抛异常）。失败留给 {@link #uploadPending} 重试。
      *
      * @param shippingId gz_pay_shipping_order 主键

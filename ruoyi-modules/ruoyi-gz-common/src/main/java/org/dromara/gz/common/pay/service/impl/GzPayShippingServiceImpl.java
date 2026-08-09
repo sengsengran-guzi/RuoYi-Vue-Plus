@@ -69,7 +69,9 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
     @Override
     public void enqueue(GzPayTransaction txn, ShippingInfo info) {
         try {
-            GzPayShippingOrder existing = findByTransactionId(txn.getTransactionId());
+            // ★ 一律先加行锁再读：追加包裹是读-改-写，不锁就会「两个店员同时发两个运单 → 丢一个」
+            //   （两边都读到 N 个、都写回 N+1 个，后写的覆盖先写的，且两个请求都返回成功）。
+            GzPayShippingOrder existing = lockByTransactionId(txn.getTransactionId());
             if (existing == null) {
                 insertNew(txn, info);
                 return;
@@ -81,14 +83,97 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
             }
             appendPackage(existing, info);
         } catch (DuplicateKeyException dup) {
-            // 并发的另一个发货动作刚为同一交易建了行 —— 它自己会带上包裹上报，本次跳过不重复建
-            log.info("[gz-shipping] 发货任务已存在跳过入队（并发）transaction_id={}", txn.getTransactionId());
+            // 并发的另一笔刚抢先建了行。★ 不能就这么 return —— 那会把**本次的包裹**丢掉
+            //   （赢的那笔只带它自己的运单，我的运单再也没人报）。回头加锁读出来，把包裹并进去。
+            try {
+                GzPayShippingOrder existing = lockByTransactionId(txn.getTransactionId());
+                if (existing != null && info.shipmentPackage() != null) {
+                    appendPackage(existing, info);
+                    log.info("[gz-shipping] 并发建行冲突已化解：包裹并入既有任务 transaction_id={} tracking={}",
+                        txn.getTransactionId(), info.shipmentPackage().getTrackingNo());
+                } else {
+                    log.info("[gz-shipping] 发货任务已存在跳过入队（并发）transaction_id={}", txn.getTransactionId());
+                }
+            } catch (Exception retry) {
+                logEnqueueFailure(txn, info, retry);
+            }
         } catch (Exception e) {
-            // ★ 入队失败绝不回滚调用方事务：支付确认（拼豆）与店员发货（拼团）都是既成事实，
-            //   上报只是次要链路。MySQL 语句级回滚，事务/连接仍可用，调用方后续写入正常提交。
-            log.error("[gz-shipping] 发货任务入队失败（已忽略，不影响支付/发货）out_trade_no={}: {}",
-                txn.getOutTradeNo(), e.getMessage(), e);
+            logEnqueueFailure(txn, info, e);
         }
+    }
+
+    /**
+     * 入队失败的统一记账。
+     *
+     * <p>★ 入队失败<b>绝不回滚调用方事务</b>：支付确认（拼豆）与店员发货（拼团）都是既成事实，
+     * 上报只是次要链路。MySQL 语句级回滚，事务/连接仍可用，调用方后续写入正常提交。</p>
+     *
+     * <p><b>但不能只写日志就算完</b>：日志没人天天看，而这条链路的失败形态是「HTTP 200 发货成功 +
+     * 包裹静默消失 + admin 列表一切正常」。所以只要行已存在，就把原因写进 {@code last_error}
+     * 让 owner 在发货管理页看得见（写 last_error 本身再失败也只记日志，不能套娃拖垮调用方）。</p>
+     */
+    private void logEnqueueFailure(GzPayTransaction txn, ShippingInfo info, Exception e) {
+        String tracking = info.shipmentPackage() == null ? null : info.shipmentPackage().getTrackingNo();
+        log.error("[gz-shipping] 发货任务入队失败（已忽略，不影响支付/发货）out_trade_no={} tracking={}: {}",
+            txn.getOutTradeNo(), tracking, e.getMessage(), e);
+        try {
+            GzPayShippingOrder existing = findByTransactionId(txn.getTransactionId());
+            if (existing != null) {
+                GzPayShippingOrder upd = new GzPayShippingOrder();
+                upd.setId(existing.getId());
+                upd.setLastError(StrUtil.maxLength(
+                    "运单 " + tracking + " 入队失败未能并入上报：" + e.getMessage(), 480));
+                shippingMapper.updateById(upd);
+            }
+        } catch (Exception ignore) {
+            log.warn("[gz-shipping] 连 last_error 都没写进去 transaction_id={}: {}",
+                txn.getTransactionId(), ignore.getMessage());
+        }
+    }
+
+    @Override
+    public boolean markAllDelivered(String transactionId) {
+        try {
+            GzPayShippingOrder existing = lockByTransactionId(transactionId);
+            if (existing == null) {
+                // 整单一个包裹都没发过（例如全部购买失败）—— 没有可收口的上报任务，不是异常
+                return false;
+            }
+            if (Boolean.TRUE.equals(existing.getIsAllDelivered())) {
+                return false;
+            }
+            GzPayShippingOrder upd = new GzPayShippingOrder();
+            upd.setId(existing.getId());
+            upd.setIsAllDelivered(Boolean.TRUE);
+
+            boolean blocked = GzPayShippingOrder.STATUS_BLOCKED.equals(existing.getUploadStatus());
+            if (blocked) {
+                // 同 appendPackage：blocked 是微信终态拒绝，自动重试只会白烧那唯一一次机会
+                upd.setLastError("微信侧已终态拒绝（blocked），整单已发完的收口标记未自动上报，需人工处理");
+                shippingMapper.updateById(upd);
+                log.error("[gz-shipping] ★ 支付单 {} 处于 blocked，收口标记已置但不自动重试，请人工处理", transactionId);
+                return false;
+            }
+            upd.setUploadStatus(GzPayShippingOrder.STATUS_PENDING);
+            upd.setAttemptCount(0);
+            shippingMapper.updateById(upd);
+            registerAfterCommitUpload(existing.getId());
+            log.info("[gz-shipping] 整单已全部发完，收口重报 transaction_id={}", transactionId);
+            return true;
+        } catch (Exception e) {
+            // 同 enqueue：收口失败绝不上抛（调用方是「标记购买失败/退款」这类既成事实的业务事务）
+            log.error("[gz-shipping] 发货收口失败（已忽略，不影响业务）transaction_id={}: {}",
+                transactionId, e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /** 按支付单号加行锁读（追加包裹的读-改-写必须串行化，见 mapper 注释）。 */
+    private GzPayShippingOrder lockByTransactionId(String transactionId) {
+        if (StrUtil.isBlank(transactionId)) {
+            return null;
+        }
+        return TenantHelper.ignore(() -> shippingMapper.selectByTransactionIdForUpdate(transactionId));
     }
 
     /** 按微信支付单号取上报任务（忽略租户：cron / @Async 无登录态，与其它扫表路径同口径）。 */
