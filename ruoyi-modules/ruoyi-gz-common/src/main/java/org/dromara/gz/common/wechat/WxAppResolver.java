@@ -103,6 +103,34 @@ public class WxAppResolver {
         return properties.resolveApp(clientId);
     }
 
+    /**
+     * 【宽松 + 指定归属】优先按<b>任务自带的</b> clientid 解析，缺省或认不出才回落当前请求 / 默认 app。
+     *
+     * <p><b>发货信息上报专用</b>。上报几乎总是发生在<b>没有原请求上下文</b>的线程里
+     * （支付回调后的 {@code @Async}、店员点发货后的 {@code @Async}、cron、admin 补报按钮），
+     * 此时 {@link #currentAppOrDefault()} 只能回落 {@code default-client-id} ——
+     * 多小程序下这意味着<b>拿 A 小程序的 access_token 去报 B 小程序的订单</b>，
+     * 微信恒回「支付单不存在」且重试永远好不了。所以发货任务落库时把归属 clientid 一起存下来，
+     * 上报时以它为准。</p>
+     *
+     * <p>认不出的 clientid <b>不抛错</b>（与 {@link #currentAppOrDefault()} 同口径）：
+     * 存量行的该列是空串，回落默认即改造前行为；配置里删掉某个小程序也不该让历史任务上报时 500。</p>
+     *
+     * @param clientId 任务自带的归属 clientid，可为 null / 空
+     * @return 小程序配置（永不为 null）
+     */
+    public MiniappApp appOfOrDefault(String clientId) {
+        if (StringUtils.isNotBlank(clientId)) {
+            MiniappApp app = properties.resolveApps().get(clientId);
+            if (app != null) {
+                return app;
+            }
+            log.warn("[wx-app] 任务归属 clientid={} 不在 wx.miniapp.apps 里（已配置：{}），回落默认 app —— "
+                + "若该任务确属另一个小程序，上报会失败，请补配置", clientId, properties.resolveApps().keySet());
+        }
+        return currentAppOrDefault();
+    }
+
     /** 当前请求对应的小程序 appid（微信各接口的凭证维度）；严格口径，仅 mp 侧调用点可用。 */
     public String currentAppid() {
         return currentApp().getAppid();

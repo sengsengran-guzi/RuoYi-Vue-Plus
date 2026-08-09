@@ -2,7 +2,12 @@ package org.dromara.gz.jp.service.impl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.dromara.common.core.service.DictService;
+import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
+import org.dromara.gz.common.pay.mapper.GzPayTransactionMapper;
+import org.dromara.gz.common.pay.service.IGzPayShippingService;
+import org.dromara.gz.common.pay.shipping.ShippingInfo;
 import org.dromara.gz.common.service.IGzUserService;
+import org.dromara.gz.jp.config.GzJpPayProperties;
 import org.dromara.gz.jp.domain.entity.GzJpOrder;
 import org.dromara.gz.jp.domain.entity.GzJpOrderItem;
 import org.dromara.gz.jp.domain.enums.GzJpFulfillStatus;
@@ -44,15 +49,26 @@ class GzJpFulfillFixture {
     final GzJpOrderMapper orderMapper = org.mockito.Mockito.mock(GzJpOrderMapper.class);
     final IGzUserService userService = org.mockito.Mockito.mock(IGzUserService.class);
     final DictService dictService = org.mockito.Mockito.mock(DictService.class);
+    final GzPayTransactionMapper payTransactionMapper = org.mockito.Mockito.mock(GzPayTransactionMapper.class);
+    final IGzPayShippingService shippingService = org.mockito.Mockito.mock(IGzPayShippingService.class);
+    final GzJpPayProperties jpPayProperties = new GzJpPayProperties();
+
+    /** 支付流水（id → 行），{@link #paidOrderWithTxn} 建 */
+    final Map<Long, GzPayTransaction> transactions = new LinkedHashMap<>();
+
+    /** 发货上报入队记录：每次 {@code shippingService.enqueue} 的 (交易, 发货信息) */
+    final List<Map.Entry<GzPayTransaction, ShippingInfo>> shippingEnqueues = new ArrayList<>();
 
     final GzJpFulfillServiceImpl service;
 
     GzJpFulfillFixture() {
         wireItemMapper();
         wireOrderMapper();
+        wireShipping();
         org.mockito.Mockito.when(dictService.getAllDictByDictType(any()))
             .thenReturn(Map.of("sf", "顺丰速运", "yto", "圆通速递", "jd", "京东快递"));
-        service = new GzJpFulfillServiceImpl(itemMapper, orderMapper, userService, dictService, new ObjectMapper());
+        service = new GzJpFulfillServiceImpl(itemMapper, orderMapper, userService, dictService, new ObjectMapper(),
+            payTransactionMapper, shippingService, jpPayProperties);
     }
 
     // ============================================================
@@ -193,5 +209,88 @@ class GzJpFulfillFixture {
             }
             return out;
         });
+        org.mockito.Mockito.when(orderMapper.selectById(any()))
+            .thenAnswer(inv -> orders.get((Long) inv.getArgument(0)));
+    }
+
+    // ============================================================
+    //  发货上报（GZ-JP-301）
+    // ============================================================
+
+    private void wireShipping() {
+        // 回读本次发货后的行（服务用它筛出「真落到 delivered 且运单号就是这一单」的行）
+        org.mockito.Mockito.when(itemMapper.selectByIds(any())).thenAnswer(inv -> {
+            Collection<?> ids = inv.getArgument(0);
+            List<GzJpOrderItem> out = new ArrayList<>();
+            for (Object id : ids) {
+                GzJpOrderItem it = items.get((Long) id);
+                if (it != null && "0".equals(it.getDelFlag())) {
+                    out.add(it);
+                }
+            }
+            return out;
+        });
+
+        // is_all_delivered 的分母：本订单还有几行既没发货也没购买失败（逐字照搬 SQL 的 NOT IN）
+        org.mockito.Mockito.when(itemMapper.countUnfinishedByOrderId(any())).thenAnswer(inv -> {
+            Long orderId = inv.getArgument(0);
+            int n = 0;
+            for (GzJpOrderItem it : items.values()) {
+                if (orderId.equals(it.getOrderId()) && "0".equals(it.getDelFlag())
+                    && !GzJpFulfillStatus.DELIVERED.getCode().equals(it.getFulfillStatus())
+                    && !GzJpFulfillStatus.PURCHASE_FAILED.getCode().equals(it.getFulfillStatus())) {
+                    n++;
+                }
+            }
+            return n;
+        });
+
+        org.mockito.Mockito.when(payTransactionMapper.selectById(any()))
+            .thenAnswer(inv -> transactions.get((Long) inv.getArgument(0)));
+
+        org.mockito.Mockito.doAnswer(inv -> {
+            shippingEnqueues.add(new java.util.AbstractMap.SimpleEntry<>(inv.getArgument(0), inv.getArgument(1)));
+            return null;
+        }).when(shippingService).enqueue(any(), any());
+    }
+
+    /**
+     * 建一张<b>带微信支付流水</b>的已支付订单（发货上报要靠 transaction_id 找支付单）。
+     *
+     * @param orderId   订单 id
+     * @param userId    客人 id
+     * @param txId      支付流水主键
+     * @param wxTxnNo   微信 transaction_id
+     * @param mobile    收件人手机号（进地址快照；null = 不带地址快照）
+     */
+    GzJpFulfillFixture paidOrderWithTxn(long orderId, long userId, long txId, String wxTxnNo, String mobile) {
+        paidOrder(orderId, userId);
+        GzJpOrder o = orders.get(orderId);
+        o.setPayTransactionId(txId);
+        if (mobile != null) {
+            o.setAddressSnapshotJson("{\"recipient\":\"测试收件人\",\"mobile\":\"" + mobile + "\"}");
+        }
+        GzPayTransaction txn = new GzPayTransaction();
+        txn.setId(txId);
+        txn.setTransactionId(wxTxnNo);
+        txn.setOutTradeNo("JPO-" + orderId);
+        transactions.put(txId, txn);
+        return this;
+    }
+
+    /** 给商品行塞商品快照名（item_desc 用） */
+    GzJpFulfillFixture itemName(long itemId, String name) {
+        items.get(itemId).setProductSnapshotJson("{\"name\":\"" + name + "\"}");
+        return this;
+    }
+
+    /** 本次发货上报里，属于某笔微信交易的那条（没有则 null） */
+    ShippingInfo enqueuedFor(String wxTxnNo) {
+        for (Map.Entry<GzPayTransaction, ShippingInfo> e : shippingEnqueues) {
+            if (wxTxnNo.equals(e.getKey().getTransactionId())) {
+                return e.getValue();
+            }
+        }
+        return null;
     }
 }

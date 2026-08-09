@@ -21,8 +21,10 @@ public class WxMockShippingClient implements WxShippingClient {
 
     @Override
     public UploadResult uploadShippingInfo(UploadCommand cmd) {
-        log.info("[wx-shipping-mock] 模拟发货信息上报成功 transaction_id={} logisticsType={} itemDesc={}",
-            cmd.transactionId(), cmd.logisticsType(), cmd.itemDesc());
+        log.info("[wx-shipping-mock] 模拟发货信息上报成功 transaction_id={} clientId={} logisticsType={} "
+                + "deliveryMode={} allDelivered={} packages={} itemDesc={}",
+            cmd.transactionId(), cmd.clientId(), cmd.logisticsType(), cmd.deliveryMode(),
+            cmd.allDelivered(), cmd.packages() == null ? 0 : cmd.packages().size(), cmd.itemDesc());
         return UploadResult.ok();
     }
 }

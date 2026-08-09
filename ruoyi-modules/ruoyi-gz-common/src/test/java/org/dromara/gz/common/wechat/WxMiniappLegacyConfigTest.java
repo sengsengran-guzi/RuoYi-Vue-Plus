@@ -172,7 +172,10 @@ class WxMiniappLegacyConfigTest {
         WxMockAccessTokenManager.class,
         WxRealAccessTokenManager.class,
         WxMockShippingClient.class,
-        WxRealShippingClient.class
+        WxRealShippingClient.class,
+        // 实物发货上报要按快递中文名反查微信 delivery_id（GZ-JP-301）；
+        // 少装它 → WxRealShippingClient 构造不出来 → 整个 dispatcher 起不来
+        WxDeliveryListResolver.class
     })
     static class WxTestConfig {
     }

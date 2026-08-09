@@ -70,10 +70,25 @@ public class WxRealAccessTokenManager implements WxAccessTokenManager {
 
     @Override
     public String getToken(boolean forceRefresh) {
+        return getTokenFor(null, forceRefresh);
+    }
+
+    /**
+     * 取<b>指定小程序</b>的 access_token（发货信息上报专用）。
+     *
+     * <p>上报线程（{@code @Async} / cron / admin 补报）没有原请求上下文，{@link #getToken(boolean)} 只能落
+     * {@code default-client-id} —— 多小程序下就是拿 A 的 token 报 B 的订单，微信恒回「支付单不存在」。
+     * 故发货任务落库时记下归属 clientid，上报时经本方法取对应小程序的 token。</p>
+     *
+     * @param clientId     任务归属的小程序 clientid；blank / 未登记 → 回落当前请求或默认 app
+     * @param forceRefresh 是否强制刷新（token 失效重试用）
+     * @return access_token
+     */
+    public String getTokenFor(String clientId, boolean forceRefresh) {
         // 宽松口径：本能力也被 admin 后台手动补报 / @Async / cron 调用，那些线程带的 clientid
         // 不是小程序（如 plus-ui 的 PC clientid），认不出落默认 app（= 多 appid 改造前的行为）。
         // ★ 解析必须前置到读缓存之前：不知道自己是哪个小程序，就不知道该读哪个槽位（ADR-0019 §2）。
-        MiniappApp app = appResolver.currentAppOrDefault();
+        MiniappApp app = appResolver.appOfOrDefault(clientId);
         String cacheKey = ACCESS_TOKEN_CACHE_KEY_PREFIX + app.getAppid();
         if (!forceRefresh) {
             String cached = RedisUtils.getCacheObject(cacheKey);

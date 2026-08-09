@@ -1,6 +1,7 @@
 package org.dromara.gz.common.pay.service.impl;
 
 import cn.hutool.core.util.StrUtil;
+import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
@@ -15,6 +16,7 @@ import org.dromara.gz.common.pay.domain.vo.GzPayShippingOrderVO;
 import org.dromara.gz.common.pay.mapper.GzPayShippingOrderMapper;
 import org.dromara.gz.common.pay.service.IGzPayShippingService;
 import org.dromara.gz.common.pay.shipping.ShippingInfo;
+import org.dromara.gz.common.pay.shipping.ShippingPackage;
 import org.dromara.gz.common.pay.shipping.WxShippingClient;
 import org.dromara.gz.common.pay.shipping.WxShippingClient.UploadCommand;
 import org.dromara.gz.common.pay.shipping.WxShippingClient.UploadResult;
@@ -26,6 +28,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -66,29 +69,150 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
     @Override
     public void enqueue(GzPayTransaction txn, ShippingInfo info) {
         try {
-            GzPayShippingOrder row = GzPayShippingOrder.builder()
-                .transactionId(txn.getTransactionId())
-                .outTradeNo(txn.getOutTradeNo())
-                .businessType(txn.getBusinessType())
-                .openid(txn.getOpenid())
-                .logisticsType(info.logisticsType())
-                .itemDesc(info.itemDesc())
-                .paidTime(txn.getPaidTime() != null ? txn.getPaidTime() : LocalDateTime.now())
-                .uploadStatus(GzPayShippingOrder.STATUS_PENDING)
-                .attemptCount(0)
-                .build();
-            shippingMapper.insert(row);
-            registerAfterCommitUpload(row.getId());
-            log.info("[gz-shipping] 发货任务入队 out_trade_no={} transaction_id={} logisticsType={}",
-                txn.getOutTradeNo(), txn.getTransactionId(), info.logisticsType());
+            GzPayShippingOrder existing = findByTransactionId(txn.getTransactionId());
+            if (existing == null) {
+                insertNew(txn, info);
+                return;
+            }
+            if (info.shipmentPackage() == null) {
+                // 虚拟件重复入队：applyPaid 对同一交易 at-most-once，理论不可达；防御性忽略
+                log.info("[gz-shipping] 发货任务已存在跳过入队 transaction_id={}", txn.getTransactionId());
+                return;
+            }
+            appendPackage(existing, info);
         } catch (DuplicateKeyException dup) {
-            // applyPaid 对同一交易 at-most-once，理论不会撞；防御性忽略（已有任务，SnailJob 会处理）
-            log.info("[gz-shipping] 发货任务已存在跳过入队 transaction_id={}", txn.getTransactionId());
+            // 并发的另一个发货动作刚为同一交易建了行 —— 它自己会带上包裹上报，本次跳过不重复建
+            log.info("[gz-shipping] 发货任务已存在跳过入队（并发）transaction_id={}", txn.getTransactionId());
         } catch (Exception e) {
-            // 入队失败绝不回滚支付（MySQL 语句级回滚，事务/连接仍可用，后续 markPaid 正常提交）
-            log.error("[gz-shipping] 发货任务入队失败（已忽略，不影响支付确认）out_trade_no={}: {}",
+            // ★ 入队失败绝不回滚调用方事务：支付确认（拼豆）与店员发货（拼团）都是既成事实，
+            //   上报只是次要链路。MySQL 语句级回滚，事务/连接仍可用，调用方后续写入正常提交。
+            log.error("[gz-shipping] 发货任务入队失败（已忽略，不影响支付/发货）out_trade_no={}: {}",
                 txn.getOutTradeNo(), e.getMessage(), e);
         }
+    }
+
+    /** 按微信支付单号取上报任务（忽略租户：cron / @Async 无登录态，与其它扫表路径同口径）。 */
+    private GzPayShippingOrder findByTransactionId(String transactionId) {
+        if (StrUtil.isBlank(transactionId)) {
+            return null;
+        }
+        return TenantHelper.ignore(() -> shippingMapper.selectOne(Wrappers.<GzPayShippingOrder>lambdaQuery()
+            .eq(GzPayShippingOrder::getTransactionId, transactionId)
+            .last("LIMIT 1")));
+    }
+
+    /** 首次入队：落 pending 行（虚拟件带 item_desc，实物件带第一个包裹）。 */
+    private void insertNew(GzPayTransaction txn, ShippingInfo info) {
+        ShippingPackage first = info.shipmentPackage();
+        GzPayShippingOrder row = GzPayShippingOrder.builder()
+            .transactionId(txn.getTransactionId())
+            .outTradeNo(txn.getOutTradeNo())
+            .businessType(txn.getBusinessType())
+            .openid(txn.getOpenid())
+            .clientId(info.clientId() == null ? "" : info.clientId())
+            .logisticsType(info.logisticsType())
+            .deliveryMode(info.deliveryMode())
+            .isAllDelivered(info.allDelivered())
+            .itemDesc(info.itemDesc())
+            .shippingListJson(first == null ? null : writePackages(List.of(first)))
+            .paidTime(txn.getPaidTime() != null ? txn.getPaidTime() : LocalDateTime.now())
+            .uploadStatus(GzPayShippingOrder.STATUS_PENDING)
+            .attemptCount(0)
+            .build();
+        shippingMapper.insert(row);
+        registerAfterCommitUpload(row.getId());
+        log.info("[gz-shipping] 发货任务入队 out_trade_no={} transaction_id={} logisticsType={} deliveryMode={} "
+                + "clientId={} tracking={}",
+            txn.getOutTradeNo(), txn.getTransactionId(), info.logisticsType(), info.deliveryMode(),
+            info.clientId(), first == null ? null : first.getTrackingNo());
+    }
+
+    /**
+     * 追加一个包裹到既有任务（同一支付单的第 2..N 个包裹）。
+     *
+     * <p><b>为什么复用同一行而不是每个包裹一行</b>：微信要求每次上报把
+     * {@code shipping_list} 整份带上（文档未写明多次上报是覆盖还是合并，带全量在两种语义下都对）。
+     * 累计清单存在一行里，重试 / 补报天然拿到的就是全量。</p>
+     *
+     * <p>包裹按运单号去重：同一批货分两次勾选补进同一个包裹是合法操作（GZ-JP-106 允许），
+     * 不能因此在清单里出现两条同号记录。</p>
+     */
+    private void appendPackage(GzPayShippingOrder existing, ShippingInfo info) {
+        ShippingPackage incoming = info.shipmentPackage();
+        List<ShippingPackage> packages = new ArrayList<>(readPackages(existing.getShippingListJson()));
+        boolean replaced = false;
+        for (int i = 0; i < packages.size(); i++) {
+            if (StrUtil.equals(packages.get(i).getTrackingNo(), incoming.getTrackingNo())) {
+                packages.set(i, incoming);
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            if (packages.size() >= ShippingInfo.MAX_PACKAGES) {
+                // 微信硬上限 15（10060024）。发货已经发生，不能回滚 —— 记 error 让 owner 人工并单
+                log.error("[gz-shipping] ★ 支付单 {} 包裹数已达微信上限 {}，运单 {} 无法并入上报，请人工处理",
+                    existing.getTransactionId(), ShippingInfo.MAX_PACKAGES, incoming.getTrackingNo());
+                GzPayShippingOrder over = new GzPayShippingOrder();
+                over.setId(existing.getId());
+                over.setLastError("包裹数已达微信上限 " + ShippingInfo.MAX_PACKAGES
+                    + "，运单 " + incoming.getTrackingNo() + " 未能上报");
+                shippingMapper.updateById(over);
+                return;
+            }
+            packages.add(incoming);
+        }
+
+        GzPayShippingOrder upd = new GzPayShippingOrder();
+        upd.setId(existing.getId());
+        upd.setShippingListJson(writePackages(packages));
+        upd.setLogisticsType(info.logisticsType());
+        upd.setDeliveryMode(info.deliveryMode());
+        upd.setIsAllDelivered(info.allDelivered());
+        upd.setItemDesc(info.itemDesc());
+        if (StrUtil.isNotBlank(info.clientId())) {
+            upd.setClientId(info.clientId());
+        }
+
+        // ★ blocked 是微信侧**终态拒绝**（10060002 已完成发货 / 10060003 唯一一次重新发货机会已用掉），
+        //   不能因为「又来了个包裹」就自动放回 pending —— 那正是 blocked 要防的事：cron 会一直重试，
+        //   而这类错误重试一万次也不会好，还可能把那次机会烧在自动重试上。包裹照常并入清单存着
+        //   （人工处理完点「重新上报」时用的就是这份完整清单），但状态保持 blocked、记 error 让 owner 看见。
+        boolean blocked = GzPayShippingOrder.STATUS_BLOCKED.equals(existing.getUploadStatus());
+        if (blocked) {
+            upd.setLastError("微信侧已终态拒绝（blocked），新并入运单 " + incoming.getTrackingNo()
+                + " 未自动上报，需人工处理后手动重新上报");
+            log.error("[gz-shipping] ★ 支付单 {} 处于 blocked，运单 {} 已并入清单但不自动重试，请人工处理",
+                existing.getTransactionId(), incoming.getTrackingNo());
+        } else {
+            // 内容变了 → 重新排队上报（含已 success 的行：微信允许 is_all_delivered=false 期间继续追加）
+            upd.setUploadStatus(GzPayShippingOrder.STATUS_PENDING);
+            upd.setAttemptCount(0);
+        }
+        shippingMapper.updateById(upd);
+        if (!blocked) {
+            registerAfterCommitUpload(existing.getId());
+        }
+        log.info("[gz-shipping] 发货任务追加包裹 transaction_id={} tracking={} 累计包裹={} allDelivered={}",
+            existing.getTransactionId(), incoming.getTrackingNo(), packages.size(), info.allDelivered());
+    }
+
+    /** 包裹清单 JSON → 对象（解析失败返回空表：宁可少报也不让整条链路 500）。 */
+    private List<ShippingPackage> readPackages(String json) {
+        if (StrUtil.isBlank(json)) {
+            return List.of();
+        }
+        try {
+            return JSONUtil.toList(json, ShippingPackage.class);
+        } catch (Exception e) {
+            log.error("[gz-shipping] 包裹清单 JSON 解析失败，按空清单处理: {}", StrUtil.maxLength(json, 200), e);
+            return List.of();
+        }
+    }
+
+    /** 对象 → 包裹清单 JSON。 */
+    private String writePackages(List<ShippingPackage> packages) {
+        return JSONUtil.toJsonStr(packages);
     }
 
     /** 注册事务提交后异步上报；无事务上下文（如单测）直接异步调。 */
@@ -248,7 +372,14 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
             return true;
         }
         UploadResult result = shippingClient.uploadShippingInfo(new UploadCommand(
-            row.getTransactionId(), row.getOpenid(), row.getLogisticsType(), row.getItemDesc()));
+            row.getTransactionId(),
+            row.getOpenid(),
+            row.getLogisticsType(),
+            row.getItemDesc(),
+            row.getDeliveryMode() == null ? ShippingInfo.DELIVERY_MODE_UNIFIED : row.getDeliveryMode(),
+            row.getIsAllDelivered(),
+            row.getClientId(),
+            readPackages(row.getShippingListJson())));
 
         GzPayShippingOrder upd = new GzPayShippingOrder();
         upd.setId(row.getId());
@@ -257,7 +388,10 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
             upd.setUploadStatus(GzPayShippingOrder.STATUS_SUCCESS);
             upd.setUploadedTime(LocalDateTime.now());
         } else {
-            upd.setUploadStatus(GzPayShippingOrder.STATUS_FAILED);
+            // ★ 终态失败落 blocked 而不是 failed：cron / 手动补报都只扫 pending|failed，
+            //   继续重试会烧掉微信每笔单仅有一次的「重新发货」机会（10060002 → 10060003 → 永久失败）
+            upd.setUploadStatus(result.terminal()
+                ? GzPayShippingOrder.STATUS_BLOCKED : GzPayShippingOrder.STATUS_FAILED);
             upd.setLastError(StrUtil.format("errcode={} errmsg={}", result.errcode(), result.errmsg()));
         }
         shippingMapper.updateById(upd);

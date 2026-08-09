@@ -78,7 +78,7 @@ class WxLoginAdapterDispatchTest {
             new WxMockAccessTokenManager(),
             realToken,
             new WxMockShippingClient(),
-            new WxRealShippingClient(realToken));
+            new WxRealShippingClient(realToken, new WxDeliveryListResolver(realToken)));
     }
 
     @AfterEach
@@ -220,7 +220,7 @@ class WxLoginAdapterDispatchTest {
             new WxMockAccessTokenManager(),
             realToken,
             new WxMockShippingClient(),
-            new WxRealShippingClient(realToken));
+            new WxRealShippingClient(realToken, new WxDeliveryListResolver(realToken)));
 
         givenRequestWithClientId(CID_GUZI);
         assertInstanceOf(WxMockLoginAdapter.class, legacyDispatcher.loginAdapter());

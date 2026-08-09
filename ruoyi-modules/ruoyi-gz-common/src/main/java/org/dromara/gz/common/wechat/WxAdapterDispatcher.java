@@ -87,12 +87,19 @@ public class WxAdapterDispatcher implements WxLoginAdapter, WxPhoneAdapter, WxAc
     /**
      * 当前小程序的发货信息上报客户端（<b>共享能力 → 宽松口径</b>）。
      *
-     * <p>三种调用来源：支付回调后的 {@code @Async} 线程、cron、以及 admin 后台
-     * 「发货信息手动补报」（{@code POST /system/gz/pay/shipping/{id}/retry}，带的是 PC clientid）。
+     * <p>四种调用来源：支付回调后的 {@code @Async} 线程、店员点发货后的 {@code @Async} 线程、cron、
+     * 以及 admin 后台「发货信息手动补报」（{@code POST /system/gz/pay/shipping/{id}/retry}，带的是 PC clientid）。
      * 用严格口径会让后台补报按钮直接报「未配置的小程序客户端」—— 那是本能力唯一的人工兜底，不能挂。</p>
+     *
+     * @param clientId 发货任务自带的归属 clientid；blank → 回落当前请求 / 默认 app
      */
+    public WxShippingClient shippingClient(String clientId) {
+        return pick(appResolver.appOfOrDefault(clientId), mockShippingClient, realShippingClient);
+    }
+
+    /** 当前请求 / 默认小程序的发货信息上报客户端（无归属信息时用）。 */
     public WxShippingClient shippingClient() {
-        return pick(appResolver.currentAppOrDefault(), mockShippingClient, realShippingClient);
+        return shippingClient(null);
     }
 
     private <T> T pick(MiniappApp app, T mock, T real) {
@@ -120,9 +127,16 @@ public class WxAdapterDispatcher implements WxLoginAdapter, WxPhoneAdapter, WxAc
         return accessTokenManager().getToken(forceRefresh);
     }
 
+    /**
+     * 发货信息上报门面转发。
+     *
+     * <p><b>★ 按 {@link UploadCommand#clientId()} 选通道，不按当前请求</b>：上报几乎总在无请求上下文的
+     * 线程里发生（{@code @Async} / cron / admin 补报），按当前请求选会让拼团（mock 或另一 appid）的订单
+     * 走到现小程序的 real 通道上去。</p>
+     */
     @Override
     public UploadResult uploadShippingInfo(UploadCommand cmd) {
-        return shippingClient().uploadShippingInfo(cmd);
+        return shippingClient(cmd == null ? null : cmd.clientId()).uploadShippingInfo(cmd);
     }
 
     /**

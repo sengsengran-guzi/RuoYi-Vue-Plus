@@ -11,7 +11,13 @@ import org.dromara.common.core.service.DictService;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.common.domain.vo.GzUserVO;
+import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
+import org.dromara.gz.common.pay.mapper.GzPayTransactionMapper;
+import org.dromara.gz.common.pay.service.IGzPayShippingService;
+import org.dromara.gz.common.pay.shipping.ShippingInfo;
+import org.dromara.gz.common.pay.shipping.ShippingPackage;
 import org.dromara.gz.common.service.IGzUserService;
+import org.dromara.gz.jp.config.GzJpPayProperties;
 import org.dromara.gz.jp.domain.bo.GzJpFulfillAdvanceBo;
 import org.dromara.gz.jp.domain.bo.GzJpFulfillQueryBo;
 import org.dromara.gz.jp.domain.bo.GzJpFulfillShipBo;
@@ -104,6 +110,12 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
     private final DictService dictService;
     /** Spring 全局 ObjectMapper（解商品快照；构造注入以便单测替换） */
     private final ObjectMapper objectMapper;
+    /** 支付流水（发货上报要按「一笔支付单」找 transaction_id） */
+    private final GzPayTransactionMapper payTransactionMapper;
+    /** 微信发货信息上报（入队即返回，真正上报在 afterCommit 的 @Async 里） */
+    private final IGzPayShippingService shippingService;
+    /** 拼团小程序 clientid（上报要用对 appid 的 access_token） */
+    private final GzJpPayProperties jpPayProperties;
 
     // ============================================================
     //  批量推进（FLOW:F-JP-03.step2）
@@ -163,9 +175,125 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
         result.setCarrierCode(carrier);
         result.setCarrierLabel(carrierLabel);
         result.setTrackingNo(trackingNo);
+
+        // ★ 微信「订单中心」发货信息上报就挂在这一刻（GZ-JP-301）。
+        //   不在支付回调里报：拼团到货要几周到几个月，付款当下没有任何可上报的发货事实；
+        //   而微信把「修改物流模式」视为重新发货、每笔支付单只给一次机会（10060003），
+        //   先按虚拟报一次等于开局把机会烧掉。发货这一刻才是真事实。
+        enqueueShippingUpload(ids, carrier, carrierLabel, trackingNo);
+
         log.info("[gz-jp-fulfill] SHIP carrier={} trackingNo={} requested={} advanced={} rejected={} operator={}",
             carrier, trackingNo, result.getRequested(), result.getAdvanced(), result.getRejected(), operatorId);
         return result;
+    }
+
+    /**
+     * 把本次发货的包裹按「一笔支付单」入队上报微信。
+     *
+     * <p><b>为什么按订单拆</b>：本项目允许<b>同一客人跨订单凑一个包裹</b>（GZ-JP-108 看板按客人聚合），
+     * 但微信的 {@code upload_shipping_info} 是<b>按支付单</b>的 —— 一个运单号横跨 2 张订单时
+     * 必须给这 2 笔支付单各报一次（同一个 tracking_no 出现在两笔支付单里，微信允许）。</p>
+     *
+     * <p><b>allDelivered 怎么算</b>：该订单里还有没有「既没发货、也没购买失败」的行。
+     * 全都落定了才置 true —— 微信只有收到 {@code is_all_delivered=true} 才认为整单发完并推「发货完成」通知，
+     * 提前置 true 会导致后续到货的包裹被当成「重新发货」。</p>
+     *
+     * <p><b>绝不影响发货本身</b>：整段包在 try/catch 里，任何异常只记 ERROR。
+     * 店员交寄包裹是既成事实，上报只是次要链路，不能因为上报出问题把发货回滚掉
+     * （{@code IGzPayShippingService.enqueue} 内部另有一层同样口径的兜底）。</p>
+     *
+     * @param ids          本次请求的行 id（含被拒 / 幂等跳过的，靠回读实际状态筛）
+     * @param carrier      快递字典 code
+     * @param carrierLabel 快递公司中文名（上报时按它反查微信 delivery_id）
+     * @param trackingNo   运单号
+     */
+    private void enqueueShippingUpload(List<Long> ids, String carrier, String carrierLabel, String trackingNo) {
+        try {
+            // 回读本事务内的最新值：只认「真的落到 delivered 且运单号就是这一单」的行。
+            // 用回读而不是让 applyBatch 返回 id 列表，是因为「本来就已 delivered 且同运单号」的幂等行
+            // 也属于这个包裹，同样要算进 item_desc —— 那些行 advanced 计数里没有。
+            List<GzJpOrderItem> rows = itemMapper.selectByIds(ids);
+            Map<Long, List<GzJpOrderItem>> byOrder = new LinkedHashMap<>();
+            for (GzJpOrderItem row : rows) {
+                if (GzJpFulfillStatus.DELIVERED.getCode().equals(row.getFulfillStatus())
+                    && trackingNo.equals(row.getTrackingNo()) && row.getOrderId() != null) {
+                    byOrder.computeIfAbsent(row.getOrderId(), k -> new ArrayList<>()).add(row);
+                }
+            }
+            if (byOrder.isEmpty()) {
+                return;
+            }
+            for (Map.Entry<Long, List<GzJpOrderItem>> entry : byOrder.entrySet()) {
+                enqueueOneOrder(entry.getKey(), entry.getValue(), carrier, carrierLabel, trackingNo);
+            }
+        } catch (Exception e) {
+            log.error("[gz-jp-fulfill] ★ 发货上报入队失败（已忽略，发货本身不受影响）tracking={}: {}",
+                trackingNo, e.getMessage(), e);
+        }
+    }
+
+    /** 单笔支付单的入队（异常只记日志，不打断同批其它订单）。 */
+    private void enqueueOneOrder(Long orderId, List<GzJpOrderItem> shipped,
+                                 String carrier, String carrierLabel, String trackingNo) {
+        try {
+            GzJpOrder order = orderMapper.selectById(orderId);
+            if (order == null || order.getPayTransactionId() == null) {
+                log.warn("[gz-jp-fulfill] 订单 {} 没有支付流水，跳过发货上报（测试单/代客单？）", orderId);
+                return;
+            }
+            GzPayTransaction txn = payTransactionMapper.selectById(order.getPayTransactionId());
+            if (txn == null || StrUtil.isBlank(txn.getTransactionId())) {
+                log.warn("[gz-jp-fulfill] 订单 {} 的支付流水 {} 不存在或无微信 transaction_id，跳过发货上报",
+                    orderId, order.getPayTransactionId());
+                return;
+            }
+
+            ShippingPackage pkg = new ShippingPackage(trackingNo, carrier, carrierLabel,
+                buildItemDesc(shipped), ShippingPackage.maskContact(readReceiverMobile(order)));
+            ShippingInfo info = ShippingInfo.physicalPackage(
+                buildItemDesc(shipped), pkg, isOrderAllDelivered(orderId), jpPayProperties.getClientId());
+            shippingService.enqueue(txn, info);
+        } catch (Exception e) {
+            log.error("[gz-jp-fulfill] ★ 订单 {} 发货上报入队失败（已忽略）tracking={}: {}",
+                orderId, trackingNo, e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 该订单是否已全部发完 —— 还有「既没发货、也没购买失败」的行就是 false。
+     *
+     * <p>{@code purchase_failed} 算落定：那批货买不到、已走退款，不会再有包裹。</p>
+     */
+    private boolean isOrderAllDelivered(Long orderId) {
+        return itemMapper.countUnfinishedByOrderId(orderId) == 0;
+    }
+
+    /**
+     * 包裹商品描述（微信 {@code item_desc} 限 120 字，这里留余量截到 100）。
+     *
+     * <p>多款时形如「XX立牌 等 3 件」—— 把每款名字都拼上去很容易超长被微信拒。</p>
+     */
+    private String buildItemDesc(List<GzJpOrderItem> shipped) {
+        JpOrderSnapshot.Product first = shipped.isEmpty() ? null : readSnapshot(shipped.get(0).getProductSnapshotJson());
+        String firstName = first == null || StrUtil.isBlank(first.getName()) ? "谷子商品" : first.getName();
+        String desc = shipped.size() == 1 ? firstName : firstName + " 等 " + shipped.size() + " 件";
+        return StrUtil.maxLength(desc, 100);
+    }
+
+    /** 从订单地址快照取收件人手机号（解析失败返回 null，上报时该字段留空而不是崩）。 */
+    private String readReceiverMobile(GzJpOrder order) {
+        if (StrUtil.isBlank(order.getAddressSnapshotJson())) {
+            return null;
+        }
+        try {
+            JpOrderSnapshot.Address addr = objectMapper.readValue(
+                order.getAddressSnapshotJson(), JpOrderSnapshot.Address.class);
+            return addr == null ? null : addr.getMobile();
+        } catch (Exception e) {
+            log.warn("[gz-jp-fulfill] 订单 {} 地址快照解析失败，发货上报不带收件人联系方式: {}",
+                order.getId(), e.getMessage());
+            return null;
+        }
     }
 
     // ============================================================

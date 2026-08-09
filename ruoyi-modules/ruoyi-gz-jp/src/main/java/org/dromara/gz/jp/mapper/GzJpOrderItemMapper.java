@@ -264,6 +264,23 @@ public interface GzJpOrderItemMapper extends BaseMapperPlus<GzJpOrderItem, GzJpO
     int countRefundedByOrderId(@Param("orderId") Long orderId);
 
     /**
+     * 订单下<b>还没落定</b>的商品行数 —— 既没发货、也没购买失败（GZ-JP-301 发货上报用）。
+     *
+     * <p>微信 {@code upload_shipping_info} 的 {@code is_all_delivered} 要靠它算：返回 0 才是「整单发完」。
+     * {@code purchase_failed} 算落定 —— 那批货买不到、已走退款，不会再有包裹。</p>
+     *
+     * <p><b>提前置 is_all_delivered=true 的代价</b>：微信会认为整单发完并推「发货完成」通知，
+     * 之后再到货的包裹只能走「重新发货」，而那个机会每笔支付单<b>只有一次</b>（10060003）。</p>
+     *
+     * @param orderId 订单 id
+     * @return 未落定行数（0 = 整单已全部发完）
+     */
+    @Select("SELECT COUNT(*) FROM gz_jp_order_item "
+        + "WHERE order_id = #{orderId} AND del_flag = '0' "
+        + "AND fulfill_status NOT IN ('delivered', 'purchase_failed')")
+    int countUnfinishedByOrderId(@Param("orderId") Long orderId);
+
+    /**
      * 把整单尚无退款记录的行一次性标为已退款（<b>仅用于 GZ-PAY 全额退款旁路</b>，GZ-JP-107）。
      *
      * <p><b>什么时候会走到这里</b>：admin 在<b>支付管理</b>页对一笔 jp 交易做了全额退款

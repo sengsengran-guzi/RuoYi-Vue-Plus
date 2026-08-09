@@ -40,16 +40,28 @@ public class GzPayShippingOrderVO implements Serializable {
     /** 支付用户 openid */
     private String openid;
 
+    /** 所属小程序 clientid（空 = 默认小程序） */
+    private String clientId;
+
     /** 物流模式 1实体/2同城/3虚拟商品/4自提 */
     private Integer logisticsType;
+
+    /** 发货模式 1统一发货 / 2分拆发货 */
+    private Integer deliveryMode;
+
+    /** 分拆发货：截至目前整单是否已全部发完 */
+    private Boolean isAllDelivered;
 
     /** 商品描述 */
     private String itemDesc;
 
+    /** 累计包裹清单 JSON（实物件；虚拟件为 null） */
+    private String shippingListJson;
+
     /** 支付成功时间 */
     private LocalDateTime paidTime;
 
-    /** 上报状态 pending / success / failed */
+    /** 上报状态 pending / success / failed / blocked */
     private String uploadStatus;
 
     /** 上报尝试次数 */
