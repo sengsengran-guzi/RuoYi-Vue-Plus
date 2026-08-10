@@ -6,13 +6,12 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.domain.R;
 import org.dromara.common.core.service.ConfigService;
+import org.dromara.gz.common.config.MpPublicConfigKeyResolver;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-
-import java.util.Set;
 
 /**
  * GZ-BEAN-010 mp 端公开 sys_config 读取 Controller（C 端）。
@@ -29,9 +28,14 @@ import java.util.Set;
  * 实现的跨模块 SPI），不依赖 ruoyi-system 模块，符合 gz-common 现有依赖边界。</p>
  *
  * <p><b>安全边界</b>：本端点仅暴露<b>运营素材类</b>配置（banner / 文案），key 由前端硬编码常量传入；
- * 不暴露 {@code config_value} 为密钥 / 商户证书的敏感 key（敏感配置走环境变量，不入 DB — doc/11 §10.4）。</p>
+ * 白名单收敛在 {@link MpPublicConfigKeyResolver}，非白名单 key 一律拒绝 —— 不暴露 {@code config_value}
+ * 为密钥 / 商户证书的敏感 key（敏感配置走环境变量，不入 DB — doc/11 §10.4）。</p>
  *
- * <p>关联文档：doc/11 §10.4 sys_config / doc/10 §3 N1 拼豆落地页 / GZ-BEAN-010 AC 2/6</p>
+ * <p><b>多小程序</b>：{@code sys_config} 是全局单表，而本后端同时服务谷子宇宙与拼团两个小程序。
+ * 首页轮播 banner 这类运营素材必须<b>各配一套</b>，否则运营配一次两边串味。归属判断（读 header
+ * {@code clientid}）与 key 归一全部收敛在 {@link MpPublicConfigKeyResolver}，本 controller 不碰 clientid。</p>
+ *
+ * <p>关联文档：doc/11 §10.4 sys_config / doc/10 §3 N1 拼豆落地页 / GZ-BEAN-010 AC 2/6 / ADR-0019 §1</p>
  *
  * @author kevin-coder (sensenran-guzi · GZ-BEAN-010)
  */
@@ -45,18 +49,7 @@ public class GzConfigMpController {
 
     private final ConfigService configService;
 
-    /**
-     * 公开可匿名读的 sys_config key 白名单（仅运营素材类）。
-     *
-     * <p>本端点 {@link SaIgnore} 匿名可达 + key 由 {@code @RequestParam} 传入，若不限定 key 则任意人
-     * 可读任意配置（含 {@code gz.commission.*} 分成率 / {@code sys.user.initPassword} 默认密码）。
-     * 故只放行 mp 落地页真实使用的运营素材 key（{@link org.dromara.gz.common ...} api/gz-common.ts 常量），
-     * 非白名单 key 一律拒绝。新增运营素材 key 时同步加入本集合。</p>
-     */
-    private static final Set<String> PUBLIC_CONFIG_KEYS = Set.of(
-        "gz.bean.home.banner",
-        "gz.home.banners"
-    );
+    private final MpPublicConfigKeyResolver configKeyResolver;
 
     /**
      * 按 key 读取单个 sys_config 配置值（mp 落地页运营素材）。
@@ -81,12 +74,13 @@ public class GzConfigMpController {
      */
     @GetMapping("/get")
     public R<String> get(@RequestParam("key") @NotBlank String key) {
-        // 安全门槛：仅放行运营素材类 key（白名单），杜绝匿名读分成率 / 默认密码等敏感配置。
-        if (!PUBLIC_CONFIG_KEYS.contains(key)) {
+        // 安全门槛 + 多小程序归一：非白名单 key 拒绝；白名单 key 按当前 clientid 换成本小程序自己那份。
+        String actualKey = configKeyResolver.resolve(key);
+        if (actualKey == null) {
             log.warn("[gz-config-mp] 拒绝读取非白名单配置 key: {}", key);
             return R.fail("非法的配置项");
         }
-        String value = configService.getConfigValue(key);
+        String value = configService.getConfigValue(actualKey);
         // value 必须放 data（R.ok(String) 会命中 msg 重载导致 data 恒 null，mp 落地页 banner/文案读 data 全空）
         return R.ok("操作成功", value == null ? "" : value);
     }
