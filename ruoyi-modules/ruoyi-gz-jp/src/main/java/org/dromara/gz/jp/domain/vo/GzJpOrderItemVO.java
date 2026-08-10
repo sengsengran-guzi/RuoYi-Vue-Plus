@@ -73,6 +73,21 @@ public class GzJpOrderItemVO implements Serializable {
     /** 国内快递编码（字典 gz_express_carrier；未发货为 null） */
     private String carrierCode;
 
+    /**
+     * 国内快递中文名（字典 {@code gz_express_carrier} 的 label；后端给，前端别自己维护映射）。
+     *
+     * <p><b>降级口径（三种情况全给 {@code null}，绝不给字面量 "null"、绝不抛）</b>：</p>
+     * <ol>
+     *   <li>{@link #carrierCode} 为空（未发货）→ null</li>
+     *   <li>编码不在字典里（后台删了某个承运商，历史订单行还留着旧编码）→ null</li>
+     *   <li>字典整体取不到（缓存故障）→ null，只告警不拦 —— 字典挂了不该让客人的订单详情打不开</li>
+     * </ol>
+     *
+     * <p>mp 拿到 null 时只显示运单号（页面自带兜底文案）：客人看到「SF7654321000」比看到
+     * 「sf SF7654321000」或「null SF7654321000」都好，单号本身就够他去快递官网查件。</p>
+     */
+    private String carrierLabel;
+
     /** 国内运单号（未发货为 null）—— 同单号的行属同一批，mp 按它合并显示 */
     private String trackingNo;
 

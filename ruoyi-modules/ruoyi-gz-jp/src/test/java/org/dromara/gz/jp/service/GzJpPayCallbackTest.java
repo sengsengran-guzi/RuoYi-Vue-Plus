@@ -121,7 +121,7 @@ class GzJpPayCallbackTest {
 
         // 真实 jp 订单服务（回调路径只用到两个 mapper，其余 collaborator 本测试不触及）
         orderService = new GzJpOrderServiceImpl(jpOrderMapper, jpItemMapper, null, null, null,
-            null, null, null, null, null, new ObjectMapper());
+            null, null, null, null, null, null, new ObjectMapper());
 
         // SPI：真实 dispatcher + 真实 jp handler（启动期路由表由 validate() 建）
         JpPayCallbackHandler jpHandler = new JpPayCallbackHandler(orderService);

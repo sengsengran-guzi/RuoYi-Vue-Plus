@@ -30,12 +30,14 @@ import org.springframework.stereotype.Component;
  * <p><b>刻意不碰 {@code fulfill_status}</b>：钱退了不等于货没买到（ADR-0007 双状态机正交）。
  * 把已发货的行改成「购买失败」会让客人看到自己收到的东西显示为没买到。</p>
  *
- * <p><b>⚠️ 已知风险（无法在 jp 域内根治，见 report §风险）</b>：拼团行级退款不写
- * {@code gz_pay_refund}，所以 {@code PayRefundTxService.createRefunding} 的
- * 「一笔支付只允许一条退款单」闸门<b>看不见</b>它们 —— admin 理论上能在已部分退款的 jp 单上再发起全额退款。
- * 真提交时微信会因「退款总额超过原单」拒绝（钱是安全的），但会留下一条 failed 的 gz_pay_refund。
- * 根治要动 {@code PayRefundTxService}，那是本卡明令不碰的线上资金链路 ——
- * 缓解措施是 admin 侧不要对 {@code business_type='jp'} 的交易用支付管理页退款。</p>
+ * <p><b>★ 现状：本 handler 已收不到新触发，但不要删</b>。上面描述的洞已在支付域根治 ——
+ * {@code PayRefundTxService.createRefunding} 加了 {@code business_type='jp'} 硬闸，
+ * 支付域全额退款对拼团直接抛 {@code ServiceException}，所以<b>不会再有新的 jp 全额退款单产生</b>，
+ * 本 handler 也不会再被新退款触发。保留它的理由：存量库里可能还有在飞的
+ * {@code gz_pay_refund}（status=refunding，闸门上线前发起）—— 微信的退款回调随时可能回来，
+ * 那时仍需要本 handler 把拼团侧同步过去；删了这些单子的回调会落到「无 handler」分支，
+ * 钱退了而 {@code gz_jp_order} 永远停在已支付。等确认库里没有 business_type='jp' 的
+ * 非终态 gz_pay_refund 后，本类才可以退休。</p>
  *
  * @author kevin-coder (sensenran-guzi · GZ-JP-107)
  */

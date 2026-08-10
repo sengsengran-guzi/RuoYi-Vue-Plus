@@ -6,6 +6,7 @@ import org.dromara.common.core.exception.ServiceException;
 import org.dromara.gz.common.pay.domain.bo.RefundApplyBo;
 import org.dromara.gz.common.pay.domain.entity.GzPayRefund;
 import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
+import org.dromara.gz.common.pay.enums.PayBusinessType;
 import org.dromara.gz.common.pay.enums.PayStatus;
 import org.dromara.gz.common.pay.mapper.GzPayRefundMapper;
 import org.dromara.gz.common.pay.mapper.GzPayTransactionMapper;
@@ -43,6 +44,9 @@ public class PayRefundTxService {
      * <p>SELECT ... FOR UPDATE 锁原交易行，杜绝并发对同一笔支付重复发起退款（与
      * countActiveByTransactionId 双重防护）。返回的 refund 带 transientTransactionRowId 供事务外调微信用。</p>
      *
+     * <p><b>business_type='jp' 一律拒绝</b>：拼团走行级部分退款（{@code gz_jp_refund}），与本域的
+     * {@code gz_pay_refund} 互盲且不改 transaction.status，防重闸对它失效 —— 详见方法内注释。</p>
+     *
      * @param bo          退款申请（transactionId = 交易行主键 id + reason）
      * @param triggeredBy 触发人 username
      * @return 已落库的退款单（status=refunding，含 transientTransactionRowId）
@@ -58,6 +62,22 @@ public class PayRefundTxService {
         }
         if (txn.getTransactionId() == null) {
             throw new ServiceException("支付订单缺微信交易号，无法退款");
+        }
+        // ── 拼团（jp）硬闸：支付域的全额退款对 jp 单不可用 ────────────────────────────────
+        // 删了这行会怎样：jp 用的是**行级部分退款**，退款单写自己的 gz_jp_refund 表，且行级退款
+        // **从不修改** gz_pay_transaction.status（gz-jp 全模块对 transaction 只有 selectById，零 update）。
+        // 于是本方法上面三道闸对 jp 单全部放行：
+        //   ① 交易行存在      → 在
+        //   ② status == paid  → 行级退款不改它，退完全额仍停在 paid
+        //   ③ countActive==0  → 只查 gz_pay_refund，看不见 gz_jp_refund（两张表互盲）
+        // 结果：一笔已在 jp 侧退净的订单，支付域仍认为「可退全额」，admin 一点即重复退款。
+        // 真提交时微信会因退款总额超原单而拒绝（钱本身安全），但会留下 failed 脏退款单，
+        // 且 transaction 已被 markRefunding 推走、要靠 rollbackAccepted 兜回来。
+        // 前端 OrderDetailDrawer 的 canRefund 也挡了 jp，但那只是 UI —— apply 端点仅有
+        // @SaCheckPermission，任何持 token 的 curl（superadmin 更是直接绕过鉴权）都能穿过去，
+        // 故必须在此处兜底。jp 的退款唯一入口 = 履约看板的行级退款。
+        if (PayBusinessType.JP.equals(txn.getBusinessType())) {
+            throw new ServiceException("拼团订单请走履约看板的行级退款，支付域全额退款对拼团不可用");
         }
         if (refundMapper.countActiveByTransactionId(txn.getTransactionId()) > 0) {
             throw new ServiceException("该订单已有进行中或已完成的退款，不可重复退款");

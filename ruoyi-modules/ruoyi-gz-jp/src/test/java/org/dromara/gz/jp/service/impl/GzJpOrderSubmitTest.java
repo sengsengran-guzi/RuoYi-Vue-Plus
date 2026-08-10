@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.ibatis.builder.MapperBuilderAssistant;
 import org.dromara.common.core.exception.ServiceException;
+import org.dromara.common.core.service.DictService;
 import org.dromara.gz.common.domain.vo.GzUserVO;
 import org.dromara.gz.common.pay.domain.bo.CreateOrderBo;
 import org.dromara.gz.common.pay.domain.vo.MpPayParamsVO;
@@ -120,6 +121,9 @@ class GzJpOrderSubmitTest {
     private IGzUserAddressService addressService;
     @Mock
     private IGzFileService fileService;
+    /** 详情行的 carrierLabel 走它（下单路径不碰，这里只为满足构造） */
+    @Mock
+    private DictService dictService;
 
     private GzJpOrderServiceImpl service;
 
@@ -142,7 +146,8 @@ class GzJpOrderSubmitTest {
     void setUp() {
         insertedItems.clear();
         service = new GzJpOrderServiceImpl(orderMapper, itemMapper, productMapper, eventService, cartService,
-            payTransactionService, orderNoGenerator, userService, addressService, fileService, objectMapper);
+            payTransactionService, orderNoGenerator, userService, addressService, fileService, dictService,
+            objectMapper);
 
         // 订单号生成器：固定发号，便于断言前缀
         when(orderNoGenerator.generate(PayBusinessType.JP)).thenReturn("JPO-20260807-000001");

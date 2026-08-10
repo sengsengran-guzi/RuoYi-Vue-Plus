@@ -24,6 +24,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -38,7 +40,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.lenient;
 
 /**
- * GZ-PAY-103 AC 9 — 退款服务 mock 全链路自测（5 个测试方法）。
+ * GZ-PAY-103 AC 9 — 退款服务 mock 全链路自测（5 条主链路 + 2 条 business_type='jp' 闸门用例）。
  *
  * <p>用<b>真实</b> {@link MockWechatPayClient}（mock V3 退款 / 退款回调解析路径）+ <b>真实</b>
  * {@link RefundCallbackDispatcher} + <b>测试内联 preorder {@link IRefundCallbackHandler}</b>（真实退款
@@ -53,6 +55,8 @@ import static org.mockito.Mockito.lenient;
  *   ③ 重复退拦截（同 transaction 已 refunding → 抛 ServiceException）
  *   ④ 回调幂等（已 refunded → 二次回调不重复变更）
  *   ⑤ 受理失败回滚（mock 受理失败 → refund=failed + transaction 回 paid + 抛异常）
+ *   ⑥ business_type='jp' 硬闸：拼团走行级退款，支付域全额退款直接拒（旧三道闸全绿也必须被拦）
+ *   ⑦ 反面回归：preorder / pindou / gacha / test 四条非 jp 业务线仍能正常创建退款单（jp 闸不误伤）
  * </pre>
  *
  * <p>不依赖 Spring 上下文 / 真实 DB，CI 稳定（与 GzPayBusinessFullChainMockTest 同款思路）。</p>
@@ -225,11 +229,16 @@ class PayRefundServiceImplTest {
 
     /** 造一笔 paid 的 preorder 支付交易行 */
     private GzPayTransaction givenPaidTransaction(long id, String txnId) {
+        return givenPaidTransactionOfType(id, txnId, PayBusinessType.PREORDER, "PREORD-20260606-000001");
+    }
+
+    /** 造一笔 paid 的指定 business_type 支付交易行（jp 闸门用例需要按业务线换值） */
+    private GzPayTransaction givenPaidTransactionOfType(long id, String txnId, String businessType, String outTradeNo) {
         GzPayTransaction txn = GzPayTransaction.builder()
             .id(id)
-            .outTradeNo("PREORD-20260606-000001")
-            .businessType(PayBusinessType.PREORDER)
-            .businessOrderNo("PREORD-ORDER-001")
+            .outTradeNo(outTradeNo)
+            .businessType(businessType)
+            .businessOrderNo(outTradeNo)
             .amountCent(9900L)
             .status(PayStatus.PAID)
             .transactionId(txnId)
@@ -344,5 +353,48 @@ class PayRefundServiceImplTest {
         assertEquals(PayStatus.FAILED, r.getStatus());
         assertNull(r.getWechatRefundId(), "受理失败 wechat_refund_id 仍为 null");
         assertEquals(PayStatus.PAID, txnDb.get(104L).getStatus(), "transaction refunding → paid 回滚");
+    }
+
+    @Test
+    @DisplayName("jp 闸 ①：business_type=jp 的交易禁止走支付域全额退款（三道旧闸全绿也必须被拦）")
+    void jpTransaction_rejectedByBusinessTypeGate() {
+        String txnId = "mock_wx_txn_jp_001";
+        givenPaidTransactionOfType(105L, txnId, PayBusinessType.JP, "JPO-20260807-000037");
+
+        // 前置：复刻线上真实处境 —— 拼团已在 gz_jp_refund 侧退净全额，但那张表与 gz_pay_refund 互盲，
+        // 且 jp 行级退款从不改 transaction.status。于是旧的三道闸此刻全部为「绿」：
+        //   ① 交易行存在 ② status=paid ③ countActive=0
+        // 只有 business_type 闸能拦住它 —— 下面两条断言把「旧闸全绿」钉死，
+        // 保证本用例真的在验新闸而不是被别的闸顺手挡住。
+        assertEquals(PayStatus.PAID, txnDb.get(105L).getStatus(), "旧闸②绿：txn 仍是 paid");
+        assertEquals(0L, refundMapper.countActiveByTransactionId(txnId), "旧闸③绿：gz_pay_refund 里看不到任何退款单");
+
+        ServiceException ex = assertThrows(ServiceException.class,
+            () -> refundTxService.createRefunding(applyBo(105L), "gz_owner"));
+        assertTrue(ex.getMessage().contains("拼团"), ex.getMessage());
+        assertTrue(ex.getMessage().contains("行级退款"), ex.getMessage());
+
+        // 闸门必须在任何写操作之前生效：不落退款单、不把 transaction 推去 refunding
+        assertTrue(refundDb.isEmpty(), "不产生 gz_pay_refund 退款单");
+        assertEquals(PayStatus.PAID, txnDb.get(105L).getStatus(), "transaction 状态不被 markRefunding 推走");
+    }
+
+    @ParameterizedTest(name = "business_type={0} 仍可正常发起全额退款")
+    @ValueSource(strings = {PayBusinessType.PREORDER, PayBusinessType.PINDOU, PayBusinessType.GACHA, PayBusinessType.TEST})
+    @DisplayName("jp 闸 ②（反面/回归）：非 jp 业务线不受影响，仍能正常创建 refunding 退款单")
+    void nonJpTransaction_stillRefundable(String businessType) {
+        String txnId = "mock_wx_txn_" + businessType;
+        givenPaidTransactionOfType(106L, txnId, businessType, "OTN-20260807-000001");
+
+        GzPayRefund refund = refundTxService.createRefunding(applyBo(106L), "gz_owner");
+
+        assertNotNull(refund, "非 jp 业务线必须照常拿到退款单，jp 闸不得误伤");
+        assertEquals(PayStatus.REFUNDING, refund.getStatus());
+        assertEquals(9900L, refund.getRefundAmountCent(), "全额退款金额 = 原单 amount_cent");
+        assertEquals(txnId, refund.getTransactionId());
+        assertEquals("gz_owner", refund.getTriggeredBy());
+        assertEquals(106L, refund.getTransientTransactionRowId().longValue(), "带回原交易行 id 供事务外调微信");
+        assertEquals(1, refundDb.size(), "落库一条退款单");
+        assertEquals(PayStatus.REFUNDING, txnDb.get(106L).getStatus(), "transaction paid → refunding");
     }
 }

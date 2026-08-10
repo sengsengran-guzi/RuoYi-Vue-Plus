@@ -205,6 +205,36 @@ class WxLoginAdapterDispatchTest {
     }
 
     @Test
+    @DisplayName("★★核心不变量: 显式传入的 clientId 压过请求 header —— 发货上报按「任务行上存的归属」选 appid")
+    void explicitClientId_overridesRequestHeader() {
+        // 这是多小程序共用一个后端时最贵的一条不变量，之前零覆盖。
+        //
+        // 为什么重要：发货上报真正发生在 @Async / cron / admin 补报线程里，那里**根本没有请求上下文**；
+        // 有上下文时（admin 补报）header 里装的还是操作者当前那个客户端，跟这笔单属于谁毫无关系。
+        // 所以 doUpload 是拿「发货任务行上存的 client_id」调 shippingClient(clientId) 的。
+        // 一旦这个重载改成忽略入参、回落去读上下文，就是「B 小程序的订单用 A 的 appid 报上去」：
+        // access_token 是 appid 维度凭证，微信会恒回 10060001「支付单不存在」，而且**重试永远好不了**
+        // （每次重试都还是拿错 token）。这个故障在 mock 通道下完全照不出来。
+        //
+        // fixture 里 CID_GUZI=real、CID_JP=mock，所以「选错了」会体现为实现类整个换掉，一眼可辨。
+
+        // ① 上下文是谷子宇宙（real），但这笔单属于拼团 → 必须给拼团那套（mock）
+        givenRequestWithClientId(CID_GUZI);
+        assertInstanceOf(WxMockShippingClient.class, dispatcher.shippingClient(CID_JP),
+            "行上 clientId=拼团，却按 header(谷子宇宙) 选了实现 —— 上报会拿错 appid 的 token");
+
+        // ② 反向同样成立（防止实现写成「固定偏向 mock」也能过 ①）
+        givenRequestWithClientId(CID_JP);
+        assertInstanceOf(WxRealShippingClient.class, dispatcher.shippingClient(CID_GUZI),
+            "行上 clientId=谷子宇宙，却按 header(拼团) 选了实现");
+
+        // ③ 无请求上下文（@Async / cron 的真实处境）仍按入参选 —— 这才是上报的主场景
+        RequestContextHolder.resetRequestAttributes();
+        assertInstanceOf(WxMockShippingClient.class, dispatcher.shippingClient(CID_JP));
+        assertInstanceOf(WxRealShippingClient.class, dispatcher.shippingClient(CID_GUZI));
+    }
+
+    @Test
     @DisplayName("向后兼容: 单值配置（apps 未配）→ 任意请求都走那个单一 app")
     void legacyScalarConfig_dispatchesToSingleApp() {
         WxMiniappProperties legacy = new WxMiniappProperties();

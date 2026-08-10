@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.exception.ServiceException;
+import org.dromara.common.core.service.DictService;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.common.domain.vo.GzUserVO;
@@ -53,6 +54,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -94,6 +96,9 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
     /** 图片缺失 / 解析失败 / 商品已删时的占位图（与 GZ-JP-103/104 同一张） */
     private static final String PLACEHOLDER_IMAGE_URL = "/static/images/mock-product.png";
 
+    /** 国内快递公司字典（既有字典，与 admin / 履约看板同一份真源） */
+    private static final String DICT_EXPRESS_CARRIER = "gz_express_carrier";
+
     private final GzJpOrderMapper baseMapper;
     private final GzJpOrderItemMapper itemMapper;
     private final GzJpProductMapper productMapper;
@@ -105,6 +110,8 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
     private final IGzUserService userService;
     private final IGzUserAddressService addressService;
     private final IGzFileService fileService;
+    /** 快递编码 → 中文名（详情行的 carrierLabel；前端不再维护第二份映射表） */
+    private final DictService dictService;
     /** Spring 全局 ObjectMapper（快照 JSON 序列化/反序列化；构造注入以便单测替换） */
     private final ObjectMapper objectMapper;
 
@@ -408,10 +415,12 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
                 .orderByAsc(GzJpOrderItem::getId));
 
         Map<Long, String> urlCache = new HashMap<>();
+        // 字典整单只读一次（30 款逐行读字典就是 N 次缓存往返）
+        Map<String, String> carriers = safeDictMap();
         List<GzJpOrderItemVO> itemVOs = new ArrayList<>(items.size());
         int totalQty = 0;
         for (GzJpOrderItem item : items) {
-            itemVOs.add(toItemVO(item, urlCache));
+            itemVOs.add(toItemVO(item, urlCache, carriers));
             totalQty += ObjectUtil.defaultIfNull(item.getQty(), 0);
         }
 
@@ -489,7 +498,7 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
         return vo;
     }
 
-    private GzJpOrderItemVO toItemVO(GzJpOrderItem item, Map<Long, String> urlCache) {
+    private GzJpOrderItemVO toItemVO(GzJpOrderItem item, Map<Long, String> urlCache, Map<String, String> carriers) {
         JpOrderSnapshot.Product snap = readJson(item.getProductSnapshotJson(), JpOrderSnapshot.Product.class);
         GzJpOrderItemVO vo = new GzJpOrderItemVO();
         vo.setId(item.getId());
@@ -501,6 +510,7 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
         vo.setFulfillStatus(item.getFulfillStatus());
         vo.setFulfillStatusLabel(GzJpFulfillStatus.labelOf(item.getFulfillStatus()));
         vo.setCarrierCode(item.getCarrierCode());
+        vo.setCarrierLabel(resolveCarrierLabel(item.getCarrierCode(), carriers));
         vo.setTrackingNo(item.getTrackingNo());
         vo.setShippedAt(item.getShippedAt());
         vo.setRefundStatus(item.getRefundStatus());
@@ -552,6 +562,47 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
         }
         urlCache.put(fileId, url);
         return url;
+    }
+
+    /**
+     * 快递编码 → 中文名（字典 {@code gz_express_carrier}）。
+     *
+     * <p><b>降级一律给 {@code null}，绝不返回字面量 "null"、绝不抛</b>（对齐
+     * {@code GzJpFulfillServiceImpl#resolveCarrierLabel} 的「取空只告警不拦」）：</p>
+     * <ul>
+     *   <li>编码为空（未发货）→ null，且不打日志（这是绝大多数行的正常状态）</li>
+     *   <li>字典整体为空（缓存故障 / 读取异常，{@link #safeDictMap} 已吞掉异常）→ null</li>
+     *   <li>编码不在字典里（后台删了某个承运商，历史订单行仍留旧编码）→ null + 告警</li>
+     * </ul>
+     *
+     * <p><b>为什么不回落成编码本身</b>：客人侧看到「sf SF7654321000」比只看到「SF7654321000」
+     * 更困惑，而单号本身就够他去快递官网查件。这里与 mp 的展示口径是同一条（mp 拿到空就只渲染单号）。</p>
+     *
+     * @param carrier  订单行上的快递编码（可为 null）
+     * @param carriers 本次请求已取好的字典（整单只读一次）
+     */
+    private String resolveCarrierLabel(String carrier, Map<String, String> carriers) {
+        if (StrUtil.isBlank(carrier)) {
+            return null;
+        }
+        String label = carriers.get(carrier);
+        if (StrUtil.isBlank(label)) {
+            log.warn("[gz-jp-order] 快递编码 {} 在字典 {} 里查不到中文名，carrierLabel 下发 null",
+                carrier, DICT_EXPRESS_CARRIER);
+            return null;
+        }
+        return label;
+    }
+
+    /** 字典读取兜底：null / 异常一律当空字典 —— 字典挂了不该让客人的订单详情打不开。 */
+    private Map<String, String> safeDictMap() {
+        try {
+            Map<String, String> map = dictService.getAllDictByDictType(DICT_EXPRESS_CARRIER);
+            return map == null ? Collections.emptyMap() : map;
+        } catch (Exception e) {
+            log.warn("[gz-jp-order] 读取字典 {} 失败：{}", DICT_EXPRESS_CARRIER, e.getMessage());
+            return Collections.emptyMap();
+        }
     }
 
     // ============================================================

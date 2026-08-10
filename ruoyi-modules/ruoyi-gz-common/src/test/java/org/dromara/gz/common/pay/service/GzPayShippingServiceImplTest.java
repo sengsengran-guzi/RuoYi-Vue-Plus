@@ -200,6 +200,35 @@ class GzPayShippingServiceImplTest {
         verify(shippingMapper, times(0)).selectById(any());
     }
 
+    @Test
+    @DisplayName("★★ 上报命令带的是「任务行上存的 clientId」—— 多小程序共用后端时的命门")
+    void doUpload_carriesRowClientIdIntoCommand() {
+        // 上报跑在 @Async / cron / admin 补报线程里，那里没有请求上下文可读；
+        // 有上下文时（admin 补报）header 装的是操作者当前的客户端，与这笔单属于谁无关。
+        // 所以归属必须由**行**决定，一路透传到 UploadCommand，下游再据此选 appid / secret / token 槽位。
+        //
+        // 断的是值不是「调用发生了」：verify(...).uploadShippingInfo(any()) 那种写法在
+        // clientId 被透传成 null 时照样绿，等于没测。
+        GzPayShippingOrder jpRow = physicalRow(77L, GzPayShippingOrder.STATUS_PENDING, "SF001");
+        when(shippingMapper.selectById(77L)).thenReturn(jpRow);
+        when(shippingClient.uploadShippingInfo(any(UploadCommand.class))).thenReturn(UploadResult.ok());
+
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(() -> TenantHelper.ignore(any(Supplier.class)))
+                .thenAnswer(inv -> ((Supplier<?>) inv.getArgument(0)).get());
+            service.retryOne(77L);
+        }
+
+        ArgumentCaptor<UploadCommand> cmd = ArgumentCaptor.forClass(UploadCommand.class);
+        verify(shippingClient).uploadShippingInfo(cmd.capture());
+        assertEquals("mp-applet-gz-jp", cmd.getValue().clientId(),
+            "上报命令没带上行里的 clientId —— 下游会按 default-client-id 拿错 appid 的 token，"
+                + "微信恒回 10060001 且重试永远好不了");
+        // 同时确认没有把别的字段串错行
+        assertEquals(jpRow.getTransactionId(), cmd.getValue().transactionId());
+        assertEquals(jpRow.getOpenid(), cmd.getValue().openid());
+    }
+
     // ============================================================
     //  多包裹并发与收口（D6 QA 第 2 轮逮到的三个「静默丢数据」缺陷的回归）
     // ============================================================
