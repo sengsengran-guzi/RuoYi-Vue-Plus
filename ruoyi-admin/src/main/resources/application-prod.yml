@@ -273,20 +273,37 @@ justauth:
 --- # 微信小程序登录配置（GZ-SYS-002 / 多小程序 ADR-0019 §1）— prod 由 env var 注入真实 AppID/Secret
 wx:
   miniapp:
-    # 单值形态：等价于 apps: { mp-applet-sensenran-guzi: {appid, secret} }（default-client-id 默认即它）。
-    # 拼团小程序（clientid=mp-applet-gz-jp）拿到 appid/secret 后改成下面的 apps 形态再上线：
-    #   apps:
-    #     mp-applet-sensenran-guzi: { appid: "${WX_MA_APPID:wx2f8b93e09703f07d}", secret: "${WX_MA_SECRET:}" }
-    #     mp-applet-gz-jp:          { appid: "${WX_JP_MA_APPID:}",                secret: "${WX_JP_MA_SECRET:}",
-    #                                 register-source: mp_wechat_jp }
-    # 注意：未登记的 clientid 一律拒绝（不静默用另一个小程序的凭证），所以拼团 mp 上线前必须先补这里。
-    # register-source（GZ-SYS-023）写进 gz_user.register_source，新小程序必须配自己的值，否则 admin
-    # 分不清用户来自哪个小程序；不配 → 继承全局默认 mp_wechat（= 现小程序取值，单值形态天然如此）。
-    appid: ${WX_MA_APPID:wx2f8b93e09703f07d}   # 谷子宇宙小程序 AppID（非机密，已绑商户 1731037015）；env var 可覆盖
-    secret: ${WX_MA_SECRET:}
+    # 无 clientid 上下文（@Async 发货上报 / cron / curl 调试）时落到哪个小程序；必须是 apps 的 key
+    default-client-id: mp-applet-sensenran-guzi
+    # 按 clientid 索引的小程序清单（key = mp 端 VITE_APP_CLIENT_ID / 请求 header clientid）。
+    # 没登记的 clientid 在登录/手机号口径直接抛错（WxAppResolver.currentApp 严格口径）——
+    # 既不会静默拿另一个小程序的 appid/secret 去调微信，也不会静默降级 mock 登录。
+    apps:
+      # 谷子宇宙（现小程序）：appid 非机密（已绑商户 1731037015），secret 走 env var
+      mp-applet-sensenran-guzi:
+        appid: ${WX_MA_APPID:wx2f8b93e09703f07d}
+        secret: ${WX_MA_SECRET:}
     session-key-ttl-seconds: ${WX_MA_SESSION_KEY_TTL:86400}
     # 业务 token TTL（秒），30 天（ADR-0009 登录态长效；失效由 mp 静默 wx.login 续期）
     token-ttl-seconds: ${WX_MA_TOKEN_TTL:2592000}
+
+--- # 谷子宇宙拼团小程序（clientid=mp-applet-gz-jp）— 仅当本环境声明「要服务拼团」时才注册
+# 开关 = 激活 profile jp（部署机 .env 加 SPRING_PROFILES_INCLUDE=jp，compose 已透传该变量）。
+# 上线三步，缺任何一步都以「响亮的错」暴露，不会静默走 mock：
+#   1. .env  SPRING_PROFILES_INCLUDE=jp     不加 → 拼团 clientid 的登录被明确拒绝（未配置的小程序客户端），现小程序照常营业
+#   2. .env  WX_JP_MA_APPID=<真 appid>      加了 1 漏 2 → ProdSecretGuard 点名 [mp-applet-gz-jp] 拒绝启动
+#   3. .env  WX_JP_MA_SECRET=<真 secret>    漏 3 → 登录调 jscode2session 返 invalid appsecret(40125)，不影响现小程序
+# 为什么不无条件登记：拼团 appid 到手前（甲方备案中）无条件登记 = 每次部署都被守卫拒启动，
+# 线上真实营业的现小程序会跟着起不来。appid 到手后想去掉这个开关，删掉本段的 on-profile 行即可。
+spring.config.activate.on-profile: jp
+wx:
+  miniapp:
+    apps:
+      mp-applet-gz-jp:
+        appid: ${WX_JP_MA_APPID:}
+        secret: ${WX_JP_MA_SECRET:}
+        # 写进 gz_user.register_source（GZ-SYS-023）；不配会继承全局 mp_wechat，admin 分不清用户来自哪个小程序
+        register-source: mp_wechat_jp
 
 --- # 拼豆核销码签名密钥（GZ-BEAN-004）— prod 必须走 env var GZ_BEAN_QR_SECRET（生产前生成 ≥ 32 字符随机串）
 gz:

@@ -92,6 +92,38 @@ docker logs gz-ruoyi-admin-prod 2>&1 | grep -iE "flyway|migrat|started"
 - 域名：你的业务域名
 - 申请 SSL 证书（Let's Encrypt）
 
+### 2.4 拼团小程序上线（拿到 mp-applet-gz-jp 的 appid/secret 之后）
+
+一个后端同时服务两个小程序（谷子宇宙 `mp-applet-sensenran-guzi` / 拼团 `mp-applet-gz-jp`），
+后者默认**不注册**：没拿到真凭证前若注册，`ProdSecretGuard` 会拒绝启动，把线上营业中的现小程序一起拖下水。
+
+上线动作只有 .env 三行 + 一次重启：
+
+```bash
+cd $REPO_DIR
+vim .env
+#   SPRING_PROFILES_INCLUDE=jp
+#   WX_JP_MA_APPID=<拼团真 appid>      # 必须与 miniapp-jp/.env.production 的 VITE_WX_APPID 一致
+#   WX_JP_MA_SECRET=<拼团真 secret>
+docker compose --env-file .env -f script/docker/docker-compose.deploy.yml up -d ruoyi-admin
+
+# 验：两个小程序都注册成功、且都是 real 通道
+docker logs gz-ruoyi-admin-prod 2>&1 | grep "小程序注册"
+# 期待两行：clientid=mp-applet-sensenran-guzi ... channel=real
+#          clientid=mp-applet-gz-jp ...        channel=real registerSource=mp_wechat_jp
+```
+
+漏配的表现（都是响亮的错，不会静默降级 mock）：
+
+| 漏了什么 | 现象 |
+|---|---|
+| `SPRING_PROFILES_INCLUDE=jp` | 拼团登录报「未配置的小程序客户端 clientid=mp-applet-gz-jp」；现小程序不受影响 |
+| `WX_JP_MA_APPID` | 容器起不来，日志 `[prod 启动拒绝] ... 小程序 [mp-applet-gz-jp] 的 appid 仍为占位/空` |
+| `WX_JP_MA_SECRET` | 能启动，拼团登录时微信返 `invalid appsecret (40125)` |
+
+> 商户号 / `gz.pay.appid` / `gz_pay_channel` **都不用动**：收款 appid 由 `PayAppidResolver` 按 clientid
+> 取 `wx.miniapp.apps.<clientid>.appid`，与 `payer.openid` 天然同源。
+
 ---
 
 ## 3. 日常运维

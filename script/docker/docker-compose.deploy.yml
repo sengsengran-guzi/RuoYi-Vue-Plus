@@ -91,6 +91,12 @@ services:
       - "8080:8080"
     environment:
       SPRING_PROFILES_ACTIVE: prod
+      # 追加激活的 profile（逗号分隔，空 = 只有 prod）。
+      # 拼团小程序上线时在 .env 设 SPRING_PROFILES_INCLUDE=jp —— 这才会让 application-prod.yml 里
+      # mp-applet-gz-jp 那段生效（不设 = 拼团 clientid 未登记，登录被明确拒绝，现小程序不受影响）。
+      # 用 spring.profiles.include 而不是改 SPRING_PROFILES_ACTIVE：后者被 snail-job namespace 等处
+      # 以 ${spring.profiles.active} 直接引用，改成 "prod,jp" 会连带污染那些值。
+      SPRING_PROFILES_INCLUDE: ${SPRING_PROFILES_INCLUDE:-}
       TZ: Asia/Shanghai
       # 数据库走 docker 服务名解析（覆盖 application-prod.yml 的 MASTER_DB_URL 默认值）
       MASTER_DB_URL: "jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-ry-vue}?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=false&serverTimezone=Asia/Shanghai&autoReconnect=true&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true&nullCatalogMeansCurrent=true"
@@ -104,6 +110,11 @@ services:
       # 配齐后自动切 WxRealLoginAdapter（jscode2session）+ WxRealPhoneAdapter（getuserphonenumber）。
       WX_MA_APPID: ${WX_MA_APPID:-wxMOCK}
       WX_MA_SECRET: ${WX_MA_SECRET:-}
+      # 拼团小程序（clientid=mp-applet-gz-jp）的凭证，仅在 SPRING_PROFILES_INCLUDE 含 jp 时被读取。
+      # 刻意用 :-（可空）而不是 :?（缺失即拒）—— compose 层拦截会连 ps/logs/down 都跑不了，
+      # 真正的 fail-fast 由 prod 的 ProdSecretGuard 做：登记了却漏 appid → 启动被拒并点名该 clientid。
+      WX_JP_MA_APPID: ${WX_JP_MA_APPID:-}
+      WX_JP_MA_SECRET: ${WX_JP_MA_SECRET:-}
       # 拼豆核销码 HMAC 签名密钥（GZ-BEAN-004）— prod 必填，否则 ProdSecretGuard fail-fast 拒绝启动。
       # 生成：openssl rand -base64 32
       GZ_BEAN_QR_SECRET: ${GZ_BEAN_QR_SECRET:?GZ_BEAN_QR_SECRET is required（核销码 HMAC 密钥，≥32 随机字符，生成 openssl rand -base64 32）}
