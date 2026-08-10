@@ -10,6 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.tenant.helper.TenantHelper;
+import org.dromara.gz.common.pay.config.ShippingExecutorConfig;
 import org.dromara.gz.common.pay.domain.entity.GzPayShippingOrder;
 import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
 import org.dromara.gz.common.pay.domain.vo.GzPayShippingOrderVO;
@@ -134,6 +135,11 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
         }
     }
 
+    /** 人工待办追加一行（保留既有的，别把上一条覆盖掉——超限可能连着丢好几个运单）。 */
+    private static String appendNote(String existing, String add) {
+        return StrUtil.isBlank(existing) ? add : existing + " | " + add;
+    }
+
     /** 快路径读到行之后再加锁确认；行在这瞬间被删掉（理论不可达）就退回快路径那份。 */
     private GzPayShippingOrder lockOrThrow(String transactionId, GzPayShippingOrder fallback) {
         GzPayShippingOrder locked = lockByTransactionId(transactionId);
@@ -164,8 +170,8 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
             if (existing != null) {
                 GzPayShippingOrder upd = new GzPayShippingOrder();
                 upd.setId(existing.getId());
-                upd.setLastError(StrUtil.maxLength(
-                    "运单 " + tracking + " 入队失败未能并入上报：" + e.getMessage(), 480));
+                upd.setManualNote(StrUtil.maxLength(appendNote(existing.getManualNote(),
+                    "运单 " + tracking + " 入队失败未能并入上报：" + e.getMessage()), 480));
                 shippingMapper.updateById(upd);
             }
         } catch (Exception ignore) {
@@ -287,8 +293,11 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
                     existing.getTransactionId(), ShippingInfo.MAX_PACKAGES, incoming.getTrackingNo());
                 GzPayShippingOrder over = new GzPayShippingOrder();
                 over.setId(existing.getId());
-                over.setLastError("包裹数已达微信上限 " + ShippingInfo.MAX_PACKAGES
-                    + "，运单 " + incoming.getTrackingNo() + " 未能上报");
+                // ★ 写 manual_note 不写 last_error：last_error 会被下一次成功上报清空，
+                //   而「这个运单永远进不了上报清单」是既成事实，清掉就零痕迹了。
+                over.setManualNote(StrUtil.maxLength(appendNote(existing.getManualNote(),
+                    "包裹数已达微信上限 " + ShippingInfo.MAX_PACKAGES
+                        + "，运单 " + incoming.getTrackingNo() + " 未能上报，需人工并单"), 480));
                 shippingMapper.updateById(over);
                 return;
             }
@@ -372,7 +381,7 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
         }
     }
 
-    @Async
+    @Async(ShippingExecutorConfig.SHIPPING_EXECUTOR)
     @Override
     public void tryUploadAsync(Long shippingId) {
         if (shippingId == null) {
@@ -386,7 +395,12 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
                         return null; // 被中断 → 放弃后续重试，留手动补报
                     }
                     GzPayShippingOrder row = shippingMapper.selectById(shippingId);
-                    if (row == null || GzPayShippingOrder.STATUS_SUCCESS.equals(row.getUploadStatus())) {
+                    // ★ 必须同时判 blocked：第 1 枪拿 10060002（已完成发货，terminal）会把行写成 blocked，
+                    //   若这里只判 success，同一个任务 12 秒后**还会再报一次**，撞 10060003
+                    //   （重新发货次数用完）→ 该支付单永久报不上去。全自动，无需任何人操作。
+                    if (row == null
+                        || GzPayShippingOrder.STATUS_SUCCESS.equals(row.getUploadStatus())
+                        || GzPayShippingOrder.STATUS_BLOCKED.equals(row.getUploadStatus())) {
                         return null; // 单没了 / 已被其它路径推成功
                     }
                     try {
@@ -510,6 +524,15 @@ public class GzPayShippingServiceImpl implements IGzPayShippingService {
     private boolean doUpload(GzPayShippingOrder row) {
         if (GzPayShippingOrder.STATUS_SUCCESS.equals(row.getUploadStatus())) {
             return true;
+        }
+        // ★ blocked = 微信侧终态拒绝，**任何自动路径都不许再报**。
+        //   批扫拿的是内存快照（扫的时候还是 pending，轮到它时已被别的路径写成 blocked），
+        //   不在这里挡住就会再打一枪，把每笔单仅有一次的「重新发货」机会烧掉。
+        //   人工要强制重试走 admin 的单条补报（它会显式清 blocked 后再调）。
+        if (GzPayShippingOrder.STATUS_BLOCKED.equals(row.getUploadStatus())) {
+            log.info("[gz-shipping] 跳过 blocked 行的自动上报 id={} transaction_id={}（需人工处理）",
+                row.getId(), row.getTransactionId());
+            return false;
         }
         UploadResult result = shippingClient.uploadShippingInfo(new UploadCommand(
             row.getTransactionId(),

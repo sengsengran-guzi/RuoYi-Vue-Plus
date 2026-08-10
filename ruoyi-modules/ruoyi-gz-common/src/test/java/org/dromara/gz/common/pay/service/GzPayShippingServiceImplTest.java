@@ -281,16 +281,18 @@ class GzPayShippingServiceImplTest {
             GzPayShippingOrder row3 = physicalRow(3L, GzPayShippingOrder.STATUS_SUCCESS, "TRK-A");
             when(shippingMapper.selectOne(any())).thenReturn(row3);
             when(shippingMapper.selectByTransactionIdForUpdate("txn-3")).thenReturn(row3);
-            // 追加时写库炸（模拟列装不下 / 连接问题）—— 语句级失败，应被吞掉并记 last_error
+            // 追加时写库炸（模拟列装不下 / 连接问题）—— 语句级失败，应被吞掉并留下人工待办
             when(shippingMapper.updateById(any(GzPayShippingOrder.class))).thenThrow(new RuntimeException("Data too long for column"));
 
             service.enqueue(txn("txn-3"), physical("TRK-B", false));   // 不抛
 
             ArgumentCaptor<GzPayShippingOrder> captor = ArgumentCaptor.forClass(GzPayShippingOrder.class);
             verify(shippingMapper, atLeastOnce()).updateById(captor.capture());
-            boolean wroteError = captor.getAllValues().stream()
-                .anyMatch(r -> r.getLastError() != null && r.getLastError().contains("TRK-B"));
-            assertTrue(wroteError, "★ 必须把失败原因落到 last_error，admin 才看得见");
+            // ★ 必须落 manual_note 而不是 last_error：last_error 会被下一次成功上报清空，
+            //   而「这个运单没能并进上报清单」是既成事实，清掉就零痕迹了。
+            boolean wroteNote = captor.getAllValues().stream()
+                .anyMatch(r -> r.getManualNote() != null && r.getManualNote().contains("TRK-B"));
+            assertTrue(wroteNote, "★ 人工待办必须落到 manual_note（last_error 会被成功上报清空）");
         }
     }
 
@@ -394,6 +396,18 @@ class GzPayShippingServiceImplTest {
         service.retryOne(32L);
 
         verify(shippingMapper, times(0)).updateById(any(GzPayShippingOrder.class));
+    }
+
+    @Test
+    @DisplayName("★★ blocked 行任何自动路径都不许再上报（再报一次就撞 10060003，永久报不上去）")
+    void blockedRowIsNeverAutoRetried() {
+        GzPayShippingOrder blocked = physicalRow(41L, GzPayShippingOrder.STATUS_BLOCKED, "TRK-A");
+        when(shippingMapper.selectById(41L)).thenReturn(blocked);
+
+        // retryOne 走的是同一个 doUpload；blocked 必须在打微信之前就被挡住
+        service.retryOne(41L);
+
+        verify(shippingClient, times(0)).uploadShippingInfo(any(UploadCommand.class));
     }
 
     private static GzPayTransaction txn(String transactionId) {

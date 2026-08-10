@@ -52,24 +52,30 @@ public interface GzPayShippingOrderMapper extends BaseMapperPlus<GzPayShippingOr
      * admin 页面还一切正常、{@code last_error} 为空 —— 永久静默丢包裹。
      * 实测 dev（mock 微秒级）40 笔并发命中 7 笔；prod 真网络窗口大几个数量级。</p>
      *
-     * <p>守卫用 {@code (upload_status, attempt_count)} 做代际标识：追加包裹会把它们重置成
-     * {@code (pending, 0)}，与我读到的那一份必然不同 ⇒ affected=0 ⇒ 调用方放弃写入，
+     * <p>守卫用 {@code content_version} 做代际标识（追加包裹 / 收口时 +1）。
+     * <b>不能用 {@code (upload_status, attempt_count)}</b>：追加包裹写入的正是 {@code (pending, 0)}，
+     * 与首次上报读到的逐字相同 ⇒ ABA 恒命中、等于没守。守卫落空 ⇒ affected=0 ⇒ 调用方放弃写入，
      * 由那次追加派出的新上报去报最新的整份清单（上报本身幂等，重报无害）。</p>
      *
-     * <p>成功时顺带清空 {@code last_error} —— 否则「已成功却挂着上次的错误原因」会让 owner 误判。</p>
+     * <p><b>{@code upload_status <> 'blocked'}</b>：blocked 是微信侧终态拒绝，
+     * 并发下的陈旧回写不许把它覆盖回 {@code failed/success} —— 覆盖了自动重试就会复活，
+     * 撞 {@code 10060003}（重新发货机会已用掉）永久报不上去。</p>
+     *
+     * <p>成功时顺带清空 {@code last_error}（「已成功却挂着上次的错误原因」会让 owner 误判）；
+     * <b>但不碰 {@code manual_note}</b> —— 那记的是「某运单永远进不了清单」这种既成事实，
+     * 清掉就零痕迹了。</p>
      *
      * @param id            主键
-     * @param expectStatus  我开始上报时看到的状态
-     * @param expectAttempt 我开始上报时看到的尝试次数
+     * @param expectVersion 我开始上报时读到的 content_version
      * @param newStatus     要写入的新状态
      * @param newAttempt    要写入的新尝试次数
      * @param uploadedTime  成功时的上报时间（失败传 null）
      * @param lastError     失败原因（成功传 null，会把该列清空）
-     * @return 影响行数；0 = 守卫未命中（期间内容变过），调用方应放弃本次结果
+     * @return 影响行数；0 = 守卫未命中（期间内容变过 / 已 blocked），调用方应放弃本次结果
      */
     @Update("UPDATE gz_pay_shipping_order SET upload_status = #{newStatus}, attempt_count = #{newAttempt}, "
         + "uploaded_time = #{uploadedTime}, last_error = #{lastError} "
-        + "WHERE id = #{id} AND content_version = #{expectVersion}")
+        + "WHERE id = #{id} AND content_version = #{expectVersion} AND upload_status <> 'blocked'")
     int updateStatusGuarded(@Param("id") Long id,
                             @Param("expectVersion") Long expectVersion,
                             @Param("newStatus") String newStatus,

@@ -117,8 +117,18 @@ public class GzPayShippingOrder extends TenantEntity {
      */
     private Long contentVersion;
 
-    /** 最近一次失败原因 */
+    /** 最近一次失败原因（每次上报回写都会覆写；成功时清空） */
     private String lastError;
+
+    /**
+     * 需人工介入的事实（超 15 包裹上限被丢弃的运单 / 入队失败未并入的运单）。
+     *
+     * <p><b>和 {@code lastError} 不是一回事</b>：{@code lastError} 是「上次上报为什么失败」，
+     * 会被下一次成功上报清空；而这里记的是<b>既成事实</b>——某个运单**永远**不会进上报清单了，
+     * 需要 owner 人工并单。挂在 {@code lastError} 上会被成功上报静默抹掉，
+     * admin 页只剩一行干净的 success，而那几个运单号从没进过微信、零痕迹。</p>
+     */
+    private String manualNote;
 
     /** 上报成功时间 */
     private LocalDateTime uploadedTime;

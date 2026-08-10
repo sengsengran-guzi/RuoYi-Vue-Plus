@@ -11,6 +11,7 @@ import org.dromara.common.core.service.DictService;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.common.domain.vo.GzUserVO;
+import org.dromara.gz.common.pay.config.ShippingExecutorConfig;
 import org.dromara.gz.common.pay.config.WechatPayProperties;
 import org.dromara.gz.common.pay.domain.entity.GzPayTransaction;
 import org.dromara.gz.common.pay.mapper.GzPayTransactionMapper;
@@ -287,7 +288,7 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
     }
 
     @Override
-    @Async
+    @Async(ShippingExecutorConfig.SHIPPING_EXECUTOR)
     public void settleShippingAsync(List<Long> orderIds) {
         settleOrders(orderIds);
     }

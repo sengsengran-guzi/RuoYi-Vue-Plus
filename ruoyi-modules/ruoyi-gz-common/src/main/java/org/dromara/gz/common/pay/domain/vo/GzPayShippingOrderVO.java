@@ -70,6 +70,9 @@ public class GzPayShippingOrderVO implements Serializable {
     /** 最近一次失败原因 */
     private String lastError;
 
+    /** 需人工介入的事实（超包裹上限被丢弃的运单等）；上报结果不覆写 */
+    private String manualNote;
+
     /** 上报成功时间 */
     private LocalDateTime uploadedTime;
 
