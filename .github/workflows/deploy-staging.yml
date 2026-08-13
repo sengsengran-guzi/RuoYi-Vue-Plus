@@ -12,7 +12,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Trigger deploy on server
@@ -21,7 +21,7 @@ jobs:
           host: ${{ secrets.SSH_HOST_STAGING }}
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY_STAGING }}
-          command_timeout: 30m
+          command_timeout: 60m
           script: |
             set -e
             REPO_DIR=/www/wwwroot/api.sensenran-guzi.com
