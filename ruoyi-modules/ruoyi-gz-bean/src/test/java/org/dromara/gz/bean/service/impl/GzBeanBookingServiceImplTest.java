@@ -80,6 +80,7 @@ class GzBeanBookingServiceImplTest {
     @Mock private org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper seatTypeConfigMapper;
     @Mock private org.dromara.gz.bean.mapper.GzBeanSeatMapper seatMapper;
     @Mock private org.dromara.gz.bean.mapper.GzBeanSeatTypePriceMapper seatTypePriceMapper;
+    @Mock private org.dromara.gz.bean.mapper.GzBeanDayPassPriceMapper dayPassPriceMapper;
     @Mock private org.dromara.gz.bean.mapper.GzBeanTimeSlotTemplateMapper timeSlotTemplateMapper;
     @Mock private org.dromara.gz.bean.service.IGzBeanFreePromoService freePromoService;
     @Mock private org.dromara.gz.bean.service.IGzBeanSeatClosureService seatClosureService;
@@ -111,12 +112,15 @@ class GzBeanBookingServiceImplTest {
         qrCodeSigner = new QrCodeSigner(props);
         service = new GzBeanBookingServiceImpl(
             bookingMapper, bookingGroupMapper, bookingLogMapper, storeMapper, gzUserMapper, qrCodeSigner,
-            seatTypeConfigMapper, seatMapper, seatTypePriceMapper, timeSlotTemplateMapper, freePromoService,
+            seatTypeConfigMapper, seatMapper, seatTypePriceMapper, dayPassPriceMapper, timeSlotTemplateMapper, freePromoService,
             seatClosureService, slotQuotaCloseService, payServiceProvider, couponServiceProvider,
             payRefundServiceProvider, configService
         );
         // 按星期价格：默认无覆盖 → effectivePrice 回退基础价（ADR-0014 §3）；个别用例自行覆盖 stub
         lenient().when(seatTypePriceMapper.selectByConfig(anyLong())).thenReturn(java.util.List.of());
+        // 包天按星期价（GZ-BEAN-053）：默认无覆盖 → 回退 config.day_pass_price_cent；个别用例自行覆盖 stub
+        lenient().when(dayPassPriceMapper.selectByConfig(anyLong())).thenReturn(java.util.List.of());
+        lenient().when(dayPassPriceMapper.selectByConfigIds(any())).thenReturn(java.util.List.of());
         // 座位关闭（GZ-BEAN-036）：默认无关闭规则（空集）→ 不拦分座 / seat-map closed=false；关闭用例自行覆盖 stub。
         lenient().when(seatClosureService.findClosedSeatIds(anyString(), anyLong(), any(), any(), any()))
             .thenReturn(java.util.List.of());
@@ -2809,6 +2813,100 @@ class GzBeanBookingServiceImplTest {
         assertEquals("pending", inserted.getStatus());
         assertEquals("paying", inserted.getPayStatus());
         verify(payService).createBusinessOrder(any());
+    }
+
+    // ============================================================
+    //  GZ-BEAN-053 包天按星期价（gz_bean_day_pass_price）
+    // ============================================================
+
+    /** 某星期的包天覆盖价行。 */
+    private org.dromara.gz.bean.domain.entity.GzBeanDayPassPrice newDayPassPrice(long configId, int weekday, long priceCent) {
+        return org.dromara.gz.bean.domain.entity.GzBeanDayPassPrice.builder()
+            .seatTypeConfigId(configId)
+            .weekday(weekday)
+            .priceCent(priceCent)
+            .build();
+    }
+
+    @Test
+    @DisplayName("submitDayPass · 命中该日星期的包天覆盖价 → 用覆盖价下单（不用 config 基础包天价）")
+    void submitDayPass_weekdayPriceHit_usesOverride() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        stubBusinessWindow();
+        when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
+        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
+        when(seatTypeConfigMapper.selectById(10L)).thenReturn(newDayPassConfig(5, 3, 8000));
+        when(bookingMapper.countActiveDayPassForUpdate("1001", 1L, 10L, SESS_DATE)).thenReturn(0L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyLong(), any(), any())).thenReturn(0L);
+        // SESS_DATE = 2099-01-01 = 周四(ISO 4)；周四 9900 覆盖、周六 12000 不命中
+        when(dayPassPriceMapper.selectByConfig(10L)).thenReturn(java.util.List.of(
+            newDayPassPrice(10L, 4, 9900L),
+            newDayPassPrice(10L, 6, 12000L)));
+        org.dromara.gz.common.pay.domain.vo.MpPayParamsVO pp =
+            org.dromara.gz.common.pay.domain.vo.MpPayParamsVO.builder().outTradeNo("PINDOU-DP-W").build();
+        when(payServiceProvider.getObject()).thenReturn(payService);
+        when(payService.createBusinessOrder(any())).thenReturn(pp);
+        when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
+
+        spy.submitDayPass(newDayPassBo(), 1L);
+
+        org.mockito.ArgumentCaptor<GzBeanBooking> cap = org.mockito.ArgumentCaptor.forClass(GzBeanBooking.class);
+        verify(bookingMapper).insert(cap.capture());
+        assertEquals(9900L, cap.getValue().getAmountCent(), "周四覆盖价生效（非 config 基础 8000）");
+    }
+
+    @Test
+    @DisplayName("submitDayPass · 该日星期无覆盖价 → 回退 config.day_pass_price_cent 基础包天价")
+    void submitDayPass_weekdayPriceMiss_fallsBackToBase() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        stubBusinessWindow();
+        when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
+        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
+        when(seatTypeConfigMapper.selectById(10L)).thenReturn(newDayPassConfig(5, 3, 8000));
+        when(bookingMapper.countActiveDayPassForUpdate("1001", 1L, 10L, SESS_DATE)).thenReturn(0L);
+        when(bookingMapper.countActiveCoveringSlotForUpdate(anyString(), anyLong(), anyLong(), any(), any())).thenReturn(0L);
+        // 只配了周六/周日，SESS_DATE 是周四 → 不命中
+        when(dayPassPriceMapper.selectByConfig(10L)).thenReturn(java.util.List.of(
+            newDayPassPrice(10L, 6, 12000L),
+            newDayPassPrice(10L, 7, 12000L)));
+        org.dromara.gz.common.pay.domain.vo.MpPayParamsVO pp =
+            org.dromara.gz.common.pay.domain.vo.MpPayParamsVO.builder().outTradeNo("PINDOU-DP-B").build();
+        when(payServiceProvider.getObject()).thenReturn(payService);
+        when(payService.createBusinessOrder(any())).thenReturn(pp);
+        when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
+
+        spy.submitDayPass(newDayPassBo(), 1L);
+
+        org.mockito.ArgumentCaptor<GzBeanBooking> cap = org.mockito.ArgumentCaptor.forClass(GzBeanBooking.class);
+        verify(bookingMapper).insert(cap.capture());
+        assertEquals(8000L, cap.getValue().getAmountCent(), "无该星期覆盖 → 回退基础包天价");
+    }
+
+    @Test
+    @DisplayName("selectDayPassOptions · mp 包天可选列表按该日星期取价（命中覆盖 / 未命中回退基础）")
+    void selectDayPassOptions_weekdayPrice() {
+        GzBeanStore store = newOpenStore(1L);
+        store.setTenantId("1001"); // selectDayPassOptions 直接读 store.tenantId 过滤桌型
+        when(storeMapper.selectById(1L)).thenReturn(store);
+        org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig c1 = newDayPassConfig(5, 3, 8000);
+        c1.setId(10L);
+        org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig c2 = newDayPassConfig(5, 3, 6000);
+        c2.setId(11L);
+        when(seatTypeConfigMapper.selectList(any())).thenReturn(java.util.List.of(c1, c2));
+        when(bookingMapper.countActiveDayPass(anyString(), anyLong(), anyLong(), any())).thenReturn(0L);
+        // 10 号桌型配了周四 9900；11 号只配周六 → 回退基础 6000
+        when(dayPassPriceMapper.selectByConfigIds(java.util.List.of(10L, 11L))).thenReturn(java.util.List.of(
+            newDayPassPrice(10L, 4, 9900L),
+            newDayPassPrice(11L, 6, 12000L)));
+
+        java.util.List<org.dromara.gz.bean.domain.vo.GzBeanDayPassOptionVO> options =
+            service.selectDayPassOptions(1L, SESS_DATE);
+
+        assertEquals(2, options.size());
+        assertEquals(9900L, options.get(0).getDayPassPriceCent(), "周四覆盖价");
+        assertEquals(new java.math.BigDecimal("99.00"), options.get(0).getDayPassPriceYuan());
+        assertEquals(6000L, options.get(1).getDayPassPriceCent(), "无周四覆盖 → 基础包天价");
+        assertEquals(Boolean.FALSE, options.get(0).getFull());
     }
 
     // ============================================================

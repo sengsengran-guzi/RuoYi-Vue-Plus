@@ -17,6 +17,7 @@ import org.dromara.gz.bean.domain.bo.GzBeanDayPassSubmitBo;
 import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
 import org.dromara.gz.bean.domain.entity.GzBeanBooking;
 import org.dromara.gz.bean.domain.entity.GzBeanBookingLog;
+import org.dromara.gz.bean.domain.entity.GzBeanDayPassPrice;
 import org.dromara.gz.bean.domain.entity.GzBeanSeat;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatVO;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
@@ -35,6 +36,7 @@ import org.dromara.gz.bean.domain.vo.GzBeanTypeSlotAvailabilityVO;
 import org.dromara.gz.bean.exception.GzBeanErrorCode;
 import org.dromara.gz.bean.mapper.GzBeanBookingLogMapper;
 import org.dromara.gz.bean.mapper.GzBeanBookingMapper;
+import org.dromara.gz.bean.mapper.GzBeanDayPassPriceMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypePriceMapper;
@@ -76,6 +78,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 /**
  * 拼豆预约服务实现（GZ-BEAN-004）。
@@ -185,6 +188,8 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
     private final GzBeanSeatMapper seatMapper;
     /** V1.2.x 按星期价格覆盖（GZ-BEAN-018，ADR-0014 §3）— 下单/余量取生效价 */
     private final GzBeanSeatTypePriceMapper seatTypePriceMapper;
+
+    private final GzBeanDayPassPriceMapper dayPassPriceMapper;
     /** V1.2 时段模板（GZ-BEAN-002）— 余量查询枚举启用时段 */
     private final GzBeanTimeSlotTemplateMapper timeSlotTemplateMapper;
     /**
@@ -1783,8 +1788,10 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             }
         }
 
-        // ⑩ 定价：固定包天价（ADR-0017，非逐格求和）；包天不锁券、不评前 N 名免费（is_free=0）
-        long amountCent = config.getDayPassPriceCent() == null ? 0L : config.getDayPassPriceCent();
+        // ⑩ 定价：该日星期的包天价（GZ-BEAN-053，非逐格求和）—— 星期覆盖价 ?? config 基础包天价；
+        //    包天不锁券、不评前 N 名免费（is_free=0）
+        long amountCent = dayPassPrice(config, dayPassPriceMapper.selectByConfig(config.getId()),
+            bo.getSessDate().getDayOfWeek().getValue());
         long payAmountCent = Math.max(0L, amountCent);
         boolean free = payAmountCent <= 0L; // 包天价>0 恒付费；价=0 时走免费兜底（与 submitPaid 一致）
 
@@ -1879,11 +1886,20 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                 .gt(GzBeanSeatTypeConfig::getDayPassQuota, 0)
                 .orderByAsc(GzBeanSeatTypeConfig::getSortNo)
                 .orderByAsc(GzBeanSeatTypeConfig::getId));
+        if (configs.isEmpty()) {
+            return List.of();
+        }
+        // 该日星期的包天覆盖价一次拉全（免逐桌型 N+1），逐 config 分组后 2 级回退（GZ-BEAN-053）
+        int weekday = sessDate.getDayOfWeek().getValue();
+        Map<Long, List<GzBeanDayPassPrice>> dayPassPriceRows = dayPassPriceMapper
+            .selectByConfigIds(configs.stream().map(GzBeanSeatTypeConfig::getId).toList())
+            .stream()
+            .collect(Collectors.groupingBy(GzBeanDayPassPrice::getSeatTypeConfigId));
         List<GzBeanDayPassOptionVO> result = new ArrayList<>(configs.size());
         for (GzBeanSeatTypeConfig c : configs) {
             int quota = c.getDayPassQuota() == null ? 0 : c.getDayPassQuota();
             long sold = bookingMapper.countActiveDayPass(tenantId, storeId, c.getId(), sessDate);
-            long priceCent = c.getDayPassPriceCent() == null ? 0L : c.getDayPassPriceCent();
+            long priceCent = dayPassPrice(c, dayPassPriceRows.get(c.getId()), weekday);
             result.add(GzBeanDayPassOptionVO.builder()
                 .seatTypeConfigId(c.getId())
                 .name(StrUtil.isNotBlank(c.getName()) ? c.getName() : c.getSeatType())
@@ -1944,6 +1960,28 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             return dayDefault;
         }
         return config.getPriceCent() == null ? 0L : config.getPriceCent();
+    }
+
+    /**
+     * 某「桌型 × 星期」的生效包天价（分，GZ-BEAN-053）—— 2 级回退：
+     * <ol>
+     *   <li>{@code gz_bean_day_pass_price(config, weekday)} 星期覆盖价；</li>
+     *   <li>{@code config.day_pass_price_cent} 基础包天价（兜底）。</li>
+     * </ol>
+     * 包天买断全天、无 1h 格维度，所以不像 {@link #hourPrice} 那样有格价层。
+     *
+     * @param rows    该 config 的包天星期覆盖行（已预载；null / 空 = 全回退基础价）
+     * @param weekday ISO 8601 星期 1=Mon..7=Sun
+     */
+    private long dayPassPrice(GzBeanSeatTypeConfig config, List<GzBeanDayPassPrice> rows, int weekday) {
+        if (rows != null) {
+            for (GzBeanDayPassPrice p : rows) {
+                if (p.getWeekday() != null && p.getWeekday() == weekday && p.getPriceCent() != null) {
+                    return p.getPriceCent();
+                }
+            }
+        }
+        return config.getDayPassPriceCent() == null ? 0L : config.getDayPassPriceCent();
     }
 
     /**

@@ -2,9 +2,11 @@ package org.dromara.gz.bean.service;
 
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
+import org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypePriceBo;
+import org.dromara.gz.bean.domain.vo.GzBeanDayPassPriceVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypeConfigVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypePriceVO;
 
@@ -61,4 +63,16 @@ public interface IGzBeanSeatTypeConfigService {
      * 未传删除其覆盖回退默认 / 基础价，ADR-0015 §3.1）。
      */
     boolean saveWeekdayPrices(Long configId, GzBeanSeatTypePriceBo bo);
+
+    /**
+     * 读某类型的「包天按星期价」覆盖（GZ-BEAN-053）。
+     * 行 {@code {weekday, priceCent}}；未覆盖的星期不在列表（下单回退 config.day_pass_price_cent 基础包天价）。
+     */
+    List<GzBeanDayPassPriceVO> selectDayPassPrices(Long configId);
+
+    /**
+     * 覆盖式批量存某类型的「包天按星期价」（传入即 upsert by weekday，
+     * 未传删除其覆盖回退基础包天价，GZ-BEAN-053）。
+     */
+    boolean saveDayPassPrices(Long configId, GzBeanDayPassPriceBo bo);
 }

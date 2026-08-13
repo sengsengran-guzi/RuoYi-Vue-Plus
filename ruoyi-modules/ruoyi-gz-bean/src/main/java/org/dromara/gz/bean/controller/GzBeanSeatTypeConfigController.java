@@ -14,9 +14,11 @@ import org.dromara.common.log.enums.BusinessType;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.web.core.BaseController;
+import org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypePriceBo;
+import org.dromara.gz.bean.domain.vo.GzBeanDayPassPriceVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypeConfigVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypePriceVO;
 import org.dromara.gz.bean.service.IGzBeanSeatTypeConfigService;
@@ -140,5 +142,28 @@ public class GzBeanSeatTypeConfigController extends BaseController {
     public R<Void> saveWeekdayPrices(@NotNull @PathVariable Long id,
                                      @Validated @RequestBody GzBeanSeatTypePriceBo bo) {
         return toAjax(seatTypeConfigService.saveWeekdayPrices(id, bo) ? 1 : 0);
+    }
+
+    /**
+     * 读某类型的「包天按星期价」覆盖（GZ-BEAN-053）。
+     * 每行 {@code {weekday, priceCent}}；未覆盖的星期不在列表（下单回退 config.day_pass_price_cent 基础包天价）。
+     */
+    @SaCheckPermission("gz:bean:seatTypeConfig:list")
+    @GetMapping("/{id}/day-pass-prices")
+    public R<List<GzBeanDayPassPriceVO>> dayPassPrices(@NotNull @PathVariable Long id) {
+        return R.ok(seatTypeConfigService.selectDayPassPrices(id));
+    }
+
+    /**
+     * 覆盖式批量存某类型的「包天按星期价」（属编辑权限，GZ-BEAN-053）。
+     * payload {@code items: [{weekday, priceCent}, ...]}；未传的星期删除其覆盖回退基础包天价。
+     * 空 items = 清空全部覆盖（全回退基础包天价）。
+     */
+    @SaCheckPermission("gz:bean:seatTypeConfig:edit")
+    @Log(title = "拼豆座位类型包天按星期价", businessType = BusinessType.UPDATE)
+    @PutMapping("/{id}/day-pass-prices")
+    public R<Void> saveDayPassPrices(@NotNull @PathVariable Long id,
+                                     @Validated @RequestBody GzBeanDayPassPriceBo bo) {
+        return toAjax(seatTypeConfigService.saveDayPassPrices(id, bo) ? 1 : 0);
     }
 }

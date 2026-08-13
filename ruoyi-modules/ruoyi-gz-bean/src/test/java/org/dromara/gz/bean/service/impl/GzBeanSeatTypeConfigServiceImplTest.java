@@ -44,12 +44,14 @@ class GzBeanSeatTypeConfigServiceImplTest {
     private GzBeanSeatTypeConfigMapper baseMapper;
     @Mock
     private GzBeanSeatTypePriceMapper seatTypePriceMapper;
+    @Mock
+    private org.dromara.gz.bean.mapper.GzBeanDayPassPriceMapper dayPassPriceMapper;
 
     private GzBeanSeatTypeConfigServiceImpl service;
 
     @BeforeEach
     void setUp() {
-        service = new GzBeanSeatTypeConfigServiceImpl(baseMapper, seatTypePriceMapper);
+        service = new GzBeanSeatTypeConfigServiceImpl(baseMapper, seatTypePriceMapper, dayPassPriceMapper);
     }
 
     private GzBeanSeatTypeConfigBo validBo() {
@@ -332,6 +334,83 @@ class GzBeanSeatTypeConfigServiceImplTest {
         assertTrue(service.saveWeekdayPrices(10L, bo));
         verify(seatTypePriceMapper).physicalDeleteByConfig(10L);
         verify(seatTypePriceMapper, never()).insert(any(GzBeanSeatTypePrice.class));
+    }
+
+    // ------------------------------ 包天按星期价（GZ-BEAN-053） ------------------------------
+
+    @Test
+    @DisplayName("selectDayPassPrices 回填 priceYuan + 按星期升序")
+    void selectDayPassPrices_fillsAndSorts() {
+        when(dayPassPriceMapper.selectByConfig(10L)).thenReturn(List.of(
+            org.dromara.gz.bean.domain.entity.GzBeanDayPassPrice.builder().weekday(6).priceCent(12000L).build(),
+            org.dromara.gz.bean.domain.entity.GzBeanDayPassPrice.builder().weekday(1).priceCent(8000L).build()));
+
+        List<org.dromara.gz.bean.domain.vo.GzBeanDayPassPriceVO> vos = service.selectDayPassPrices(10L);
+        assertEquals(2, vos.size());
+        assertEquals(1, vos.get(0).getWeekday(), "按星期升序");
+        assertEquals(6, vos.get(1).getWeekday());
+        assertEquals(0, new BigDecimal("120.00").compareTo(vos.get(1).getPriceYuan()));
+    }
+
+    @Test
+    @DisplayName("saveDayPassPrices 覆盖式：先物理清后插，未传的星期被删（回退基础包天价）")
+    void saveDayPassPrices_overwrite() {
+        when(baseMapper.selectById(10L)).thenReturn(
+            GzBeanSeatTypeConfig.builder().id(10L).storeId(1L).build());
+        org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo bo = new org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo();
+        org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo.Item sat = new org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo.Item();
+        sat.setWeekday(6);
+        sat.setPriceCent(12000L);
+        org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo.Item sun = new org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo.Item();
+        sun.setWeekday(7);
+        sun.setPriceCent(12000L);
+        bo.setItems(List.of(sat, sun));
+
+        assertTrue(service.saveDayPassPrices(10L, bo));
+        verify(dayPassPriceMapper).physicalDeleteByConfig(10L);
+        ArgumentCaptor<org.dromara.gz.bean.domain.entity.GzBeanDayPassPrice> cap =
+            ArgumentCaptor.forClass(org.dromara.gz.bean.domain.entity.GzBeanDayPassPrice.class);
+        verify(dayPassPriceMapper, times(2)).insert(cap.capture());
+        cap.getAllValues().forEach(p -> {
+            assertEquals(10L, p.getSeatTypeConfigId());
+            assertEquals(12000L, p.getPriceCent());
+        });
+    }
+
+    @Test
+    @DisplayName("saveDayPassPrices 同星期重复配价 → ServiceException（防 UNIQUE 冲突）")
+    void saveDayPassPrices_dupWeekday_throws() {
+        when(baseMapper.selectById(10L)).thenReturn(
+            GzBeanSeatTypeConfig.builder().id(10L).storeId(1L).build());
+        org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo bo = new org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo();
+        org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo.Item a = new org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo.Item();
+        a.setWeekday(6);
+        a.setPriceCent(12000L);
+        org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo.Item b = new org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo.Item();
+        b.setWeekday(6);
+        b.setPriceCent(13000L);
+        bo.setItems(List.of(a, b));
+
+        assertThrows(ServiceException.class, () -> service.saveDayPassPrices(10L, bo));
+    }
+
+    @Test
+    @DisplayName("saveDayPassPrices 空 items → 仅清空（全回退基础包天价），不 insert")
+    void saveDayPassPrices_emptyClearsAll() {
+        when(baseMapper.selectById(10L)).thenReturn(
+            GzBeanSeatTypeConfig.builder().id(10L).storeId(1L).build());
+        assertTrue(service.saveDayPassPrices(10L, new org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo()));
+        verify(dayPassPriceMapper).physicalDeleteByConfig(10L);
+        verify(dayPassPriceMapper, never()).insert(any(org.dromara.gz.bean.domain.entity.GzBeanDayPassPrice.class));
+    }
+
+    @Test
+    @DisplayName("saveDayPassPrices 配置不存在 → ServiceException（不清不插）")
+    void saveDayPassPrices_configMissing_throws() {
+        when(baseMapper.selectById(10L)).thenReturn(null);
+        assertThrows(ServiceException.class,
+            () -> service.saveDayPassPrices(10L, new org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo()));
+        verify(dayPassPriceMapper, never()).physicalDeleteByConfig(anyLong());
     }
 
     // ------------------------------ selectVoById / selectList 派生字段 ------------------------------

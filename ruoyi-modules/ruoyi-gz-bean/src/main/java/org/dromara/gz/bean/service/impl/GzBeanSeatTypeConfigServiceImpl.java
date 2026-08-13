@@ -11,13 +11,17 @@ import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.exception.ServiceException;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
+import org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypePriceBo;
+import org.dromara.gz.bean.domain.entity.GzBeanDayPassPrice;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypePrice;
+import org.dromara.gz.bean.domain.vo.GzBeanDayPassPriceVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypeConfigVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypePriceVO;
+import org.dromara.gz.bean.mapper.GzBeanDayPassPriceMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypePriceMapper;
 import org.dromara.gz.bean.service.IGzBeanSeatTypeConfigService;
@@ -62,6 +66,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
 
     private final GzBeanSeatTypeConfigMapper baseMapper;
     private final GzBeanSeatTypePriceMapper seatTypePriceMapper;
+    private final GzBeanDayPassPriceMapper dayPassPriceMapper;
 
     @Override
     public TableDataInfo<GzBeanSeatTypeConfigVO> selectPageList(GzBeanSeatTypeConfigQueryBo query, PageQuery pageQuery) {
@@ -240,6 +245,62 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
             }
         }
         log.info("[gz-bean-seat-type-config] SAVE weekday-prices configId={} inserted={}", configId, inserted);
+        return true;
+    }
+
+    @Override
+    public List<GzBeanDayPassPriceVO> selectDayPassPrices(Long configId) {
+        if (configId == null) {
+            return List.of();
+        }
+        List<GzBeanDayPassPrice> rows = dayPassPriceMapper.selectByConfig(configId);
+        List<GzBeanDayPassPriceVO> vos = new ArrayList<>(rows.size());
+        for (GzBeanDayPassPrice p : rows) {
+            vos.add(GzBeanDayPassPriceVO.builder()
+                .weekday(p.getWeekday())
+                .priceCent(p.getPriceCent())
+                .priceYuan(p.getPriceCent() == null ? null
+                    : new BigDecimal(p.getPriceCent()).divide(CENT_PER_YUAN, 2, RoundingMode.HALF_UP))
+                .build());
+        }
+        vos.sort(Comparator.comparing(GzBeanDayPassPriceVO::getWeekday));
+        return vos;
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public boolean saveDayPassPrices(Long configId, GzBeanDayPassPriceBo bo) {
+        if (configId == null) {
+            throw new ServiceException("配置 ID 不能为空");
+        }
+        GzBeanSeatTypeConfig config = baseMapper.selectById(configId);
+        if (config == null) {
+            throw new ServiceException("座位类型配置不存在：" + configId);
+        }
+        // 覆盖式：先清掉该 config 全部星期包天覆盖，再插入传入项
+        //   （未传的星期 = 删除其覆盖 → 下单回退 config.day_pass_price_cent 基础包天价）
+        //   ⚠️ 必须物理删（非软删）：uk_gz_bean_dpp 不含 del_flag，软删残留行会与 re-insert 同键撞 DuplicateKey
+        dayPassPriceMapper.physicalDeleteByConfig(configId);
+        int inserted = 0;
+        Set<Integer> seen = new java.util.HashSet<>();
+        if (bo != null && bo.getItems() != null) {
+            for (GzBeanDayPassPriceBo.Item item : bo.getItems()) {
+                if (item.getWeekday() == null || item.getPriceCent() == null) {
+                    continue;
+                }
+                if (!seen.add(item.getWeekday())) {
+                    throw new ServiceException("同一星期重复配包天价：weekday=" + item.getWeekday());
+                }
+                dayPassPriceMapper.insert(GzBeanDayPassPrice.builder()
+                    .seatTypeConfigId(configId)
+                    .weekday(item.getWeekday())
+                    .priceCent(item.getPriceCent())
+                    .delFlag("0")
+                    .build());
+                inserted++;
+            }
+        }
+        log.info("[gz-bean-seat-type-config] SAVE day-pass-prices configId={} inserted={}", configId, inserted);
         return true;
     }
 

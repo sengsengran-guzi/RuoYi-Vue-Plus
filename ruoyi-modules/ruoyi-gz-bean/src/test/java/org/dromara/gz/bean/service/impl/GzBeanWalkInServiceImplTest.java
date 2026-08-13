@@ -71,6 +71,7 @@ class GzBeanWalkInServiceImplTest {
     @Mock private org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper seatTypeConfigMapper;
     @Mock private org.dromara.gz.bean.mapper.GzBeanSeatMapper seatMapper;
     @Mock private org.dromara.gz.bean.mapper.GzBeanSeatTypePriceMapper seatTypePriceMapper;
+    @Mock private org.dromara.gz.bean.mapper.GzBeanDayPassPriceMapper dayPassPriceMapper;
     @Mock private org.dromara.gz.bean.mapper.GzBeanTimeSlotTemplateMapper timeSlotTemplateMapper;
     @Mock private org.dromara.gz.bean.service.IGzBeanFreePromoService freePromoService;
     @Mock private org.dromara.gz.bean.service.IGzBeanSeatClosureService seatClosureService;
@@ -109,7 +110,7 @@ class GzBeanWalkInServiceImplTest {
         qrCodeSigner = new QrCodeSigner(props);
         GzBeanBookingServiceImpl real = new GzBeanBookingServiceImpl(
             bookingMapper, bookingGroupMapper, bookingLogMapper, storeMapper, gzUserMapper, qrCodeSigner,
-            seatTypeConfigMapper, seatMapper, seatTypePriceMapper, timeSlotTemplateMapper, freePromoService,
+            seatTypeConfigMapper, seatMapper, seatTypePriceMapper, dayPassPriceMapper, timeSlotTemplateMapper, freePromoService,
             seatClosureService, slotQuotaCloseService, payServiceProvider, couponServiceProvider,
             payRefundServiceProvider, configService
         );
