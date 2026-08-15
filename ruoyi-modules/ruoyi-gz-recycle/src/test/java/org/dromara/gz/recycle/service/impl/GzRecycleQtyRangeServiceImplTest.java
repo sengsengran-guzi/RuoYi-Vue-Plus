@@ -119,4 +119,24 @@ class GzRecycleQtyRangeServiceImplTest {
         assertEquals(30, list.get(0).getDurationMinutes());
         assertEquals(60, list.get(1).getDurationMinutes());
     }
+
+    @Test
+    @DisplayName("D21 F1：getByCodeIgnoringEnabled 对已禁用档仍返回（改期重算占格面靠它，getEnabledByCode 会返 null）")
+    void getByCodeIgnoringEnabled_returnsDisabledBucket() {
+        GzRecycleQtyRange disabled = range(8L, "pts-200-plus", "200 点以上", 300, 0, 5);
+        disabled.setOccupyNextSlot(1);
+        when(baseMapper.selectOne(any())).thenReturn(disabled);
+
+        GzRecycleQtyRangeVO vo = service.getByCodeIgnoringEnabled("pts-200-plus");
+
+        assertEquals("pts-200-plus", vo.getCode());
+        assertEquals(0, vo.getEnabled(), "档已禁用");
+        assertEquals(1, vo.getOccupyNextSlot(), "占格面口径仍可取回");
+    }
+
+    @Test
+    @DisplayName("D21 F1：getByCodeIgnoringEnabled 空 code → 直接 null，不查库")
+    void getByCodeIgnoringEnabled_blankCode_returnsNull() {
+        assertEquals(null, service.getByCodeIgnoringEnabled("  "));
+    }
 }

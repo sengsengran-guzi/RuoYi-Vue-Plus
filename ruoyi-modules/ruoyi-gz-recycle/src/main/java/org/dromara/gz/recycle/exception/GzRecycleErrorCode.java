@@ -93,6 +93,23 @@ public final class GzRecycleErrorCode {
     public static final int ONE_ACTIVE_APPOINTMENT = 4127;
     public static final String ONE_ACTIVE_APPOINTMENT_MSG = "您已有进行中的回收预约，完成或取消后再约";
 
+    /* ===================== 手动占用时段 + 预约改期（412x，ADR-0021） ===================== */
+
+    /** 改期目标单当前状态不可改期（非 submitted/manual_hold，或并发被推进） */
+    public static final int RESCHEDULE_NOT_ALLOWED = 4128;
+    public static final String RESCHEDULE_NOT_ALLOWED_MSG = "该预约当前状态不可改期";
+
+    /** 仅手动占用记录（source=manual AND status=manual_hold）可在看板释放 */
+    public static final int HOLD_RELEASE_NOT_ALLOWED = 4129;
+    public static final String HOLD_RELEASE_NOT_ALLOWED_MSG = "仅手动占用记录可在看板释放";
+
+    /**
+     * 顾客单改期目标日期早于今天（D21 对抗性测试 F3）：会立刻被 no_show 扫描判过期，顾客的有效预约静默作废。
+     * 手动占用（店员台账）不受本限制 —— 落在过去无副作用（cron 不扫 manual_hold、不影响任何未来格）。
+     */
+    public static final int RESCHEDULE_DATE_PAST = 4130;
+    public static final String RESCHEDULE_DATE_PAST_MSG = "顾客预约不能改到已过去的日期，请选择今天或之后的日期";
+
     private GzRecycleErrorCode() {
     }
 }

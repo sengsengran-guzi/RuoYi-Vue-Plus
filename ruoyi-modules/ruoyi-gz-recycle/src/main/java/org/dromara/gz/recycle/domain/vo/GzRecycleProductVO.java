@@ -43,4 +43,16 @@ public class GzRecycleProductVO implements Serializable {
 
     /** 数量桶展示文案快照（如 25-50 件；旧数据为 null） */
     private String qtyBucketLabel;
+
+    /**
+     * 提交时冻结的「是否额外占用下一档」快照（{@code gz_recycle_qty_range.occupy_next_slot}，1=是 / 0=否）。
+     *
+     * <p>本单的<b>占格数（1 格 or 2 格）在提交那一刻就已确定</b>，此后点数档被禁用 / 被编辑都不得改变既有单的
+     * 占用面 —— 改期重算 spill 时以本快照为准，而<b>不是</b>去活查点数档表（活查会让「禁用某档」这类正常运营
+     * 动作把已有大单的溢出格静默放开 → 物理双占 / 超卖）。</p>
+     *
+     * <p>旧单（本字段落地前提交）为 {@code null}，改期时退回「按 code 忽略 enabled 查点数档 + 本单当前 spill
+     * 非空」的兜底推断，见 {@code GzRecycleAppointmentServiceImpl#resolveOccupyNextForReschedule}。</p>
+     */
+    private Integer occupyNextSlot;
 }

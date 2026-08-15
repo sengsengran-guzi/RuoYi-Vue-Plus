@@ -57,7 +57,10 @@ public class GzRecycleAppointment extends TenantEntity {
     /** 业务码 RCY-yyyyMMdd-6位序号 — UNIQUE(tenant_id, appointment_no) */
     private String appointmentNo;
 
-    /** FK → gz_user.id（提交用户） */
+    /** 记录来源 mp（顾客自助提交）/ manual（店员手动占用 = 代客预约 / 临时关闭，ADR-0021 §1） */
+    private String source;
+
+    /** FK → gz_user.id（提交用户）。{@code source=manual} 时 NULL（手动占用不关联任何 C 端账号） */
     private Long userId;
 
     /** FK → gz_bean_store.id（到店核对门店；V1.2 沿用拼豆口径仅成都一店） */
@@ -128,6 +131,15 @@ public class GzRecycleAppointment extends TenantEntity {
 
     /** 取消时间（cancelled 时写）；本卡 NULL */
     private LocalDateTime cancelledTime;
+
+    /** 改期次数（ADR-0021 §2，改期 +1；不建改期历史子表，追溯靠此列 + ruoyi 操作日志） */
+    private Integer rescheduleCount;
+
+    /** 最后一次改期操作人（admin 用户名，ADR-0021 §2） */
+    private String lastRescheduleBy;
+
+    /** 最后一次改期时间（ADR-0021 §2） */
+    private LocalDateTime lastRescheduleTime;
 
     /** 乐观锁版本（状态推进 + 防重复触发打款） */
     @Version

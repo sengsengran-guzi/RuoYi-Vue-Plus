@@ -39,6 +39,9 @@ public class GzRecycleAppointmentAdminVO implements Serializable {
     /** 业务码 RCY-yyyyMMdd-6位序号 */
     private String appointmentNo;
 
+    /** 记录来源 mp（顾客自助）/ manual（店员手动占用，ADR-0021） */
+    private String source;
+
     @JsonSerialize(using = ToStringSerializer.class)
     private Long userId;
 
@@ -71,6 +74,17 @@ public class GzRecycleAppointmentAdminVO implements Serializable {
 
     /** 到店时段结束 */
     private LocalTime slotEnd;
+
+    /** 本单占用的到店时段 id（FK gz_recycle_time_slot.id；看板定位格 / 改期弹窗回显） */
+    @JsonSerialize(using = ToStringSerializer.class)
+    private Long timeSlotId;
+
+    /** 大单额外占用的下一个时段 id（普通单 / 手动占用恒 null） */
+    @JsonSerialize(using = ToStringSerializer.class)
+    private Long spillTimeSlotId;
+
+    /** 改期次数（ADR-0021 §2，admin 详情「已改期 N 次」） */
+    private Integer rescheduleCount;
 
     /** 用户提交实物照 file id 列表 */
     @JsonSerialize(contentUsing = ToStringSerializer.class)

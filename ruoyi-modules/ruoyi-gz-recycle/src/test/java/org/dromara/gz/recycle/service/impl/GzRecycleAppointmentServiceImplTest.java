@@ -196,6 +196,7 @@ class GzRecycleAppointmentServiceImplTest {
         assertTrue(json.startsWith("{"), "snapshot 是对象根");
         assertTrue(json.contains("\"categories\""));
         assertTrue(json.contains("1-50 点"), "qtyBucketLabel 快照");
+        assertTrue(json.contains("\"occupyNextSlot\":0"), "占格面冻结进快照（普通档=0，D21 F1）");
     }
 
     /* ---------------- 大单占下一档 ---------------- */
@@ -218,6 +219,8 @@ class GzRecycleAppointmentServiceImplTest {
         GzRecycleAppointment saved = captureInsert().getValue();
         assertEquals(10L, saved.getTimeSlotId());
         assertEquals(15L, saved.getSpillTimeSlotId(), "大单额外占下一 enabled 档（15:00）");
+        assertTrue(saved.getProductSnapshotJson().contains("\"occupyNextSlot\":1"),
+            "大单占格面冻结进快照 —— 此后点数档被禁用/改配置都不得让改期把 spill 放开（D21 F1）");
     }
 
     @Test

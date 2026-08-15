@@ -4,10 +4,13 @@ import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleAppointmentQueryBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleAppointmentSubmitBo;
+import org.dromara.gz.recycle.domain.bo.GzRecycleManualHoldBo;
+import org.dromara.gz.recycle.domain.bo.GzRecycleRescheduleBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyScanBo;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentAdminVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentVO;
+import org.dromara.gz.recycle.domain.vo.GzRecycleWeekBoardVO;
 import org.dromara.gz.recycle.domain.vo.RecycleSlotAvailabilityVO;
 import org.dromara.gz.recycle.domain.vo.RecycleVerifyCodeVO;
 
@@ -188,4 +191,60 @@ public interface IGzRecycleAppointmentService {
      * @return 定位到的全量 AdminVO
      */
     GzRecycleAppointmentAdminVO verifyScan(GzRecycleVerifyScanBo bo);
+
+    /* ===================== GZ-RECYCLE-010 手动占用时段 + 预约改期 + 周看板（ADR-0021） ===================== */
+
+    /**
+     * 手动占用时段（ADR-0021 §1，代客预约 + 临时关闭合一）。
+     *
+     * <p>独立写入路径，<b>不走 {@link #submit}</b>（一人一单 4127 / openid 4103 / 手机号 4125 / 点数档 4107
+     * 校验对手动占用全不适用，坑位 1）。只做「时段合法性 + 容量校验 + INSERT」三步，多格选择 = 多行
+     * 同事务 all-or-nothing（任一格 4122/4123/4124 → 整批回滚，不留残行）。{@code user_id} /
+     * {@code receiver_openid} / {@code product_snapshot_json} 恒 NULL，{@code create_by} 由 admin
+     * 会话自动填。</p>
+     *
+     * @param bo       手动占用参数（storeId / apptDate / timeSlotIds / remark）
+     * @param operator 操作人（admin 用户名，日志用；create_by 由公共字段处理器自动填）
+     * @return 新建的手动占用记录（admin VO 列表，每格一条）
+     */
+    List<GzRecycleAppointmentAdminVO> manualHold(GzRecycleManualHoldBo bo, String operator);
+
+    /**
+     * 释放手动占用（ADR-0021 §1 H4）。
+     *
+     * <p>守卫 {@code source='manual' AND status='manual_hold'}（否则 4129 HOLD_RELEASE_NOT_ALLOWED，
+     * 顾客单要走取消流程，不经本方法）→ {@code status='cancelled'} + {@code cancelled_time}，格立即可约。</p>
+     *
+     * @param id 预约单主键（须为手动占用记录）
+     * @return 释放后的记录 VO
+     */
+    GzRecycleAppointmentAdminVO releaseHold(Long id);
+
+    /**
+     * 预约改期——同一行原地 UPDATE（ADR-0021 §2，不取消重建）。
+     *
+     * <p>适用 {@code submitted}（顾客单）/ {@code manual_hold}（手动占用）；其余状态 4128
+     * RESCHEDULE_NOT_ALLOWED。不允许跨门店（{@code store_id} 取原单不变）。容量校验用
+     * {@code countActiveHoldingSlotExcludingForUpdate}（排除自身，坑位 4）；spill 按新档位置重算，
+     * 改到末档显式置 NULL（坑位 5）。核销码 payload 不含日期/时段，改期后旧码仍有效。</p>
+     *
+     * @param id       预约单主键
+     * @param bo       改期参数（apptDate / timeSlotId，不含 storeId）
+     * @param operator 改期操作人（admin 用户名，写 last_reschedule_by）
+     * @return 改期后的记录 VO
+     */
+    GzRecycleAppointmentAdminVO reschedule(Long id, GzRecycleRescheduleBo bo, String operator);
+
+    /**
+     * 回收看板周视图（ADR-0021 §3）。
+     *
+     * <p>{@code weekStart} 后端归一到所在周的周一（传周三也返回周一起 7 天）。一条
+     * {@code appt_date BETWEEN weekStart AND weekEnd} 的批量查询后在内存分格（不按 7×N 档循环单查，AC26）。
+     * {@code cells} 只返被占格（活跃占用集 = {@code ACTIVE_HOLD_STATUSES}，与防超卖同源）。</p>
+     *
+     * @param storeId   门店 id
+     * @param weekStart 周内任意一天（后端归一到周一）
+     * @return 周视图 VO（slots 列头 + cells 被占格）
+     */
+    GzRecycleWeekBoardVO selectWeekBoard(Long storeId, LocalDate weekStart);
 }

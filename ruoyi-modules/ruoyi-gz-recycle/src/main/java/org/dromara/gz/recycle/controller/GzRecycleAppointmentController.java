@@ -12,16 +12,24 @@ import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.satoken.utils.LoginHelper;
 import org.dromara.common.web.core.BaseController;
 import org.dromara.gz.recycle.domain.bo.GzRecycleAppointmentQueryBo;
+import org.dromara.gz.recycle.domain.bo.GzRecycleManualHoldBo;
+import org.dromara.gz.recycle.domain.bo.GzRecycleRescheduleBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyBo;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentAdminVO;
+import org.dromara.gz.recycle.domain.vo.GzRecycleWeekBoardVO;
 import org.dromara.gz.recycle.service.IGzRecycleAppointmentService;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.time.LocalDate;
+import java.util.List;
 
 /**
  * GZ-RECYCLE-003 admin 回收预约单管理（plus-ui owner 兜底，AI 终态，走 ruoyi/Element Plus 默认）。
@@ -92,5 +100,70 @@ public class GzRecycleAppointmentController extends BaseController {
         bo.setAppointmentId(id);
         String verifiedBy = LoginHelper.getUsername();
         return R.ok(appointmentService.verifyAndPayout(bo, verifiedBy));
+    }
+
+    /**
+     * 手动占用时段（ADR-0021 §1，代客预约 + 临时关闭时段合一）。
+     *
+     * <pre>
+     * POST /system/gz/recycle/appointment/manual-hold
+     * Body: { storeId, apptDate, timeSlotIds:[..], remark }
+     * </pre>
+     *
+     * <p>多格 = 多行，同一事务 all-or-nothing（任一格已被占 → 整批回滚）。</p>
+     */
+    @SaCheckPermission("gz:recycle:appointment:hold")
+    @Log(title = "回收手动占用时段", businessType = BusinessType.INSERT)
+    @PostMapping("/manual-hold")
+    public R<List<GzRecycleAppointmentAdminVO>> manualHold(@Valid @RequestBody GzRecycleManualHoldBo bo) {
+        String operator = LoginHelper.getUsername();
+        return R.ok(appointmentService.manualHold(bo, operator));
+    }
+
+    /**
+     * 释放手动占用（ADR-0021 §1 H4）。
+     *
+     * <pre>POST /system/gz/recycle/appointment/{id}/release-hold</pre>
+     *
+     * <p>守卫 {@code source='manual' AND status='manual_hold'}，否则 4129 HOLD_RELEASE_NOT_ALLOWED
+     * （顾客单要走取消流程，不经本端点）。</p>
+     */
+    @SaCheckPermission("gz:recycle:appointment:hold")
+    @Log(title = "回收释放手动占用", businessType = BusinessType.UPDATE)
+    @PostMapping("/{id}/release-hold")
+    public R<GzRecycleAppointmentAdminVO> releaseHold(@PathVariable Long id) {
+        return R.ok(appointmentService.releaseHold(id));
+    }
+
+    /**
+     * 预约改期——同一行原地 UPDATE（ADR-0021 §2）。
+     *
+     * <pre>
+     * POST /system/gz/recycle/appointment/{id}/reschedule
+     * Body: { apptDate, timeSlotId }   // 不含 storeId，不允许跨门店改期
+     * </pre>
+     *
+     * <p>适用 {@code submitted} 顾客单 / {@code manual_hold} 手动占用；其余状态 4128 RESCHEDULE_NOT_ALLOWED。</p>
+     */
+    @SaCheckPermission("gz:recycle:appointment:reschedule")
+    @Log(title = "回收预约改期", businessType = BusinessType.UPDATE)
+    @PostMapping("/{id}/reschedule")
+    public R<GzRecycleAppointmentAdminVO> reschedule(@PathVariable Long id, @Valid @RequestBody GzRecycleRescheduleBo bo) {
+        String operator = LoginHelper.getUsername();
+        return R.ok(appointmentService.reschedule(id, bo, operator));
+    }
+
+    /**
+     * 回收看板周视图（ADR-0021 §3）。
+     *
+     * <pre>GET /system/gz/recycle/appointment/week-board?storeId=&weekStart=YYYY-MM-DD</pre>
+     *
+     * <p>{@code weekStart} 后端归一到所在周的周一（传周三也返回周一起 7 天）。</p>
+     */
+    @SaCheckPermission("gz:recycle:appointment:list")
+    @GetMapping("/week-board")
+    public R<GzRecycleWeekBoardVO> weekBoard(@RequestParam Long storeId,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate weekStart) {
+        return R.ok(appointmentService.selectWeekBoard(storeId, weekStart));
     }
 }

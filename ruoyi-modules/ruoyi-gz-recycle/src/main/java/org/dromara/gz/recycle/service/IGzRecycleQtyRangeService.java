@@ -57,4 +57,18 @@ public interface IGzRecycleQtyRangeService {
      * @return 命中启用桶 VO；无则 null
      */
     GzRecycleQtyRangeVO getEnabledByCode(String code);
+
+    /**
+     * 按 code 查点数档 —— <b>忽略 {@code enabled}</b>（改期重算占格面专用，D21 对抗性测试 F1）。
+     *
+     * <p>点数档被禁用是正常运营动作（下线旧档 / 调时长映射），但<b>不等于既有大单可以缩水成 1 格</b>：
+     * {@link #getEnabledByCode} 在档被禁用后返 null，改期路径若用它算 {@code occupy_next_slot} 会把大单的
+     * 溢出格静默放开 → 与他单物理双占。故改期兜底推断走本方法（只看 code，不看启停）。</p>
+     *
+     * <p><b>不要用于提交链路</b> —— 提交必须拒绝已禁用档（4107），那是 {@link #getEnabledByCode} 的职责。</p>
+     *
+     * @param code 桶机读码（gz_recycle_qty_range.code）
+     * @return 命中的档 VO（含已禁用档）；无则 null
+     */
+    GzRecycleQtyRangeVO getByCodeIgnoringEnabled(String code);
 }

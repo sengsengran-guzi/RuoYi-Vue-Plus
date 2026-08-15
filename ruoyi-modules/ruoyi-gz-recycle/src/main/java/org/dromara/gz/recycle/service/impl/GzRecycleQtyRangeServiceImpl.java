@@ -160,6 +160,20 @@ public class GzRecycleQtyRangeServiceImpl implements IGzRecycleQtyRangeService {
         return e == null ? null : toVO(e);
     }
 
+    @Override
+    public GzRecycleQtyRangeVO getByCodeIgnoringEnabled(String code) {
+        if (StrUtil.isBlank(code)) {
+            return null;
+        }
+        // 忽略 enabled：改期重算占格面时，档被禁用不得让既有大单缩水（D21 对抗性测试 F1）；
+        // 提交链路仍走 getEnabledByCode（禁用档必须 4107）。
+        GzRecycleQtyRange e = baseMapper.selectOne(Wrappers.<GzRecycleQtyRange>lambdaQuery()
+            .eq(GzRecycleQtyRange::getCode, StrUtil.trim(code))
+            .orderByDesc(GzRecycleQtyRange::getEnabled)
+            .last("LIMIT 1"));
+        return e == null ? null : toVO(e);
+    }
+
     /* ---------------- 内部辅助 ---------------- */
 
     private void copyEditableFields(GzRecycleQtyRangeBo bo, GzRecycleQtyRange e) {

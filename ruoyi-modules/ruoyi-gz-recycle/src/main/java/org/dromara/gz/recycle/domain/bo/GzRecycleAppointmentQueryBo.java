@@ -21,7 +21,16 @@ public class GzRecycleAppointmentQueryBo implements Serializable {
     /** 门店 id（按门店筛） */
     private Long storeId;
 
-    /** 状态（submitted / confirmed_onsite / paying / paid / cancelled / no_show / payout_failed） */
+    /**
+     * 记录来源（{@code mp} / {@code manual}，ADR-0021 §12.7）。显式传时精确按来源筛（admin 主动查手动占用）。
+     *
+     * <p><b>不是「显示手动记录」的默认入口</b>——AC22 口径：默认列表不含 {@code source='manual'} 行，
+     * 状态筛选（{@code status=manual_hold}）才是显示手动记录的唯一默认入口；本字段仅为显式精确过滤，
+     * 不影响该默认收敛逻辑（service 侧未显式传 source 时才走 status 驱动的默认排除）。</p>
+     */
+    private String source;
+
+    /** 状态（submitted / confirmed_onsite / paying / paid / cancelled / no_show / payout_failed / manual_hold） */
     private String status;
 
     /** 预约号（精确） */
