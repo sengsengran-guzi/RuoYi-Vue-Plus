@@ -81,6 +81,26 @@ public class GzBeanSeatTypeConfig extends TenantEntity {
     /** 0=停用 / 1=启用 */
     private Integer enabled;
 
+    /**
+     * 是否对小程序开放：1=开放可订（正常桌型）/ 0=仅后台看板可见的**临时桌**（GZ-BEAN-054 / ADR-0023）。
+     *
+     * <p><b>与 {@code enabled} 正交，不要合并</b>：</p>
+     * <ul>
+     *   <li>{@code enabled=1, mpVisible=1} — 正常桌型（存量全部，DB DEFAULT 1）</li>
+     *   <li>{@code enabled=1, mpVisible=0} — 临时桌：看板有格 + 可 walk-in 计时 + 可承接线上单现场分座；
+     *       小程序不展示不可订</li>
+     *   <li>{@code enabled=0} — 退役：看板 / 座位批量生成 / walk-in 全部消失（语义不变）</li>
+     * </ul>
+     *
+     * <p><b>过滤点只在小程序可订面</b>（6 处）：{@code selectTypeSlotAvailability} /
+     * {@code selectDayPassOptions} / {@code selectSeatMap} / {@code submitPaid} /
+     * {@code submitPaidGroup} / {@code submitDayPass}，外加 admin 实时余量表
+     * {@code selectTypeSlotAvailabilityDetail}（配额关闭对临时桌无意义 —— walk-in 故意绕过配额闸）。
+     * <b>看板 / batchGenerate / walk-in / admin-create / 核销分座 / 营业额聚合一律不过滤</b>，
+     * 加了就等于这个功能白做。</p>
+     */
+    private Integer mpVisible;
+
     /** 排序值（升序） */
     private Integer sortNo;
 

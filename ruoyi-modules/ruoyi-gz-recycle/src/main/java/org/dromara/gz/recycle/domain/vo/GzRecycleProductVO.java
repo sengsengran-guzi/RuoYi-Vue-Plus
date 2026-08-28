@@ -45,14 +45,25 @@ public class GzRecycleProductVO implements Serializable {
     private String qtyBucketLabel;
 
     /**
-     * 提交时冻结的「是否额外占用下一档」快照（{@code gz_recycle_qty_range.occupy_next_slot}，1=是 / 0=否）。
+     * 【已退休 GZ-RECYCLE-012】提交时冻结的「是否额外占用下一档」快照（1=是 / 0=否）。
      *
-     * <p>本单的<b>占格数（1 格 or 2 格）在提交那一刻就已确定</b>，此后点数档被禁用 / 被编辑都不得改变既有单的
-     * 占用面 —— 改期重算 spill 时以本快照为准，而<b>不是</b>去活查点数档表（活查会让「禁用某档」这类正常运营
-     * 动作把已有大单的溢出格静默放开 → 物理双占 / 超卖）。</p>
-     *
-     * <p>旧单（本字段落地前提交）为 {@code null}，改期时退回「按 code 忽略 enabled 查点数档 + 本单当前 spill
-     * 非空」的兜底推断，见 {@code GzRecycleAppointmentServiceImpl#resolveOccupyNextForReschedule}。</p>
+     * <p>小时格模型下占格面由 {@link #spanHours} 表达，本字段仅保留用于反序列化 012 之前的老单
+     * （删掉会让老单 JSON 解析丢字段）。新单不再写入。</p>
      */
     private Integer occupyNextSlot;
+
+    /**
+     * 提交时冻结的<b>占用小时数</b>（= {@code ceil(gz_recycle_qty_range.duration_minutes / 60)}，
+     * GZ-RECYCLE-012 / ADR-0022）。
+     *
+     * <p><b>占格面在提交那一刻定死</b>：此后点数档被禁用 / 被改时长都不得改变既有单的占用面 ——
+     * 改期重算 span 时以本快照为准，而<b>绝不</b>去活查点数档表。活查是超卖入口：禁用某个点数档
+     * 是正常运营动作，一旦活查，此后任何对该档既有大单的改期都会把后续小时静默放开，
+     * 与顾客实际到店时长物理双占。</p>
+     *
+     * <p>老单（012 之前提交）为 {@code null}，改期时退回
+     * 「{@code matched_duration_minutes} → 当前区间宽度」的兜底链，见
+     * {@code GzRecycleAppointmentServiceImpl#resolveSpanHoursForExisting}。</p>
+     */
+    private Integer spanHours;
 }

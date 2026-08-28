@@ -77,6 +77,12 @@ public class GzBeanSeatVO implements Serializable {
     private String bookMode;
 
     /**
+     * 本座所属桌型是否为**临时桌**（config.mp_visible=0，GZ-BEAN-054 / ADR-0023）。
+     * Service 由 config 回填；供 admin 分座 / 改派 / 排位弹窗给临时桌选项打标并排在正常桌之后。
+     */
+    private Boolean temp;
+
+    /**
      * 排位候选专用（selectPreAssignCandidates，ADR-0018 §2 客户 7.07）：本座在目标单时段是否可排位。
      * 区间重叠口径（与后端 preAssign 防超卖一致）：该座在目标 slot 无重叠活跃单 → true。
      * 其它查询（座位列表 / 核销分座 assignable-seats）不设此字段（null）。

@@ -21,6 +21,7 @@ import java.time.LocalDate;
 import java.time.LocalTime;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -168,5 +169,22 @@ class GzBeanSlotQuotaCloseServiceImplTest {
     void getQuotaClose_nullArgsReturnsZero() {
         assertEquals(0, service.getQuotaClose(null, 1L, 10L, LocalDate.of(2099, 1, 5), LocalTime.of(14, 0)));
         verify(baseMapper, never()).selectCloseCount(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("upsert · 临时桌（mp_visible=0）→ ServiceException（GZ-BEAN-054：配额关闭扣的是 mp 可订量，对临时桌不生效）")
+    void upsert_tempSeatType_throws() {
+        GzBeanStore store = new GzBeanStore();
+        store.setId(1L);
+        store.setTenantId("1001");
+        when(storeMapper.selectById(1L)).thenReturn(store);
+        GzBeanSeatTypeConfig temp = GzBeanSeatTypeConfig.builder()
+            .id(10L).storeId(1L).enabled(1).mpVisible(0).build();
+        when(seatTypeConfigMapper.selectById(10L)).thenReturn(temp);
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.upsert(newBo()));
+        assertTrue(ex.getMessage().contains("临时桌"));
+        verify(baseMapper, never()).insert(any(GzBeanSlotQuotaClose.class));
+        verify(baseMapper, never()).updateById(any(GzBeanSlotQuotaClose.class));
     }
 }

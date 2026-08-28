@@ -29,6 +29,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -100,9 +101,13 @@ class GzBeanBookingServiceImplTest {
     static void initMpLambdaCache() {
         // 纯 Mockito 单测无 Spring/MP 启动 → LambdaUpdateWrapper.set(GzBeanSeat::...) 需要的 lambda 列缓存未装载
         //（selectBoard 每日清理 / updateBoardNote 用到）。手动初始化 GzBeanSeat 的 TableInfo（幂等、全局静态、无副作用）。
+        // GzBeanSeatTypeConfig 同理：GZ-BEAN-054 的 wrapper 断言调 getSqlSegment()，那是急切解析列名。
         com.baomidou.mybatisplus.core.metadata.TableInfoHelper.initTableInfo(
             new org.apache.ibatis.builder.MapperBuilderAssistant(new com.baomidou.mybatisplus.core.MybatisConfiguration(), ""),
             org.dromara.gz.bean.domain.entity.GzBeanSeat.class);
+        com.baomidou.mybatisplus.core.metadata.TableInfoHelper.initTableInfo(
+            new org.apache.ibatis.builder.MapperBuilderAssistant(new com.baomidou.mybatisplus.core.MybatisConfiguration(), ""),
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.class);
     }
 
     @BeforeEach
@@ -987,6 +992,142 @@ class GzBeanBookingServiceImplTest {
 
         ServiceException ex = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("single"), 1L));
         assertEquals(GzBeanErrorCode.SEAT_TYPE_DISABLED, ex.getCode());
+    }
+
+    // ------------------------------ GZ-BEAN-054 临时桌型（ADR-0023） ------------------------------
+
+    @Test
+    @DisplayName("submitPaid · 临时桌（mp_visible=0）→ SEAT_TYPE_DISABLED（GZ-BEAN-054：竞态兜底，type-slots 已滤掉）")
+    void submitPaid_tempSeatType_rejected() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
+        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
+        org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig temp = newConfig("single", 8, 1500);
+        temp.setMpVisible(0); // enabled 仍是 1 —— 这正是与 submitPaid_seatTypeDisabled 的区别
+        when(seatTypeConfigMapper.selectById(10L)).thenReturn(temp);
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("single"), 1L));
+        assertEquals(GzBeanErrorCode.SEAT_TYPE_DISABLED, ex.getCode());
+        verify(bookingMapper, never()).insert(any(GzBeanBooking.class));
+    }
+
+    @Test
+    @DisplayName("submitPaid · mp_visible=null（迁移前存量行）→ 视作开放，正常下单（GZ-BEAN-054 零行为变化）")
+    void submitPaid_nullMpVisible_treatedAsVisible() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
+        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
+        org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig legacy = newConfig("single", 8, 1500);
+        legacy.setMpVisible(null);
+        when(seatTypeConfigMapper.selectById(10L)).thenReturn(legacy);
+        when(timeSlotTemplateMapper.selectList(any()))
+            .thenReturn(java.util.List.of(newWindow(LocalTime.of(10, 0), LocalTime.of(22, 0))));
+        when(bookingMapper.countActiveCoveringSlotForUpdate(any(), any(), any(), any(), any())).thenReturn(0L);
+
+        // 只断言「通过了 mp_visible 闸」——再往下会撞到未 mock 的支付服务，那不是本测的关注点。
+        // 通过的证据 = 走到了逐格配额校验（闸在它之前）。
+        try {
+            spy.submitPaid(newPaidBo("single"), 1L);
+        } catch (RuntimeException ignored) {
+            // 下游依赖未 mock，预期
+        }
+        verify(bookingMapper, atLeastOnce())
+            .countActiveCoveringSlotForUpdate(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("verify · 跨桌型分座到临时桌（mp_visible=0）→ 放行，且 booking 桌型快照不变（GZ-BEAN-054 / ADR-0023）")
+    void verify_crossTypeOntoTempSeat_allowed() {
+        GzBeanBooking booking = new GzBeanBooking();
+        booking.setId(760L);
+        booking.setStatus("pending");
+        booking.setPayStatus("paid");
+        booking.setBookingNo("BK20260826000760");
+        booking.setSeatTypeConfigId(10L); // 客人买的是「四人桌」configId=10
+        booking.setSeatTypeSnapshot("四人桌");
+        booking.setStoreId(1L);
+        booking.setTenantId("1001");
+        booking.setSessDate(LocalDate.of(2099, 1, 1));
+        booking.setSlotStart(LocalTime.of(10, 0));
+        booking.setSlotEnd(LocalTime.of(11, 0));
+        when(bookingMapper.selectById(760L)).thenReturn(booking);
+
+        // 目标座属临时桌 configId=30（mp_visible=0）
+        org.dromara.gz.bean.domain.entity.GzBeanSeat tempSeat =
+            org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
+                .id(560L).storeId(1L).seatTypeConfigId(30L)
+                .seatNo("T1-1").tableNo("T1").enabled(1).build();
+        when(seatMapper.selectById(560L)).thenReturn(tempSeat);
+        when(seatTypeConfigMapper.selectById(30L)).thenReturn(
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+                .id(30L).storeId(1L).seatType("st30").name("临时四人桌").bookMode("seat")
+                .capacity(4).quantity(1).enabled(1).mpVisible(0).build());
+        when(seatClosureService.findClosedSeatIds(eq("1001"), eq(1L), any(), any(), any()))
+            .thenReturn(new java.util.ArrayList<>());
+        when(bookingMapper.selectSeatOccupiedNowForUpdate(eq("1001"), eq(1L), eq(560L), any(), any()))
+            .thenReturn(new java.util.ArrayList<>());
+        when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
+        GzBeanBookingVO returnVo = new GzBeanBookingVO();
+        returnVo.setId(760L);
+        when(bookingMapper.selectVoById(760L)).thenReturn(returnVo);
+
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        assertDoesNotThrow(() -> spy.verify(760L, 560L, "staff1"));
+
+        assertEquals(560L, booking.getSeatId(), "分座写入临时桌座位");
+        assertEquals("T1-1", booking.getSeatNoSnapshot());
+        assertEquals(10L, booking.getSeatTypeConfigId(),
+            "★ booking 自身桌型档必须保持不变 —— 钱仍算在客人买的四人桌上，营业额口径不受影响");
+        assertEquals("四人桌", booking.getSeatTypeSnapshot(), "★ 桌型名快照同样不变");
+    }
+
+    @Test
+    @DisplayName("selectAssignableSeats · 候选含本店临时桌且临时桌垫底 + temp 标（GZ-BEAN-054）")
+    void selectAssignableSeats_includesTempLast() {
+        GzBeanBooking booking = boardBooking(901L, null, "pending",
+            LocalDate.of(2099, 1, 1), LocalTime.of(10, 0), LocalTime.of(11, 0));
+        when(bookingMapper.selectById(901L)).thenReturn(booking);
+        // 本店临时桌 configId=30
+        when(seatTypeConfigMapper.selectList(any())).thenReturn(java.util.List.of(
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+                .id(30L).storeId(1L).enabled(1).mpVisible(0).build()));
+        // mapper 返回顺序里临时桌在中间，验证 service 会把它排到最后
+        org.dromara.gz.bean.domain.vo.GzBeanSeatVO temp = assignableSeatVo(310L, "T1-1");
+        temp.setSeatTypeConfigId(30L);
+        org.dromara.gz.bean.domain.vo.GzBeanSeatVO normal1 = assignableSeatVo(301L, "S1");
+        normal1.setSeatTypeConfigId(10L);
+        org.dromara.gz.bean.domain.vo.GzBeanSeatVO normal2 = assignableSeatVo(302L, "S2");
+        normal2.setSeatTypeConfigId(10L);
+        when(seatMapper.selectVoList(any())).thenReturn(new java.util.ArrayList<>(java.util.List.of(normal1, temp, normal2)));
+        when(bookingMapper.selectSeatOccupiedNowIds(eq("1001"), eq(1L), any(), any()))
+            .thenReturn(new java.util.ArrayList<>());
+        when(seatClosureService.findClosedSeatIds(eq("1001"), eq(1L), any(), any(), any()))
+            .thenReturn(new java.util.ArrayList<>());
+
+        var seats = service.selectAssignableSeats(901L);
+
+        assertEquals(3, seats.size());
+        assertEquals(310L, seats.get(2).getId(), "临时桌必须垫底（店员肌肉记忆先看正常桌）");
+        assertTrue(seats.get(2).getTemp(), "临时桌打 temp 标供前端标注");
+        assertFalse(seats.get(0).getTemp());
+        assertFalse(seats.get(1).getTemp());
+    }
+
+    @Test
+    @DisplayName("selectTypeSlotAvailability · wrapper 带 mp_visible=1（GZ-BEAN-054：mp 桌型目录唯一源头）")
+    void selectTypeSlotAvailability_filtersMpVisible() {
+        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
+        when(seatTypeConfigMapper.selectList(any())).thenReturn(java.util.List.of());
+
+        service.selectTypeSlotAvailability(1L, LocalDate.of(2099, 1, 1));
+
+        org.mockito.ArgumentCaptor<com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig>> cap =
+            org.mockito.ArgumentCaptor.forClass(com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper.class);
+        verify(seatTypeConfigMapper).selectList(cap.capture());
+        String sql = cap.getValue().getSqlSegment();
+        assertTrue(sql.contains("mp_visible"),
+            "mp 桌型目录必须过滤 mp_visible —— 漏了临时桌会出现在顾客下单页。实际 SQL: " + sql);
     }
 
     @Test

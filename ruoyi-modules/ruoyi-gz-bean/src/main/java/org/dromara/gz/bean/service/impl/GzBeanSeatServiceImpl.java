@@ -16,6 +16,7 @@ import org.dromara.gz.bean.domain.bo.GzBeanSeatBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatQueryBo;
 import org.dromara.gz.bean.domain.entity.GzBeanSeat;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatBatchGenerateResultVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatVO;
 import org.dromara.gz.bean.mapper.GzBeanSeatMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper;
@@ -23,6 +24,7 @@ import org.dromara.gz.bean.service.IGzBeanSeatService;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -187,17 +189,47 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
 
     @Override
     @Transactional(rollbackFor = Exception.class)
-    public int batchGenerate(GzBeanSeatBatchGenerateBo bo) {
+    public GzBeanSeatBatchGenerateResultVO batchGenerate(GzBeanSeatBatchGenerateBo bo) {
         List<GzBeanSeatTypeConfig> configs = resolveConfigs(bo);
         if (CollUtil.isEmpty(configs)) {
             throw new ServiceException("未找到可生成座位单元的启用桌型");
         }
-        int total = 0;
+        GenerateTally tally = new GenerateTally();
         for (GzBeanSeatTypeConfig config : configs) {
-            total += generateForConfig(config, bo.getPrefix());
+            generateForConfig(config, bo.getPrefix(), tally);
         }
-        log.info("[gz-bean-seat] batchGenerate done configs={} generated={}", configs.size(), total);
-        return total;
+        log.info("[gz-bean-seat] batchGenerate done configs={} created={} skipped={} conflicts={}",
+            configs.size(), tally.created, tally.skipped, tally.conflictSeatNos);
+        return GzBeanSeatBatchGenerateResultVO.builder()
+            .created(tally.created)
+            .skipped(tally.skipped)
+            .conflictSeatNos(List.copyOf(tally.conflictSeatNos))
+            .hasConflict(!tally.conflictSeatNos.isEmpty())
+            .build();
+    }
+
+    /**
+     * 批量生成计数器（GZ-BEAN-054）。跨桌型冲突编号最多收集 {@value #MAX_CONFLICT_SAMPLES} 个 ——
+     * 前端只需要几个样例来提示「换个前缀」，全量回传对 quantity 很大的误操作没有意义。
+     */
+    private static final int MAX_CONFLICT_SAMPLES = 20;
+
+    private static final class GenerateTally {
+        private int created;
+        private int skipped;
+        private final List<String> conflictSeatNos = new ArrayList<>();
+
+        private void countCreated() {
+            created++;
+        }
+
+        /** @param conflictSeatNo 跨桌型冲突的编号；同桌型幂等跳过传 null */
+        private void countSkipped(String conflictSeatNo) {
+            skipped++;
+            if (conflictSeatNo != null && conflictSeatNos.size() < MAX_CONFLICT_SAMPLES) {
+                conflictSeatNos.add(conflictSeatNo);
+            }
+        }
     }
 
     /**
@@ -220,40 +252,33 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
             .orderByAsc(GzBeanSeatTypeConfig::getSortNo));
     }
 
-    /**
-     * 为单个桌型生成座位单元（按 book_mode 派生编号 + 幂等复活/跳过）。
-     *
-     * @return 本桌型新建 + 复活的数量
-     */
-    private int generateForConfig(GzBeanSeatTypeConfig config, String prefixOverride) {
+    /** 为单个桌型生成座位单元（按 book_mode 派生编号 + 幂等复活/跳过），结果累加进 {@code tally}。 */
+    private void generateForConfig(GzBeanSeatTypeConfig config, String prefixOverride, GenerateTally tally) {
         int quantity = config.getQuantity() == null ? 0 : config.getQuantity();
         if (quantity <= 0) {
             log.info("[gz-bean-seat] batchGenerate skip configId={} quantity<=0", config.getId());
-            return 0;
+            return;
         }
         String prefix = StrUtil.isNotBlank(prefixOverride) ? prefixOverride : derivePrefix(config);
         boolean seatMode = "seat".equals(config.getBookMode());
-        int count = 0;
+        int before = tally.created;
         if (seatMode) {
             int capacity = config.getCapacity() == null || config.getCapacity() < 1 ? 1 : config.getCapacity();
             // seat：每桌 {prefix}{t} 下挂 {prefix}{t}-{s}，共 quantity 桌 × capacity 座
             for (int t = 1; t <= quantity; t++) {
                 String tableNo = prefix + t;
                 for (int s = 1; s <= capacity; s++) {
-                    String seatNo = tableNo + "-" + s;
-                    count += upsertSeatUnit(config, seatNo, tableNo, t * 10 + s);
+                    upsertSeatUnit(config, tableNo + "-" + s, tableNo, t * 10 + s, tally);
                 }
             }
         } else {
             // whole：一张桌 = 一个座位单元，{prefix}{n}（table_no 空）
             for (int n = 1; n <= quantity; n++) {
-                String seatNo = prefix + n;
-                count += upsertSeatUnit(config, seatNo, null, n);
+                upsertSeatUnit(config, prefix + n, null, n, tally);
             }
         }
         log.info("[gz-bean-seat] generateForConfig configId={} bookMode={} prefix={} quantity={} generated={}",
-            config.getId(), config.getBookMode(), prefix, quantity, count);
-        return count;
+            config.getId(), config.getBookMode(), prefix, quantity, tally.created - before);
     }
 
     /**
@@ -283,23 +308,32 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
     /**
      * 幂等生成单个座位单元：
      * <ul>
-     *   <li>命中正常座（del_flag='0'）→ 跳过返回 0；</li>
-     *   <li>命中软删座（del_flag='2'）→ 复活回填返回 1；</li>
-     *   <li>无命中 → 插入返回 1。</li>
+     *   <li>命中正常座（del_flag='0'）→ 跳过（同桌型 = 幂等重跑；<b>他桌型 = 前缀冲突</b>，记进 tally）；</li>
+     *   <li>命中软删座（del_flag='2'）→ 复活回填计入 created；</li>
+     *   <li>无命中 → 插入计入 created。</li>
      * </ul>
+     *
+     * <p>{@code seat_no} 是<b>全店唯一</b>（{@code uk_tenant_store_seat_no}），跨桌型撞号会让
+     * 「点了生成但什么都没多」（GZ-BEAN-054）；把冲突编号回传给前端提示换前缀。</p>
      */
-    private int upsertSeatUnit(GzBeanSeatTypeConfig config, String seatNo, String tableNo, int sortNo) {
+    private void upsertSeatUnit(GzBeanSeatTypeConfig config, String seatNo, String tableNo, int sortNo,
+                                GenerateTally tally) {
         GzBeanSeat existing = baseMapper.selectRawBySeatNo(config.getStoreId(), seatNo);
         if (existing != null) {
             if (DEL_FLAG_DELETED.equals(existing.getDelFlag())) {
                 baseMapper.reviveSoftDeleted(existing.getId(), config.getId(), tableNo, null, null, null, sortNo);
                 log.info("[gz-bean-seat] revive softDeleted id={} seatNo={} configId={}",
                     existing.getId(), seatNo, config.getId());
-                return 1;
+                tally.countCreated();
+                return;
             }
-            // 正常座已存在 — 幂等跳过
-            log.info("[gz-bean-seat] batchGenerate skip existing seatNo={} storeId={}", seatNo, config.getStoreId());
-            return 0;
+            // 正常座已存在 — 幂等跳过。归属他桌型 = 前缀冲突（店员多半想新建却什么都没得到）
+            boolean crossType = existing.getSeatTypeConfigId() == null
+                || !existing.getSeatTypeConfigId().equals(config.getId());
+            log.info("[gz-bean-seat] batchGenerate skip existing seatNo={} storeId={} crossType={}",
+                seatNo, config.getStoreId(), crossType);
+            tally.countSkipped(crossType ? seatNo : null);
+            return;
         }
         GzBeanSeat e = new GzBeanSeat();
         e.setStoreId(config.getStoreId());
@@ -309,7 +343,7 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
         e.setEnabled(ENABLED_ON);
         e.setSortNo(sortNo);
         baseMapper.insert(e);
-        return 1;
+        tally.countCreated();
     }
 
     @Override

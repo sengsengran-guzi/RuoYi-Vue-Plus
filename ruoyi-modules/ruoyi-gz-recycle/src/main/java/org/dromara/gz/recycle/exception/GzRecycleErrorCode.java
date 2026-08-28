@@ -67,19 +67,25 @@ public final class GzRecycleErrorCode {
     public static final int RETRY_NOT_ALLOWED = 4121;
     public static final String RETRY_NOT_ALLOWED_MSG = "仅打款失败的预约单可重试";
 
-    /* ===================== 时段容量 / 大单占位（412x，GZ-RECYCLE-007 放开） ===================== */
+    /* ============ 小时格容量 / 连占（412x，GZ-RECYCLE-012 / ADR-0022 改小时制） ============ */
 
-    /** 所选到店时段已被占（每门店每天每时段仅 1 单） */
+    /** 所选起始小时格已被占（每门店每天每小时格仅 1 单，{@code SLOT_CAPACITY}） */
     public static final int SLOT_TAKEN = 4122;
-    public static final String SLOT_TAKEN_MSG = "该时段已被预约，请换个时段";
+    public static final String SLOT_TAKEN_MSG = "该时间已被预约，请换个时间";
 
-    /** 大单（超点数阈值）需连占下一个时段，但下一个时段已被占 */
-    public static final int SLOT_SPILL_BLOCKED = 4123;
-    public static final String SLOT_SPILL_BLOCKED_MSG = "该点数需连占下一个时段，但下一个时段已被预约，请换时段或减少点数";
+    /**
+     * 所需连占的后续小时放不下：被占 / 越出营业时间 / 跨中间休息断档。
+     *
+     * <p>码号 <b>4123 保持不变</b>（mp 已有分支按码走，改号要动两端）；GZ-RECYCLE-012 只改语义与文案 ——
+     * 从「大单溢出占下一档被挡」变为「这个时长从该起点放不下」。</p>
+     */
+    public static final int SLOT_SPAN_BLOCKED = 4123;
+    /** 无小时数上下文时的兜底文案；有 N 时用 {@link #slotSpanBlockedMsg(int)} 出动态文案 */
+    public static final String SLOT_SPAN_BLOCKED_MSG = "所选时间放不下本次回收所需时长，请换个时间或减少点数";
 
-    /** 到店时段无效 / 不属本门店 / 已关闭 */
+    /** 到店时间无效 / 非整点 / 不在营业时间内 */
     public static final int SLOT_INVALID = 4124;
-    public static final String SLOT_INVALID_MSG = "到店时段无效或已关闭，请重新选择";
+    public static final String SLOT_INVALID_MSG = "到店时间无效或不在营业时间内，请重新选择";
 
     /** 未提供手机号（放开后：下单需微信登录 + 手机号，doc 需求 #6） */
     public static final int MOBILE_REQUIRED = 4125;
@@ -109,6 +115,37 @@ public final class GzRecycleErrorCode {
      */
     public static final int RESCHEDULE_DATE_PAST = 4130;
     public static final String RESCHEDULE_DATE_PAST_MSG = "顾客预约不能改到已过去的日期，请选择今天或之后的日期";
+
+    /**
+     * 所选到店时间已过（今天 + 起始时刻 <= 当前时刻，GZ-RECYCLE-012）。
+     *
+     * <p>命名档时代一天只有 3 个档，选错概率低；改成 12 个小时格后这是<b>高频</b>误操作。
+     * 不拦就会产出一张必然 no_show 的脏单还白占 N 格 —— 而 prod SnailJob 没部署、no_show cron
+     * 根本不跑，这些格要靠店员手动取消（GZ-RECYCLE-014）才能放开。</p>
+     *
+     * <p>手动占用 / 改期<b>豁免</b>：店员回填台账、挪动昨天的占用记录属正常动线（与 4130 现有口径一致）。</p>
+     */
+    public static final int SLOT_PAST = 4131;
+    public static final String SLOT_PAST_MSG = "该时间已过，请选择之后的时间";
+
+    /**
+     * 顾客单不可取消（GZ-RECYCLE-014）：仅 {@code submitted / confirmed_onsite} 可取消。
+     *
+     * <p>回收是<b>反向打款</b>（店家付钱给顾客）：{@code paying / paid / payout_failed} 有资金动作
+     * 在途或已完成，取消会让账面与实际打款脱节。手动占用请用 {@code release-hold}（4129）。</p>
+     */
+    public static final int CANCEL_NOT_ALLOWED = 4132;
+    public static final String CANCEL_NOT_ALLOWED_MSG = "该预约已进入打款流程或已结束，不能取消";
+
+    /**
+     * 连占放不下的动态文案（GZ-RECYCLE-012）：把「需要几小时」直接告诉用户，
+     * 否则「放不下」三个字对用户没有可操作性。
+     *
+     * @param spanHours 本单需连续占用的小时数
+     */
+    public static String slotSpanBlockedMsg(int spanHours) {
+        return String.format("该点数需连续占用 %d 小时，所选时间放不下，请换个时间或减少点数", spanHours);
+    }
 
     private GzRecycleErrorCode() {
     }

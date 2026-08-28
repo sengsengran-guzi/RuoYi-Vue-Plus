@@ -110,23 +110,28 @@ public class GzRecycleAppointmentMpController {
      * 某门店某日到店时段可用性（GZ-RECYCLE-007 放开，mp 选时段实时显「可约/已占」）。
      *
      * <pre>
-     * GET /app/gz/recycle/appointment/slot-availability?storeId=1&amp;date=2026-07-15
-     * 200 OK { "code":200, "data": [ {"id":"5","label":"上午","startTime":"10:00:00","endTime":"13:00:00","taken":false}, ... ] }
+     * GET /app/gz/recycle/appointment/slot-availability?storeId=1&amp;date=2026-08-27&amp;qtyBucketCode=pts-150-200
+     * 200 OK { "code":200, "data": { "date":"2026-08-27", "spanHours":4, "slots":[
+     *   {"startTime":"10:00:00","endTime":"11:00:00","label":"10:00","taken":false,"past":false,"selectable":true}, ... ] } }
      * </pre>
      *
-     * <p>逐个本店 enabled 时段带 {@code taken}：占用真源 = 活跃单 {@code time_slot_id=本档 OR spill_time_slot_id=本档}
-     * （每档容量 1，大单额外占下一档）。前端把 taken=true 的档置灰禁选。登录态即可（无新权限）。
-     * storeId / date 缺省 → 空列表 / 全 taken=false。</p>
+     * <p>逐个 1 小时格带 {@code taken / past / selectable}（GZ-RECYCLE-012 / ADR-0022）。
+     * 占用真源 = 活跃单区间与该格 {@code [gi, gi+1h)} 重叠（每格容量 1）。
+     * <b>前端只看 {@code selectable}</b> —— 「从这格起放不放得下 N 小时」的规则在后端。</p>
      *
-     * <p>匿名可读（{@link SaIgnore}，browse-first）：游客浏览时段可用性所需，仅只读占用布尔、无个人数据
+     * <p>{@code qtyBucketCode} 可空：缺省 N=1（用户还没选点数档时的纯占用视图）；未知 code 降级 N=1
+     * 而不抛 4107（本端点匿名可读，抛业务异常会把浏览态用户打断）。storeId / date 缺省 → 空格列表。</p>
+     *
+     * <p>匿名可读（{@link SaIgnore}，browse-first）：游客浏览时间可用性所需，仅只读占用布尔、无个人数据
      * （与拼豆 type-slots / seat-map 一致口径）。</p>
      */
     @SaIgnore
     @GetMapping("/slot-availability")
-    public R<List<RecycleSlotAvailabilityVO>> slotAvailability(
+    public R<RecycleSlotAvailabilityVO> slotAvailability(
         @RequestParam(required = false) Long storeId,
-        @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
-        return R.ok(appointmentService.getSlotAvailability(storeId, date));
+        @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
+        @RequestParam(required = false) String qtyBucketCode) {
+        return R.ok(appointmentService.getSlotAvailability(storeId, date, qtyBucketCode));
     }
 
     /**

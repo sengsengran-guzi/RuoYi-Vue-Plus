@@ -5,6 +5,7 @@ import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.domain.R;
+import org.dromara.common.idempotent.annotation.RepeatSubmit;
 import org.dromara.common.log.annotation.Log;
 import org.dromara.common.log.enums.BusinessType;
 import org.dromara.common.mybatis.core.page.PageQuery;
@@ -17,6 +18,7 @@ import org.dromara.gz.recycle.domain.bo.GzRecycleRescheduleBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyBo;
 import org.dromara.gz.recycle.domain.vo.GzRecycleAppointmentAdminVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleWeekBoardVO;
+import org.dromara.gz.recycle.domain.vo.RecycleSlotAvailabilityVO;
 import org.dromara.gz.recycle.service.IGzRecycleAppointmentService;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.validation.annotation.Validated;
@@ -154,6 +156,25 @@ public class GzRecycleAppointmentController extends BaseController {
     }
 
     /**
+     * 取消顾客单（GZ-RECYCLE-014）：释放它占住的全部小时格。
+     *
+     * <pre>POST /system/gz/recycle/appointment/{id}/cancel</pre>
+     *
+     * <p>仅 {@code submitted / confirmed_onsite} 可取消（回收是反向打款，有钱在途/已出账的单一律 4132）。
+     * 手动占用走 {@code release-hold}。复用既有 {@code hold} 权限，不新增 menu。</p>
+     *
+     * <p><b>为什么需要它</b>：prod SnailJob 没部署，no_show cron 从来没跑过 —— 顾客爽约单此前没有任何
+     * 释放手段。改小时格后一张 5 小时大单爽约 = 当天 5 个格全废。</p>
+     */
+    @SaCheckPermission("gz:recycle:appointment:hold")
+    @Log(title = "回收预约取消", businessType = BusinessType.UPDATE)
+    @RepeatSubmit()
+    @PostMapping("/{id}/cancel")
+    public R<GzRecycleAppointmentAdminVO> cancelCustomer(@PathVariable Long id) {
+        return R.ok(appointmentService.cancelCustomerAppointment(id, LoginHelper.getUsername()));
+    }
+
+    /**
      * 回收看板周视图（ADR-0021 §3）。
      *
      * <pre>GET /system/gz/recycle/appointment/week-board?storeId=&weekStart=YYYY-MM-DD</pre>
@@ -165,5 +186,25 @@ public class GzRecycleAppointmentController extends BaseController {
     public R<GzRecycleWeekBoardVO> weekBoard(@RequestParam Long storeId,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate weekStart) {
         return R.ok(appointmentService.selectWeekBoard(storeId, weekStart));
+    }
+
+    /**
+     * 小时格可用性（GZ-RECYCLE-012 / ADR-0022，改期弹窗选新时间用）。
+     *
+     * <pre>GET /system/gz/recycle/appointment/hour-slots?storeId=&amp;date=YYYY-MM-DD&amp;spanHours=4&amp;excludeAppointmentId=123</pre>
+     *
+     * <p>与 mp 的 {@code slot-availability} 同一核心，区别只有两点：{@code spanHours} 直接传数字
+     * （admin 已知本单占几小时，不必回查点数档）+ 支持 {@code excludeAppointmentId}。</p>
+     *
+     * <p><b>{@code excludeAppointmentId} 必传</b>（改期场景）：不排除的话被改期的单会跟自己的原区间冲突，
+     * 相邻起点永远选不了。</p>
+     */
+    @SaCheckPermission("gz:recycle:appointment:list")
+    @GetMapping("/hour-slots")
+    public R<RecycleSlotAvailabilityVO> hourSlots(@RequestParam Long storeId,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
+            @RequestParam(required = false) Integer spanHours,
+            @RequestParam(required = false) Long excludeAppointmentId) {
+        return R.ok(appointmentService.getHourSlotsForAdmin(storeId, date, spanHours, excludeAppointmentId));
     }
 }

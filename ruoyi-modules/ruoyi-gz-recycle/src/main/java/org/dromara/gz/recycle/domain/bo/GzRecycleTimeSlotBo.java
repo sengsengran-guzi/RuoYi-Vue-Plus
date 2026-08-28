@@ -3,6 +3,7 @@ package org.dromara.gz.recycle.domain.bo;
 import com.fasterxml.jackson.annotation.JsonFormat;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 import lombok.Data;
 import org.dromara.common.core.validate.AddGroup;
@@ -10,6 +11,7 @@ import org.dromara.common.core.validate.EditGroup;
 
 import java.io.Serial;
 import java.io.Serializable;
+import java.time.LocalDate;
 import java.time.LocalTime;
 
 /**
@@ -51,6 +53,22 @@ public class GzRecycleTimeSlotBo implements Serializable {
     @NotNull(message = "结束时间不能为空", groups = {AddGroup.class, EditGroup.class})
     @JsonFormat(pattern = "HH:mm:ss")
     private LocalTime endTime;
+
+    /**
+     * 生效星期（ISO `1`=周一 .. `7`=周日，逗号分隔）—— GZ-RECYCLE-015。
+     * 可空 → service 视作全周 `1,2,3,4,5,6,7`（老客户端不传时行为不变）。
+     */
+    @Pattern(regexp = "^[1-7](,[1-7])*$", message = "生效星期格式非法（应为 1-7 逗号分隔）",
+        groups = {AddGroup.class, EditGroup.class})
+    private String weekdays;
+
+    /** 生效起（可空 = 立即生效）—— GZ-RECYCLE-015 */
+    @JsonFormat(pattern = "yyyy-MM-dd")
+    private LocalDate effectiveDate;
+
+    /** 生效止（可空 = 长期有效）—— GZ-RECYCLE-015 */
+    @JsonFormat(pattern = "yyyy-MM-dd")
+    private LocalDate expireDate;
 
     /** 启用标志（0=停用 / 1=启用），默认启用 */
     private Integer enabled;

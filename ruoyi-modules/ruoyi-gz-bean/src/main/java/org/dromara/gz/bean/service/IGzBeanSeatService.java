@@ -5,6 +5,7 @@ import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatBatchGenerateBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatQueryBo;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatBatchGenerateResultVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatVO;
 
 import java.util.Collection;
@@ -61,7 +62,7 @@ public interface IGzBeanSeatService {
      *
      * @return 实际新建 + 复活的座位单元数量
      */
-    int batchGenerate(GzBeanSeatBatchGenerateBo bo);
+    GzBeanSeatBatchGenerateResultVO batchGenerate(GzBeanSeatBatchGenerateBo bo);
 
     /** 座位号唯一性校验（true=唯一可用 / false=已存在；忽略软删，对齐 DB UNIQUE 仅在未删行生效语义） */
     boolean checkSeatNoUnique(GzBeanSeatBo bo);

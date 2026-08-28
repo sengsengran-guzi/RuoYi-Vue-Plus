@@ -227,7 +227,7 @@ class GzBeanSeatServiceImplTest {
         when(baseMapper.selectRawBySeatNo(eq(1L), anyString())).thenReturn(null);
         when(baseMapper.insert(any(GzBeanSeat.class))).thenReturn(1);
 
-        int generated = service.batchGenerate(bo);
+        int generated = service.batchGenerate(bo).getCreated();
         assertEquals(3, generated);
 
         ArgumentCaptor<GzBeanSeat> cap = ArgumentCaptor.forClass(GzBeanSeat.class);
@@ -251,7 +251,7 @@ class GzBeanSeatServiceImplTest {
         when(baseMapper.selectRawBySeatNo(eq(1L), anyString())).thenReturn(null);
         when(baseMapper.insert(any(GzBeanSeat.class))).thenReturn(1);
 
-        int generated = service.batchGenerate(bo);
+        int generated = service.batchGenerate(bo).getCreated();
         assertEquals(8, generated);
 
         ArgumentCaptor<GzBeanSeat> cap = ArgumentCaptor.forClass(GzBeanSeat.class);
@@ -304,7 +304,7 @@ class GzBeanSeatServiceImplTest {
             .thenReturn(1);
         when(baseMapper.insert(any(GzBeanSeat.class))).thenReturn(1);
 
-        int generated = service.batchGenerate(bo);
+        int generated = service.batchGenerate(bo).getCreated();
         assertEquals(2, generated, "复活 1 + 新建 1 = 2（跳过的不计）");
         verify(baseMapper).reviveSoftDeleted(eq(12L), eq(7L), isNull(), isNull(), isNull(), isNull(), eq(2));
         verify(baseMapper, times(1)).insert(any(GzBeanSeat.class));
@@ -324,7 +324,7 @@ class GzBeanSeatServiceImplTest {
         when(baseMapper.selectRawBySeatNo(eq(1L), anyString())).thenReturn(null);
         when(baseMapper.insert(any(GzBeanSeat.class))).thenReturn(1);
 
-        int generated = service.batchGenerate(bo);
+        int generated = service.batchGenerate(bo).getCreated();
         assertEquals(3, generated, "single 2 + double 1 = 3");
     }
 
@@ -351,7 +351,7 @@ class GzBeanSeatServiceImplTest {
         bo.setSeatTypeConfigId(7L);
         when(configMapper.selectById(7L)).thenReturn(config(7L, 1L, "single", "单人位", "whole", 1, 0));
 
-        int generated = service.batchGenerate(bo);
+        int generated = service.batchGenerate(bo).getCreated();
         assertEquals(0, generated);
         verify(baseMapper, never()).insert(any(GzBeanSeat.class));
     }
@@ -419,5 +419,50 @@ class GzBeanSeatServiceImplTest {
     void deleteByIds_happy() {
         when(baseMapper.deleteByIds(any())).thenReturn(2);
         assertTrue(service.deleteByIds(List.of(1L, 2L)));
+    }
+
+    // ------------------------------ GZ-BEAN-054 前缀撞号（跨桌型） ------------------------------
+
+    @Test
+    @DisplayName("batchGenerate · 前缀与他桌型座位撞号 → created=0 且 conflictSeatNos 有值（GZ-BEAN-054）")
+    void batchGenerate_crossTypePrefixConflict_reported() {
+        GzBeanSeatBatchGenerateBo bo = new GzBeanSeatBatchGenerateBo();
+        bo.setSeatTypeConfigId(30L);
+        bo.setPrefix("Q");
+        // 临时桌 configId=30，前缀 Q 与正式四人桌（configId=9）的 Q1/Q2 撞车
+        when(configMapper.selectById(30L)).thenReturn(config(30L, 1L, "st30", "临时四人桌", "whole", 1, 2));
+        GzBeanSeat otherTypeSeat = new GzBeanSeat();
+        otherTypeSeat.setId(50L);
+        otherTypeSeat.setDelFlag("0");
+        otherTypeSeat.setSeatTypeConfigId(9L); // 属别的桌型 = 真·前缀冲突
+        when(baseMapper.selectRawBySeatNo(eq(1L), anyString())).thenReturn(otherTypeSeat);
+
+        var result = service.batchGenerate(bo);
+
+        assertEquals(0, result.getCreated(), "全撞号 → 一个都没生成");
+        assertEquals(2, result.getSkipped());
+        assertTrue(result.getHasConflict(), "跨桌型撞号必须标出来，否则店员只看到「点了什么都没多」");
+        assertEquals(List.of("Q1", "Q2"), result.getConflictSeatNos());
+        verify(baseMapper, never()).insert(any(GzBeanSeat.class));
+    }
+
+    @Test
+    @DisplayName("batchGenerate · 同桌型幂等重跑 → skipped 有值但 hasConflict=false（不误报）")
+    void batchGenerate_sameTypeRerun_noConflict() {
+        GzBeanSeatBatchGenerateBo bo = new GzBeanSeatBatchGenerateBo();
+        bo.setSeatTypeConfigId(7L);
+        when(configMapper.selectById(7L)).thenReturn(config(7L, 1L, "single", "单人位", "whole", 1, 2));
+        GzBeanSeat sameTypeSeat = new GzBeanSeat();
+        sameTypeSeat.setId(51L);
+        sameTypeSeat.setDelFlag("0");
+        sameTypeSeat.setSeatTypeConfigId(7L); // 同桌型 = 正常幂等重跑
+        when(baseMapper.selectRawBySeatNo(eq(1L), anyString())).thenReturn(sameTypeSeat);
+
+        var result = service.batchGenerate(bo);
+
+        assertEquals(0, result.getCreated());
+        assertEquals(2, result.getSkipped());
+        assertFalse(result.getHasConflict(), "同桌型重跑是正常幂等，不该报冲突");
+        assertTrue(result.getConflictSeatNos().isEmpty());
     }
 }

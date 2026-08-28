@@ -70,6 +70,13 @@ class MpPublicConfigKeyResolverTest {
     }
 
     @Test
+    @DisplayName("回收客服二维码无分身：两个小程序都解析到同一个 key")
+    void recycle_service_qrcode_has_no_variant() {
+        assertEquals("gz.recycle.serviceQrcode", resolverFor(CLIENT_ID_GUZI).resolve("gz.recycle.serviceQrcode"));
+        assertEquals("gz.recycle.serviceQrcode", resolverFor(CLIENT_ID_JP).resolve("gz.recycle.serviceQrcode"));
+    }
+
+    @Test
     @DisplayName("非白名单 key（分成率 / 默认密码）→ null，controller 据此拒绝")
     void non_whitelisted_key_rejected() {
         MpPublicConfigKeyResolver r = resolverFor(CLIENT_ID_GUZI);

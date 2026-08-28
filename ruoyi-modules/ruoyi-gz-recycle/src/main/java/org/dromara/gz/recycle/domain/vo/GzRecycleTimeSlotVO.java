@@ -7,6 +7,7 @@ import lombok.Data;
 
 import java.io.Serial;
 import java.io.Serializable;
+import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.Date;
 
@@ -46,6 +47,15 @@ public class GzRecycleTimeSlotVO implements Serializable {
     /** 到店时段结束（HH:mm:ss） */
     @JsonFormat(pattern = "HH:mm:ss")
     private LocalTime endTime;
+
+    /** 生效星期（ISO 1=周一..7=周日，逗号分隔）—— GZ-RECYCLE-015 */
+    private String weekdays;
+
+    /** 生效起（NULL = 立即生效） */
+    private LocalDate effectiveDate;
+
+    /** 生效止（NULL = 长期有效） */
+    private LocalDate expireDate;
 
     /** 启用标志（0=停用 / 1=启用）；mp 列表恒为启用，admin 列表全状态 */
     private Integer enabled;

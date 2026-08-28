@@ -57,6 +57,9 @@ public class MpPublicConfigKeyResolver {
     /** 拼豆落地页顶部 banner（GZ-BEAN-010）—— 仅谷子宇宙小程序在用，无分身。 */
     public static final String KEY_BEAN_HOME_BANNER = "gz.bean.home.banner";
 
+    /** 回收提交页客服微信二维码（GZ-RECYCLE-016）—— 回收是 sensenran 专属业务，无分身。 */
+    public static final String KEY_RECYCLE_SERVICE_QRCODE = "gz.recycle.serviceQrcode";
+
     /**
      * 公开 key 族登记表（= 原 controller 里的白名单，升级成「按小程序分身」）。
      *
@@ -65,6 +68,8 @@ public class MpPublicConfigKeyResolver {
     private static final List<KeyFamily> FAMILIES = List.of(
         // 拼豆落地页 banner：只有谷子宇宙小程序在用，拼团端不读它 → 无分身
         new KeyFamily(KEY_BEAN_HOME_BANNER, Map.of()),
+        // 回收提交页客服二维码：回收是 sensenran 专属业务，拼团端不读它 → 无分身
+        new KeyFamily(KEY_RECYCLE_SERVICE_QRCODE, Map.of()),
         // ★ 首页轮播 banner：两个小程序各一份，否则运营配一次两边串味
         new KeyFamily(KEY_HOME_BANNERS, Map.of(CLIENT_ID_JP, KEY_JP_HOME_BANNERS))
     );

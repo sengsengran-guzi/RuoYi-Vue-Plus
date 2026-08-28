@@ -12,6 +12,7 @@ import lombok.NoArgsConstructor;
 import org.dromara.common.tenant.core.TenantEntity;
 
 import java.io.Serial;
+import java.time.LocalDate;
 import java.time.LocalTime;
 
 /**
@@ -59,6 +60,20 @@ public class GzRecycleTimeSlot extends TenantEntity {
 
     /** 到店时段结束 */
     private LocalTime endTime;
+
+    /**
+     * 生效星期（ISO `1`=周一 .. `7`=周日，逗号分隔；如 `"1,2,3,4,5"`）—— GZ-RECYCLE-015 对齐拼豆。
+     *
+     * <p>让「周末与平时营业时间不同」可配。默认全周 `1,2,3,4,5,6,7`（存量行行为不变）。
+     * 取窗口时按目标日期的 ISO 星期过滤（{@code listEnabledForDate}），切格算法本身不受影响。</p>
+     */
+    private String weekdays;
+
+    /** 生效起（NULL = 立即生效）—— GZ-RECYCLE-015 */
+    private LocalDate effectiveDate;
+
+    /** 生效止（NULL = 长期有效）—— GZ-RECYCLE-015 */
+    private LocalDate expireDate;
 
     /** 启用标志（0=停用 / 1=启用）；mp 仅拉启用时段 */
     private Integer enabled;

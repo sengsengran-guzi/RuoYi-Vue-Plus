@@ -10,6 +10,7 @@ import org.springframework.format.annotation.DateTimeFormat;
 import java.io.Serial;
 import java.io.Serializable;
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.List;
 
 /**
@@ -36,9 +37,14 @@ public class GzRecycleManualHoldBo implements Serializable {
     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)
     private LocalDate apptDate;
 
-    /** 到店时段 id 列表（gz_recycle_time_slot.id，可多选，同事务 all-or-nothing） */
-    @NotEmpty(message = "请至少选择一个时段")
-    private List<Long> timeSlotIds;
+    /**
+     * 占用的<b>小时格起点</b>列表（GZ-RECYCLE-012 / ADR-0022，可多选，同事务 all-or-nothing）。
+     *
+     * <p>一格一行，每行 span=1 小时 —— ADR-0021「要占两格就选两格建两行」的规则在小时格模型下更自然。
+     * service 会先 {@code distinct().sorted()}：前端多选顺序不可信，乱序会与 submit 的升序加锁撞出死锁。</p>
+     */
+    @NotEmpty(message = "请至少选择一个时间")
+    private List<LocalTime> slotStarts;
 
     /**
      * 备注（<b>必填</b>）：手动占用没有客户身份、没有点数档，备注是唯一辨识信息

@@ -45,16 +45,48 @@ public interface IGzRecycleAppointmentService {
     GzRecycleAppointmentVO submit(GzRecycleAppointmentSubmitBo bo, Long userId);
 
     /**
-     * 某门店某日到店时段可用性（GZ-RECYCLE-007 放开，mp 填单选时段用）。
+     * 某门店某日<b>小时格</b>可用性（GZ-RECYCLE-012 / ADR-0022，mp 填单选时间用）。
      *
-     * <p>逐个本店 enabled 时段标 {@code taken}（是否已被占）：占用真源 = 活跃单 {@code time_slot_id=本档 OR
-     * spill_time_slot_id=本档}（每档容量 1，大单额外占下一档）。已关闭（enabled=0）的档不在列。无锁，仅展示。</p>
+     * <p>逐个 1 小时格标 {@code taken / past / selectable}。占用真源 = 活跃单区间与该格
+     * {@code [gi, gi+1h)} 重叠（每格容量 1）。无锁，仅展示 —— 与 submit 的 FOR UPDATE 之间有天然
+     * 竞态窗口（UI 显示可约 → 提交拿 4122），这是有意设计。</p>
      *
-     * @param storeId 门店 id
-     * @param date    到店日期（null → 全档 taken=false）
-     * @return 该门店该日各 enabled 时段的可用性
+     * <p><b>{@code qtyBucketCode} 必须收</b>：判定「从这格起放得下 N 小时吗」要综合营业窗口连续性 /
+     * 午休不可桥接 / 今日已过 / 逐格占用 / 跨窗口不可连占五条后端知识，让前端拿裸占用自己算必然漂移。
+     * 可选：缺省 N=1（保匿名 browse-first）；未知 code 降级 N=1 而<b>不抛 4107</b>。</p>
+     *
+     * @param storeId       门店 id
+     * @param date          到店日期（null → 全格 taken=false）
+     * @param qtyBucketCode 点数档 code（可空 → N=1）
+     * @return 该门店该日的小时格可用性 + 本次依据的 spanHours
      */
-    List<RecycleSlotAvailabilityVO> getSlotAvailability(Long storeId, LocalDate date);
+    RecycleSlotAvailabilityVO getSlotAvailability(Long storeId, LocalDate date, String qtyBucketCode);
+
+    /**
+     * admin 版小时格可用性（GZ-RECYCLE-012，改期弹窗用）：直接给 {@code spanHours}，并<b>排除某单自身</b>。
+     *
+     * <p><b>{@code excludeAppointmentId} 必须生效</b>：不排除的话，被改期的单会跟自己的原区间冲突 ——
+     * 想把 10:00-14:00 的单挪到 11:00 时，11/12/13 都被自己占着，相邻起点永远选不了。</p>
+     *
+     * @param storeId               门店 id
+     * @param date                  目标日期
+     * @param spanHours             本单占用小时数（前端自算：顾客单 ceil(matched/60)，手动占用取区间宽度）
+     * @param excludeAppointmentId  排除的单 id（改期单自身；可空）
+     */
+    RecycleSlotAvailabilityVO getHourSlotsForAdmin(Long storeId, LocalDate date, Integer spanHours,
+                                                   Long excludeAppointmentId);
+
+    /**
+     * 取消顾客单（GZ-RECYCLE-014，回收看板「取消」动作）：释放它占住的全部小时格。
+     *
+     * <p>仅 {@code submitted / confirmed_onsite} 可取消 —— 回收是反向打款，
+     * {@code paying / paid / payout_failed} 有资金动作在途或已完成，一律 4132。
+     * 手动占用请走 {@code releaseHold}（4129）。</p>
+     *
+     * @param id       预约单 id
+     * @param operator 操作人（admin 用户名，写审计列）
+     */
+    GzRecycleAppointmentAdminVO cancelCustomerAppointment(Long id, String operator);
 
     /**
      * 我的回收记录列表（按 create_time desc，doc/12 §MP-RECYCLE-LIST）。

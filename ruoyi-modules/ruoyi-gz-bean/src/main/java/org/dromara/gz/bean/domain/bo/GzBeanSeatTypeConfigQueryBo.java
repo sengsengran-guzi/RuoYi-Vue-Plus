@@ -26,4 +26,7 @@ public class GzBeanSeatTypeConfigQueryBo implements Serializable {
 
     /** 0=停用 / 1=启用 */
     private Integer enabled;
+
+    /** 是否对小程序开放：1=正常桌型 / 0=仅后台临时桌（GZ-BEAN-054）；不传则不过滤 */
+    private Integer mpVisible;
 }

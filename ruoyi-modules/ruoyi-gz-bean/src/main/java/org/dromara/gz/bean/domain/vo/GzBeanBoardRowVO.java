@@ -66,6 +66,13 @@ public class GzBeanBoardRowVO implements Serializable {
     private String bookMode;
 
     /**
+     * 本座所属桌型是否对小程序开放：1=正常桌型 / 0=**临时桌**（GZ-BEAN-054 / ADR-0023）。
+     * admin 看板据此给临时桌分组打标并排到最后。<b>取自座位所属桌型档，不是 booking 自身桌型</b> ——
+     * 跨桌型分座后二者会分叉，看板是座位视角。
+     */
+    private Integer mpVisible;
+
+    /**
      * 座位备注（{@code gz_bean_seat.remark}）：纯挂座位，与座位是否有人/空闲无关，店员手动填/清，
      * 座位状态变化（核销 / 放座 / 换单等）绝不自动清理；可空。
      */

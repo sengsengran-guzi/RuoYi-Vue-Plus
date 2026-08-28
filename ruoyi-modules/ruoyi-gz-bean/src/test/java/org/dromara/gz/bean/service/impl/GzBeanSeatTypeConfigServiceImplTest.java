@@ -448,4 +448,85 @@ class GzBeanSeatTypeConfigServiceImplTest {
         assertEquals(1, list.size());
         assertEquals(0, new BigDecimal("0.00").compareTo(list.get(0).getPriceYuan()));
     }
+
+    // ------------------------------ GZ-BEAN-054 临时桌型（mp_visible，ADR-0023） ------------------------------
+
+    @Test
+    @DisplayName("insertByBo · mpVisible 空 → 视作 1（正常桌型），与 DB DEFAULT 1 同口径")
+    void insertByBo_nullMpVisible_defaultsToOne() {
+        GzBeanSeatTypeConfigBo bo = validBo();
+        when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
+        when(baseMapper.insert(any(GzBeanSeatTypeConfig.class))).thenAnswer(inv -> {
+            GzBeanSeatTypeConfig e = inv.getArgument(0);
+            e.setId(78L);
+            return 1;
+        });
+
+        assertTrue(service.insertByBo(bo));
+
+        ArgumentCaptor<GzBeanSeatTypeConfig> cap = ArgumentCaptor.forClass(GzBeanSeatTypeConfig.class);
+        verify(baseMapper).insert(cap.capture());
+        assertEquals(1, cap.getValue().getMpVisible(),
+            "toEntity 是手写拷贝，漏了这行会让老客户端提交时静默把桌型藏起来");
+    }
+
+    @Test
+    @DisplayName("insertByBo · mpVisible=0 临时桌 → 落库 0")
+    void insertByBo_tempSeatType_persistsZero() {
+        GzBeanSeatTypeConfigBo bo = validBo();
+        bo.setName("临时四人桌");
+        bo.setMpVisible(0);
+        when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
+        when(baseMapper.insert(any(GzBeanSeatTypeConfig.class))).thenAnswer(inv -> {
+            GzBeanSeatTypeConfig e = inv.getArgument(0);
+            e.setId(79L);
+            return 1;
+        });
+
+        assertTrue(service.insertByBo(bo));
+
+        ArgumentCaptor<GzBeanSeatTypeConfig> cap = ArgumentCaptor.forClass(GzBeanSeatTypeConfig.class);
+        verify(baseMapper).insert(cap.capture());
+        assertEquals(0, cap.getValue().getMpVisible());
+    }
+
+    @Test
+    @DisplayName("insertByBo · 临时桌 + 包天名额 > 0 → ServiceException（包天是纯 mp 概念）")
+    void insertByBo_tempWithDayPassQuota_throws() {
+        GzBeanSeatTypeConfigBo bo = validBo();
+        bo.setMpVisible(0);
+        bo.setDayPassQuota(3);
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.insertByBo(bo));
+        assertTrue(ex.getMessage().contains("临时桌"));
+        verify(baseMapper, never()).insert(any(GzBeanSeatTypeConfig.class));
+    }
+
+    @Test
+    @DisplayName("insertByBo · 临时桌 + 包天价 > 0 → ServiceException（quota 为 0 也拦，防半配脏数据）")
+    void insertByBo_tempWithDayPassPrice_throws() {
+        GzBeanSeatTypeConfigBo bo = validBo();
+        bo.setMpVisible(0);
+        bo.setDayPassPriceCent(5000L);
+
+        assertThrows(ServiceException.class, () -> service.insertByBo(bo));
+        verify(baseMapper, never()).insert(any(GzBeanSeatTypeConfig.class));
+    }
+
+    @Test
+    @DisplayName("insertByBo · 正常桌型 + 包天 → 放行（临时桌闸不误伤）")
+    void insertByBo_normalWithDayPass_ok() {
+        GzBeanSeatTypeConfigBo bo = validBo();
+        bo.setMpVisible(1);
+        bo.setDayPassQuota(3);
+        bo.setDayPassPriceCent(5000L);
+        when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
+        when(baseMapper.insert(any(GzBeanSeatTypeConfig.class))).thenAnswer(inv -> {
+            GzBeanSeatTypeConfig e = inv.getArgument(0);
+            e.setId(80L);
+            return 1;
+        });
+
+        assertTrue(service.insertByBo(bo));
+    }
 }

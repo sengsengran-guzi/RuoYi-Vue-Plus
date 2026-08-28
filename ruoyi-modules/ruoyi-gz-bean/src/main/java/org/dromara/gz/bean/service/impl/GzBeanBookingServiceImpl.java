@@ -74,6 +74,7 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -561,11 +562,9 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         if (seat.getEnabled() == null || seat.getEnabled() != 1) {
             throw new ServiceException(GzBeanErrorCode.SEAT_DISABLED_MSG, GzBeanErrorCode.SEAT_DISABLED);
         }
-        // 桌型匹配：座位所属桌型档须 = 预约桌型档（仅两者都有时校；存量缺 config 不强校，向后兼容）
-        if (booking.getSeatTypeConfigId() != null && seat.getSeatTypeConfigId() != null
-            && !booking.getSeatTypeConfigId().equals(seat.getSeatTypeConfigId())) {
-            throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_MISMATCH_MSG, GzBeanErrorCode.SEAT_TYPE_MISMATCH);
-        }
+        // 桌型匹配：座位所属桌型档须 = 预约桌型档（仅两者都有时校；存量缺 config 不强校，向后兼容）。
+        //   例外：目标座是临时桌（mp_visible=0，GZ-BEAN-054 / ADR-0023）→ 放行，见 assertSeatTypeCompatible
+        assertSeatTypeCompatible(booking.getSeatTypeConfigId(), seat.getSeatTypeConfigId(), "bean-verify-assign");
         // 座位关闭校验（GZ-BEAN-036 Req3，fail fast 在区间互斥之前）：该座在该日 weekday 的预约区间
         //   [slot_start, slot_end) 命中后台「按星期 + 时段关闭」规则 → 拒绝分座（整笔回滚），不让店员把已关闭
         //   座位绑给新单。周复发关闭、自动恢复；只拦新分座，不动已存活预约。
@@ -653,10 +652,8 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         if (seat.getEnabled() == null || seat.getEnabled() != 1) {
             throw new ServiceException(GzBeanErrorCode.SEAT_DISABLED_MSG, GzBeanErrorCode.SEAT_DISABLED);
         }
-        if (booking.getSeatTypeConfigId() != null && seat.getSeatTypeConfigId() != null
-            && !booking.getSeatTypeConfigId().equals(seat.getSeatTypeConfigId())) {
-            throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_MISMATCH_MSG, GzBeanErrorCode.SEAT_TYPE_MISMATCH);
-        }
+        // 桌型匹配（临时桌例外同 assignSeatAtVerify，GZ-BEAN-054 / ADR-0023）
+        assertSeatTypeCompatible(booking.getSeatTypeConfigId(), seat.getSeatTypeConfigId(), "bean-pre-assign");
         List<Long> closedSeatIds = seatClosureService.findClosedSeatIds(
             tenantId, booking.getStoreId(), booking.getSessDate(), effectiveStart, booking.getSlotEnd());
         if (closedSeatIds.contains(seatId)) {
@@ -1225,6 +1222,12 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         if (config.getEnabled() == null || config.getEnabled() != 1) {
             throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_DISABLED_MSG, GzBeanErrorCode.SEAT_TYPE_DISABLED);
         }
+        // 临时桌不可线上下单（GZ-BEAN-054 / ADR-0023）：type-slots 已滤掉，此处只可能因「顾客停留在
+        //   旧列表页 / 桌型刚被改成临时桌」的竞态到达，复用 4013 让 mp 走既有「已停用请重选」分支
+        if (!isMpVisible(config)) {
+            log.warn("[bean-submit] seat type not mp-visible configId={} storeId={}", config.getId(), bo.getStoreId());
+            throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_DISABLED_MSG, GzBeanErrorCode.SEAT_TYPE_DISABLED);
+        }
 
         // ④.5 区间连续性校验（ADR-0011 §5 / doc/15a §A.2，沿用）：把下单区间 [slotStart, slotEnd) 按 1h 展开成
         //   格序列 g1..gN，逐格校验「整点 + 落在某启用窗口内 + 物理相邻连续（午休 gap 不可跨窗口桥接）」。
@@ -1441,6 +1444,11 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         if (config == null || config.getStoreId() == null || !config.getStoreId().equals(bo.getStoreId())
             || config.getEnabled() == null || config.getEnabled() != 1) {
             throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_NOT_CONFIGURED_MSG, GzBeanErrorCode.SEAT_TYPE_NOT_CONFIGURED);
+        }
+        // 临时桌不可线上下单（GZ-BEAN-054 / ADR-0023），同 submitPaid 的竞态兜底
+        if (!isMpVisible(config)) {
+            log.warn("[bean-submit-group] seat type not mp-visible configId={} storeId={}", config.getId(), bo.getStoreId());
+            throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_DISABLED_MSG, GzBeanErrorCode.SEAT_TYPE_DISABLED);
         }
         // N 上限 = 桌型每格配置总量（cap）；超过直接 QUOTA_FULL（前端已按余量灰选，此为兜底）
         long slotCapacity = slotCapacity(config);
@@ -1740,6 +1748,11 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         if (config.getEnabled() == null || config.getEnabled() != 1) {
             throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_DISABLED_MSG, GzBeanErrorCode.SEAT_TYPE_DISABLED);
         }
+        // 临时桌不可线上下单（GZ-BEAN-054 / ADR-0023），同 submitPaid 的竞态兜底
+        if (!isMpVisible(config)) {
+            log.warn("[bean-day-pass] seat type not mp-visible configId={} storeId={}", config.getId(), bo.getStoreId());
+            throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_DISABLED_MSG, GzBeanErrorCode.SEAT_TYPE_DISABLED);
+        }
 
         // ⑤ 该桌型开放包天（day_pass_quota > 0）
         int dayPassQuota = config.getDayPassQuota() == null ? 0 : config.getDayPassQuota();
@@ -1877,12 +1890,15 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             return List.of();
         }
         String tenantId = store.getTenantId();
-        // 该店启用且开放包天（day_pass_quota>0）的桌型档
+        // 该店启用、对小程序开放且开放包天（day_pass_quota>0）的桌型档。
+        // mp_visible=1（GZ-BEAN-054）：包天是纯 mp 概念，临时桌本就被 validateMpVisible 禁止配包天，
+        // 这里再兜一道，防历史脏数据（先配包天后改临时桌）漏进 mp 包天档列表。
         List<GzBeanSeatTypeConfig> configs = seatTypeConfigMapper.selectList(
             Wrappers.<GzBeanSeatTypeConfig>lambdaQuery()
                 .eq(GzBeanSeatTypeConfig::getTenantId, tenantId)
                 .eq(GzBeanSeatTypeConfig::getStoreId, storeId)
                 .eq(GzBeanSeatTypeConfig::getEnabled, 1)
+                .eq(GzBeanSeatTypeConfig::getMpVisible, 1)
                 .gt(GzBeanSeatTypeConfig::getDayPassQuota, 0)
                 .orderByAsc(GzBeanSeatTypeConfig::getSortNo)
                 .orderByAsc(GzBeanSeatTypeConfig::getId));
@@ -1910,6 +1926,56 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                 .build());
         }
         return result;
+    }
+
+    /**
+     * 该桌型档是否对小程序开放（GZ-BEAN-054 / ADR-0023）。{@code null} 视作开放 —— 与 DB
+     * {@code DEFAULT 1} 同口径，保证迁移前后行为一致（存量行全部为 1）。
+     *
+     * <p><b>只在小程序可订面调用</b>：{@code selectTypeSlotAvailability} / {@code selectDayPassOptions} /
+     * {@code selectSeatMap} / {@code submitPaid} / {@code submitPaidGroup} / {@code submitDayPass}，
+     * 外加 admin 实时余量表 {@code selectTypeSlotAvailabilityDetail}。
+     * <b>看板 / walk-in / admin-create / 座位批量生成 / 核销分座 / 营业额聚合一律不得调用</b> ——
+     * 临时桌的全部价值就是在这些内部面照常工作。</p>
+     */
+    private boolean isMpVisible(GzBeanSeatTypeConfig config) {
+        return config != null && (config.getMpVisible() == null || config.getMpVisible() == 1);
+    }
+
+    /**
+     * 该桌型档是否是**临时桌**（{@code mp_visible=0}，GZ-BEAN-054 / ADR-0023）。
+     * 用于分座 / 排位 / 改派放宽桌型匹配闸时判定「座位落在临时桌上」。
+     */
+    private boolean isTempSeatType(Long seatTypeConfigId) {
+        if (seatTypeConfigId == null) {
+            return false;
+        }
+        GzBeanSeatTypeConfig cfg = seatTypeConfigMapper.selectById(seatTypeConfigId);
+        return cfg != null && cfg.getMpVisible() != null && cfg.getMpVisible() == 0;
+    }
+
+    /**
+     * 桌型匹配闸（分座 / 排位 / 改派三处共用，GZ-BEAN-054 放宽版）。
+     *
+     * <p>原规则：座位所属桌型档必须 = 预约桌型档，否则 {@code SEAT_TYPE_MISMATCH(4022)}
+     * （存量缺 config 不强校，向后兼容）。</p>
+     *
+     * <p><b>受控例外（ADR-0023）</b>：目标座落在**临时桌**（{@code mp_visible=0}）时放行。
+     * 临时桌根本不进小程序、没有对应的线上桌型，是周末溢出客的物理承接位；甲方要求线上单
+     * 也能分到临时桌上。<b>booking 自身的 {@code seat_type_config_id} /
+     * {@code seat_type_snapshot} 保持不变</b> —— 钱仍算在客人买的桌型上，营业额口径不受影响。</p>
+     */
+    private void assertSeatTypeCompatible(Long bookingSeatTypeConfigId, Long seatSeatTypeConfigId, String logTag) {
+        if (bookingSeatTypeConfigId == null || seatSeatTypeConfigId == null
+            || bookingSeatTypeConfigId.equals(seatSeatTypeConfigId)) {
+            return;
+        }
+        if (isTempSeatType(seatSeatTypeConfigId)) {
+            log.info("[{}] cross-type assign allowed onto temp seat type bookingConfigId={} seatConfigId={}",
+                logTag, bookingSeatTypeConfigId, seatSeatTypeConfigId);
+            return;
+        }
+        throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_MISMATCH_MSG, GzBeanErrorCode.SEAT_TYPE_MISMATCH);
     }
 
     /**
@@ -2020,12 +2086,15 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
 
         // 关多租户拦截器按 store 的租户显式 scope（mp 用户态 JWT tenant 不可靠，同 submit 注释）
         return TenantHelper.ignore(() -> {
-            // 启用的座位类型配置（按 sortNo / seatType 升序）
+            // 启用 + 对小程序开放的座位类型配置（按 sortNo / seatType 升序）。
+            // mp_visible=1 过滤（GZ-BEAN-054 / ADR-0023）：临时桌只在店内看板存在，不进小程序目录。
+            // 这里是 mp 桌型目录的唯一源头 —— 漏了它临时桌就会出现在顾客下单页。
             List<GzBeanSeatTypeConfig> configs = seatTypeConfigMapper.selectList(
                 Wrappers.<GzBeanSeatTypeConfig>lambdaQuery()
                     .eq(GzBeanSeatTypeConfig::getTenantId, tenantId)
                     .eq(GzBeanSeatTypeConfig::getStoreId, storeId)
                     .eq(GzBeanSeatTypeConfig::getEnabled, 1)
+                    .eq(GzBeanSeatTypeConfig::getMpVisible, 1)
                     .orderByAsc(GzBeanSeatTypeConfig::getSortNo)
                     .orderByAsc(GzBeanSeatTypeConfig::getSeatType));
             if (configs.isEmpty()) {
@@ -2098,12 +2167,16 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         String tenantId = store.getTenantId();
 
         // 与 selectTypeSlotAvailability 同 scope（store 租户显式 scope），区别仅在于对 admin 明确回传数字。
+        // mp_visible=1 过滤（GZ-BEAN-054）：本表语义是「小程序可订多少 / 关几个不让订」，配额关闭直接扣
+        //   mp 可订量。临时桌不进 mp 且 walk-in 故意绕过配额闸 → 给它摆一个关闭 stepper 就是拨了不生效的
+        //   假开关，纯新增 bug 面。
         return TenantHelper.ignore(() -> {
             List<GzBeanSeatTypeConfig> configs = seatTypeConfigMapper.selectList(
                 Wrappers.<GzBeanSeatTypeConfig>lambdaQuery()
                     .eq(GzBeanSeatTypeConfig::getTenantId, tenantId)
                     .eq(GzBeanSeatTypeConfig::getStoreId, storeId)
                     .eq(GzBeanSeatTypeConfig::getEnabled, 1)
+                    .eq(GzBeanSeatTypeConfig::getMpVisible, 1)
                     .orderByAsc(GzBeanSeatTypeConfig::getSortNo)
                     .orderByAsc(GzBeanSeatTypeConfig::getSeatType));
             if (configs.isEmpty()) {
@@ -2213,8 +2286,10 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             List<GzBeanSeatMapVO> result = new ArrayList<>(seats.size());
             for (GzBeanSeat seat : seats) {
                 GzBeanSeatTypeConfig cfg = configMap.get(seat.getSeatTypeConfigId());
-                if (cfg == null || cfg.getEnabled() == null || cfg.getEnabled() != 1) {
-                    // 桌型被删 / 停用 → 该座不出现在影院图（与下单校验一致：座挂的桌型须启用）
+                if (cfg == null || cfg.getEnabled() == null || cfg.getEnabled() != 1 || !isMpVisible(cfg)) {
+                    // 桌型被删 / 停用 → 该座不出现在影院图（与下单校验一致：座挂的桌型须启用）；
+                    // 临时桌（mp_visible=0，GZ-BEAN-054）同样剔除 —— seat-map 是 mp 面接口，
+                    // 不剔会把临时桌的座位编号外泄给顾客
                     continue;
                 }
                 String typeName = StrUtil.isNotBlank(cfg.getName()) ? cfg.getName() : cfg.getSeatType();
@@ -2617,7 +2692,9 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             for (GzBeanSeat seat : seats) {
                 GzBeanSeatTypeConfig cfg = configMap.get(seat.getSeatTypeConfigId());
                 if (cfg == null || cfg.getEnabled() == null || cfg.getEnabled() != 1) {
-                    // 桌型被删 / 停用 → 该座不出现在看板（与 seat-map 一致）
+                    // 桌型被删 / 停用 → 该座不出现在看板（与 seat-map 一致）。
+                    // ⚠️ 这里**只**看 enabled，绝不能加 mp_visible 过滤（GZ-BEAN-054 / ADR-0023）——
+                    //    临时桌出现在看板正是本功能的全部价值。
                     continue;
                 }
                 String typeName = StrUtil.isNotBlank(cfg.getName()) ? cfg.getName() : cfg.getSeatType();
@@ -2628,6 +2705,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                     .zone(seat.getZone())
                     .seatTypeConfigId(cfg.getId())
                     .typeName(typeName)
+                    .mpVisible(cfg.getMpVisible() == null ? 1 : cfg.getMpVisible())
                     .bookMode(cfg.getBookMode())
                     // 备注纯挂座位（gz_bean_seat.remark）：与是否有人/空闲无关；每日自动清理已在上方 sweep 完成（seat.remark 此刻为当天有效值）
                     .remark(seat.getRemark());
@@ -2735,16 +2813,63 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         }
     }
 
+    /**
+     * 分座 / 排位候选座的桌型档范围（GZ-BEAN-054 / ADR-0023）：**该预约桌型 ∪ 本店全部临时桌**
+     * （{@code mp_visible=0}）。临时桌是周末溢出客的物理承接位，甲方要求线上单也能分到它上面。
+     *
+     * @return 候选桌型档 id 集合（含 booking 自身桌型；booking 桌型为空时只含临时桌）
+     */
+    private List<Long> candidateSeatTypeConfigIds(String tenantId, Long storeId, Long bookingSeatTypeConfigId) {
+        List<Long> ids = new ArrayList<>();
+        if (bookingSeatTypeConfigId != null) {
+            ids.add(bookingSeatTypeConfigId);
+        }
+        for (Long tempId : tempSeatTypeConfigIds(tenantId, storeId)) {
+            if (!ids.contains(tempId)) {
+                ids.add(tempId);
+            }
+        }
+        return ids;
+    }
+
+    /** 本店启用的临时桌（{@code mp_visible=0}）桌型档 id（GZ-BEAN-054）。 */
+    private List<Long> tempSeatTypeConfigIds(String tenantId, Long storeId) {
+        return seatTypeConfigMapper.selectList(Wrappers.<GzBeanSeatTypeConfig>lambdaQuery()
+                .eq(GzBeanSeatTypeConfig::getTenantId, tenantId)
+                .eq(GzBeanSeatTypeConfig::getStoreId, storeId)
+                .eq(GzBeanSeatTypeConfig::getEnabled, 1)
+                .eq(GzBeanSeatTypeConfig::getMpVisible, 0))
+            .stream().map(GzBeanSeatTypeConfig::getId).toList();
+    }
+
+    /**
+     * 给候选座回填 {@code temp} 标 + **临时桌排到最后**（GZ-BEAN-054）。
+     * 店员的肌肉记忆是「先看正常桌」，临时桌只是溢出兜底，不能插在前面打乱顺序。
+     */
+    private List<GzBeanSeatVO> markAndSortTempLast(List<GzBeanSeatVO> seats, List<Long> tempConfigIds) {
+        for (GzBeanSeatVO s : seats) {
+            s.setTemp(s.getSeatTypeConfigId() != null && tempConfigIds.contains(s.getSeatTypeConfigId()));
+        }
+        return seats.stream()
+            .sorted(Comparator.comparing((GzBeanSeatVO s) -> Boolean.TRUE.equals(s.getTemp())))
+            .toList();
+    }
+
     @Override
     public List<GzBeanSeatVO> selectAssignableSeats(Long bookingId) {
         GzBeanBooking booking = requireBookingForBoardOp(bookingId);
         String tenantId = booking.getTenantId();
         Long storeId = booking.getStoreId();
-        // 本店 + 该预约桌型档 + 启用 的座位（核销分座只能选同桌型）
+        // 本店 + 启用 + 「该预约桌型 ∪ 本店临时桌」的座位（GZ-BEAN-054 / ADR-0023 放宽同桌型限制）
+        List<Long> tempConfigIds = tempSeatTypeConfigIds(tenantId, storeId);
+        List<Long> candidateConfigIds = candidateSeatTypeConfigIds(tenantId, storeId, booking.getSeatTypeConfigId());
+        if (candidateConfigIds.isEmpty()) {
+            return List.of();
+        }
         List<GzBeanSeatVO> seats = seatMapper.selectVoList(Wrappers.<GzBeanSeat>lambdaQuery()
             .eq(GzBeanSeat::getTenantId, tenantId)
             .eq(GzBeanSeat::getStoreId, storeId)
-            .eq(GzBeanSeat::getSeatTypeConfigId, booking.getSeatTypeConfigId())
+            .in(GzBeanSeat::getSeatTypeConfigId, candidateConfigIds)
             .eq(GzBeanSeat::getEnabled, 1)
             .orderByAsc(GzBeanSeat::getTableNo)
             .orderByAsc(GzBeanSeat::getSortNo)
@@ -2752,6 +2877,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         if (seats.isEmpty()) {
             return List.of();
         }
+        seats = markAndSortTempLast(seats, tempConfigIds);
         // 排除「当下有人在坐」的座（GZ-BEAN-043，与 assignSeatAtVerify 同口径）：used + 未放座 + slot_end > now，
         //   分钟精度、放座即空——给店员一份「此刻真能分」的候选，早上用过/已放座的座重回可选。
         LocalTime now = LocalTime.now();
@@ -2781,10 +2907,16 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         GzBeanBooking booking = requireBookingForBoardOp(bookingId);
         String tenantId = booking.getTenantId();
         Long storeId = booking.getStoreId();
+        // 候选范围同 selectAssignableSeats：「该预约桌型 ∪ 本店临时桌」（GZ-BEAN-054 / ADR-0023）
+        List<Long> tempConfigIds = tempSeatTypeConfigIds(tenantId, storeId);
+        List<Long> candidateConfigIds = candidateSeatTypeConfigIds(tenantId, storeId, booking.getSeatTypeConfigId());
+        if (candidateConfigIds.isEmpty()) {
+            return List.of();
+        }
         List<GzBeanSeatVO> seats = seatMapper.selectVoList(Wrappers.<GzBeanSeat>lambdaQuery()
             .eq(GzBeanSeat::getTenantId, tenantId)
             .eq(GzBeanSeat::getStoreId, storeId)
-            .eq(GzBeanSeat::getSeatTypeConfigId, booking.getSeatTypeConfigId())
+            .in(GzBeanSeat::getSeatTypeConfigId, candidateConfigIds)
             .eq(GzBeanSeat::getEnabled, 1)
             .orderByAsc(GzBeanSeat::getTableNo)
             .orderByAsc(GzBeanSeat::getSortNo)
@@ -2792,6 +2924,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         if (seats.isEmpty()) {
             return List.of();
         }
+        seats = markAndSortTempLast(seats, tempConfigIds);
         // 目标单 slot 的区间重叠占用（复用看板全天挂座活跃单，内存按区间过滤 + 算占用止界；排除本单自身）
         LocalTime reqStart = booking.getSlotStart();
         LocalTime reqEnd = booking.getSlotEnd();
@@ -3700,10 +3833,8 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
         if (seat.getEnabled() == null || seat.getEnabled() != 1) {
             throw new ServiceException(GzBeanErrorCode.SEAT_DISABLED_MSG, GzBeanErrorCode.SEAT_DISABLED);
         }
-        if (primary.getSeatTypeConfigId() != null && seat.getSeatTypeConfigId() != null
-            && !primary.getSeatTypeConfigId().equals(seat.getSeatTypeConfigId())) {
-            throw new ServiceException(GzBeanErrorCode.SEAT_TYPE_MISMATCH_MSG, GzBeanErrorCode.SEAT_TYPE_MISMATCH);
-        }
+        // 桌型匹配（按锚单；临时桌例外同 assignSeatAtVerify，GZ-BEAN-054 / ADR-0023）
+        assertSeatTypeCompatible(primary.getSeatTypeConfigId(), seat.getSeatTypeConfigId(), "bean-reassign");
         // 合并时段（链按时段升序，连续 → [首.slotStart, 尾.slotEnd)）
         LocalTime chainStart = chain.get(0).getSlotStart();
         LocalTime chainEnd = chain.get(chain.size() - 1).getSlotEnd();
@@ -3776,8 +3907,13 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             return null;
         }
         GzBeanSeat seat = b.getSeatId() == null ? null : seatMapper.selectById(b.getSeatId());
-        GzBeanSeatTypeConfig cfg = b.getSeatTypeConfigId() == null ? null
-            : seatTypeConfigMapper.selectById(b.getSeatTypeConfigId());
+        // 桌型档一律取**座位所属**的（与 selectBoard 同口径）—— 看板上 seatTypeConfigId / typeName /
+        //   bookMode / mpVisible 是**座位维度**字段，前端按它分组渲染。跨桌型分座（GZ-BEAN-054 临时桌）
+        //   后 booking.seatTypeConfigId ≠ seat.seatTypeConfigId，取 booking 的会让本行被归进错误分组
+        //   （甚至凭空多出一个分组）。座位缺失（历史单只剩快照）时回退 booking 自身桌型。
+        Long rowConfigId = seat != null && seat.getSeatTypeConfigId() != null
+            ? seat.getSeatTypeConfigId() : b.getSeatTypeConfigId();
+        GzBeanSeatTypeConfig cfg = rowConfigId == null ? null : seatTypeConfigMapper.selectById(rowConfigId);
         GzBeanStore store = b.getStoreId() == null ? null : storeMapper.selectById(b.getStoreId());
         String typeName = cfg != null && StrUtil.isNotBlank(cfg.getName()) ? cfg.getName()
             : cfg != null ? cfg.getSeatType() : null;
@@ -3786,8 +3922,9 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
             .seatNo(seat != null ? seat.getSeatNo() : b.getSeatNoSnapshot())
             .tableNo(seat != null ? seat.getTableNo() : null)
             .zone(seat != null ? seat.getZone() : null)
-            .seatTypeConfigId(b.getSeatTypeConfigId())
+            .seatTypeConfigId(rowConfigId)
             .typeName(typeName)
+            .mpVisible(cfg == null || cfg.getMpVisible() == null ? 1 : cfg.getMpVisible())
             .bookMode(cfg != null ? cfg.getBookMode() : b.getBookModeSnapshot());
         // 单座即时回显（放座/延时后），无续坐链上下文 → effectiveEnd = 本单 slot_end（保持原行为，
         //   不在此做续坐合并；续坐显示由下一次 selectBoard 全量刷新时按 continuousUntil 校正）。

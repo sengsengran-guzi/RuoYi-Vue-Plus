@@ -98,6 +98,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
     public boolean insertByBo(GzBeanSeatTypeConfigBo bo) {
         validateBookMode(bo.getBookMode());
         validateDayPass(bo);
+        validateMpVisible(bo);
         if (!checkNameUnique(bo)) {
             throw new ServiceException("该门店已存在同名座位类型：" + bo.getName());
         }
@@ -131,6 +132,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         }
         validateBookMode(bo.getBookMode());
         validateDayPass(bo);
+        validateMpVisible(bo);
         if (!checkNameUnique(bo)) {
             throw new ServiceException("该门店已存在同名座位类型：" + bo.getName());
         }
@@ -325,9 +327,28 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         e.setPriceCent(bo.getPriceCent());
         e.setDayPassPriceCent(bo.getDayPassPriceCent() == null ? 0L : bo.getDayPassPriceCent());
         e.setEnabled(bo.getEnabled());
+        // 小程序可见性（GZ-BEAN-054）：空视作 1（正常桌型），与 DB DEFAULT 1 同口径 —— 老客户端/老脚本
+        // 不传该字段时绝不能意外把桌型藏起来
+        e.setMpVisible(bo.getMpVisible() == null ? 1 : bo.getMpVisible());
         e.setSortNo(bo.getSortNo());
         e.setRemark(bo.getRemark());
         return e;
+    }
+
+    /**
+     * 临时桌（{@code mp_visible=0}）与包天套餐互斥校验（GZ-BEAN-054 / ADR-0023）。
+     *
+     * <p>包天是纯小程序概念（mp 下单选包天档 → {@code submitDayPass}），临时桌根本不进小程序，
+     * 配了包天名额 / 包天价就是一组永远不会被读到的死数据，还会让 {@code validateDayPass}
+     * 的上界校验产生误导性报错。直接在入口拒掉。</p>
+     */
+    private void validateMpVisible(GzBeanSeatTypeConfigBo bo) {
+        boolean temp = bo.getMpVisible() != null && bo.getMpVisible() == 0;
+        boolean wantsDayPass = (bo.getDayPassQuota() != null && bo.getDayPassQuota() > 0)
+            || (bo.getDayPassPriceCent() != null && bo.getDayPassPriceCent() > 0L);
+        if (temp && wantsDayPass) {
+            throw new ServiceException("临时桌不支持包天套餐（包天仅对小程序开放的桌型有效），请把包天名额与包天价置 0");
+        }
     }
 
     /** book_mode 必属 whole/seat 的兜底校验（防绕过 Bo @Pattern）。 */
@@ -398,6 +419,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
             lqw.eq(ObjectUtil.isNotNull(q.getStoreId()), GzBeanSeatTypeConfig::getStoreId, q.getStoreId());
             lqw.eq(StrUtil.isNotBlank(q.getSeatType()), GzBeanSeatTypeConfig::getSeatType, q.getSeatType());
             lqw.eq(ObjectUtil.isNotNull(q.getEnabled()), GzBeanSeatTypeConfig::getEnabled, q.getEnabled());
+            lqw.eq(ObjectUtil.isNotNull(q.getMpVisible()), GzBeanSeatTypeConfig::getMpVisible, q.getMpVisible());
         }
         lqw.orderByAsc(GzBeanSeatTypeConfig::getStoreId)
             .orderByAsc(GzBeanSeatTypeConfig::getSortNo)

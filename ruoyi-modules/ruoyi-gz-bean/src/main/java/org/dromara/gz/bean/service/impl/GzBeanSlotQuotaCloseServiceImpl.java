@@ -77,6 +77,13 @@ public class GzBeanSlotQuotaCloseServiceImpl implements IGzBeanSlotQuotaCloseSer
         if (config == null || config.getStoreId() == null || !config.getStoreId().equals(bo.getStoreId())) {
             throw new ServiceException("桌型不存在或不属于该门店：seatTypeConfigId=" + bo.getSeatTypeConfigId());
         }
+        // 临时桌不参与配额关闭（GZ-BEAN-054 / ADR-0023）：配额关闭扣的是**小程序可订量**，而临时桌不进
+        //   小程序、walk-in 又故意绕过配额闸 → 关了也不生效，是个拨了不动的假开关。入口直接拒，
+        //   admin 余量表也已把临时桌过滤掉（selectTypeSlotAvailabilityDetail），此处兜底防绕过。
+        if (config.getMpVisible() != null && config.getMpVisible() == 0) {
+            throw new ServiceException("临时桌不参与小程序配额关闭（它本就不对小程序开放）：seatTypeConfigId="
+                + bo.getSeatTypeConfigId());
+        }
 
         String tenantId = store.getTenantId();
         Long existingId = baseMapper.selectExistingId(

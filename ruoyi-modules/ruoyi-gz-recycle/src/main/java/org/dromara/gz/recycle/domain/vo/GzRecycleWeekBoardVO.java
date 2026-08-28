@@ -35,32 +35,46 @@ public class GzRecycleWeekBoardVO implements Serializable {
     /** 周日（weekStart + 6 天） */
     private LocalDate weekEnd;
 
-    /** 该店 enabled 到店时段列（与 listEnabledByStore 同源顺序） */
+    /**
+     * 看板行 = 该店营业窗口切出的 1 小时格 ∪ 本周活跃单覆盖到的「孤儿格」（GZ-RECYCLE-012 / ADR-0022）。
+     *
+     * <p>并集是必须的：存量整档单（如 10:00-13:00 老单）或 admin 事后改窄窗口后，会有格「实际挡着下单
+     * 但不在窗口里」。不做并集 → 店员看到空白却约不上，最难排查的一类投诉。</p>
+     */
     private List<SlotVO> slots;
 
     /** 被占格（空闲格由前端补） */
     private List<CellVO> cells;
 
-    /** 看板列头：一个到店时段格。 */
+    /** 看板行头：一个 1 小时格（GZ-RECYCLE-012 起不再有 id —— 格由起点唯一标识）。 */
     @Data
     public static class SlotVO implements Serializable {
 
         @Serial
         private static final long serialVersionUID = 1L;
 
-        @JsonSerialize(using = ToStringSerializer.class)
-        private Long id;
-
-        private String label;
-
+        /** 格起点（整点），前端用它做行 key */
         @JsonFormat(pattern = "HH:mm:ss")
         private LocalTime startTime;
 
+        /** 格止点 = startTime + 1h */
         @JsonFormat(pattern = "HH:mm:ss")
         private LocalTime endTime;
+
+        /**
+         * 本行是否在当前营业窗口之外（孤儿格）：被存量单 / 改窄窗口留下的占用挡着，但已不可新约。
+         * 前端应给可辨识标记，避免店员以为「这行是可用时间但一直约不上」。
+         */
+        private Boolean outOfWindow;
     }
 
-    /** 被占格：某日期 × 某到店时段的占用状况。 */
+    /**
+     * 一个占用<b>区间块</b>：某日期 × {@code [slotStart, slotEnd)}（GZ-RECYCLE-012 / ADR-0022）。
+     *
+     * <p>一单发<b>一个</b>块（不是逐格发 N 个），前端按 {@code spanHours} 做 rowspan 合并渲染 ——
+     * 逐格发会把一笔 4 小时单渲成 4 个格，等于把旧模型的 spill 噪音放大 4 倍。
+     * {@code kind='spill'} 随 {@code spill_time_slot_id} 一起退休：多格占用现在由块自身的区间表达。</p>
+     */
     @Data
     public static class CellVO implements Serializable {
 
@@ -69,13 +83,21 @@ public class GzRecycleWeekBoardVO implements Serializable {
 
         private LocalDate apptDate;
 
-        @JsonSerialize(using = ToStringSerializer.class)
-        private Long timeSlotId;
+        /** 块起点（整点，= 本单区间起点向下取整） */
+        @JsonFormat(pattern = "HH:mm:ss")
+        private LocalTime slotStart;
 
-        /** customer（顾客单）/ manual（手动占用）/ spill（大单溢出占用，不可操作，需操作源单） */
+        /** 块止点（整点，= 本单区间止点向上取整） */
+        @JsonFormat(pattern = "HH:mm:ss")
+        private LocalTime slotEnd;
+
+        /** 本块跨几个 1 小时格（前端 rowspan） */
+        private Integer spanHours;
+
+        /** customer（顾客单）/ manual（手动占用） */
         private String kind;
 
-        /** 源单 id（spill 格指向大单本身；customer/manual 格 = 本记录 id） */
+        /** 源单 id */
         @JsonSerialize(using = ToStringSerializer.class)
         private Long appointmentId;
 

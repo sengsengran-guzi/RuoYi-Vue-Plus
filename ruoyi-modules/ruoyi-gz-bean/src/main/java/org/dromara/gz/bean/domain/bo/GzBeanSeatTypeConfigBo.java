@@ -89,6 +89,13 @@ public class GzBeanSeatTypeConfigBo extends BaseEntity {
     @Min(value = 0, message = "enabled 取值仅 0/1", groups = {AddGroup.class, EditGroup.class})
     private Integer enabled;
 
+    /**
+     * 是否对小程序开放：1=开放可订 / 0=仅后台看板可见的**临时桌**（GZ-BEAN-054 / ADR-0023）。
+     * 可空 —— Service 视作 1（正常桌型），保证老客户端/老脚本提交不会意外把桌型藏起来。
+     */
+    @Min(value = 0, message = "mpVisible 取值仅 0/1", groups = {AddGroup.class, EditGroup.class})
+    private Integer mpVisible;
+
     /** 排序值 */
     private Integer sortNo;
 

@@ -17,6 +17,7 @@ import org.dromara.common.web.core.BaseController;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatBatchGenerateBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatQueryBo;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatBatchGenerateResultVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatVO;
 import org.dromara.gz.bean.service.IGzBeanSeatService;
 import org.springframework.validation.annotation.Validated;
@@ -121,8 +122,14 @@ public class GzBeanSeatController extends BaseController {
     @Log(title = "拼豆座位单元批量生成", businessType = BusinessType.INSERT)
     @RepeatSubmit()
     @PostMapping("/batchGenerate")
-    public R<Integer> batchGenerate(@Validated @RequestBody GzBeanSeatBatchGenerateBo bo) {
-        int generated = seatService.batchGenerate(bo);
-        return R.ok("成功生成 / 复活 " + generated + " 个座位单元（已存在的跳过）", generated);
+    public R<GzBeanSeatBatchGenerateResultVO> batchGenerate(@Validated @RequestBody GzBeanSeatBatchGenerateBo bo) {
+        GzBeanSeatBatchGenerateResultVO result = seatService.batchGenerate(bo);
+        // 前缀与已有座位编号跨桌型撞车时，created 可能是 0 —— 必须在 msg 里说清楚，否则店员看到的是
+        // 「点了生成但什么都没多」（seat_no 全店唯一，GZ-BEAN-054）
+        String msg = Boolean.TRUE.equals(result.getHasConflict())
+            ? "生成 / 复活 " + result.getCreated() + " 个座位单元；有 " + result.getConflictSeatNos().size()
+                + " 个编号已被其它桌型占用（" + String.join("、", result.getConflictSeatNos()) + "），请更换编号前缀"
+            : "成功生成 / 复活 " + result.getCreated() + " 个座位单元（已存在的跳过）";
+        return R.ok(msg, result);
     }
 }

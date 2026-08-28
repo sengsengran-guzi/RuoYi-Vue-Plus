@@ -34,6 +34,7 @@ import org.dromara.gz.recycle.domain.vo.GzRecycleProductVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleQtyRangeVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleTimeSlotVO;
 import org.dromara.gz.recycle.domain.vo.GzRecycleWeekBoardVO;
+import org.dromara.gz.recycle.domain.vo.RecycleHourSlotVO;
 import org.dromara.gz.recycle.domain.vo.RecycleSlotAvailabilityVO;
 import org.dromara.gz.recycle.domain.vo.RecycleVerifyCodeVO;
 import org.dromara.gz.recycle.exception.GzRecycleErrorCode;
@@ -55,11 +56,13 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.TreeSet;
 import java.util.Set;
 
 /**
@@ -97,10 +100,12 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
     /**
      * 占用到店时段的活跃态（GZ-RECYCLE-007 + ADR-0021；{@code cancelled / no_show} 释放不占）。
      *
-     * <p>⚠️ 本集合有<b>两份物理拷贝</b>：本 Java 常量（{@link #getSlotAvailability} mp 灰格用）+
-     * {@link GzRecycleAppointmentMapper#countActiveHoldingSlotForUpdate} /
-     * {@link GzRecycleAppointmentMapper#countActiveHoldingSlotExcludingForUpdate} 的 {@code @Select}
-     * 内联字面量（MyBatis 无法引用 Java 常量）。<b>改口径必须两处同步</b>，ADR-0021 坑位 2。</p>
+     * <p>⚠️ 本集合有<b>三份物理拷贝</b>：本 Java 常量（{@link #getSlotAvailability} mp 灰格 + 周看板用）+
+     * {@link GzRecycleAppointmentMapper#countActiveCoveringHourForUpdate} /
+     * {@link GzRecycleAppointmentMapper#countActiveCoveringHourExcludingForUpdate} 的 {@code @Select}
+     * 内联字面量（MyBatis 无法引用 Java 常量）。<b>改口径必须三处同步</b>（ADR-0021 坑位 2），
+     * 漏改任一处 = 防超卖与 UI 口径分叉（漏拦即超卖）。
+     * 一致性由 {@code GzRecycleActiveStatusConsistencyTest} 反射机械守卫。</p>
      */
     private static final List<String> ACTIVE_HOLD_STATUSES =
         List.of("submitted", "confirmed_onsite", "paying", "paid", "payout_failed", STATUS_MANUAL_HOLD);
@@ -123,6 +128,19 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         List.of("submitted", "confirmed_onsite", "paying", "payout_failed");
     /** Redis 锁 TTL（同拼豆 5s） */
     private static final Duration LOCK_TTL = Duration.ofSeconds(5);
+    /**
+     * 每个 1 小时格的容量（GZ-RECYCLE-012 / ADR-0022）：恒 1 单。
+     *
+     * <p>ADR-0022 明确<b>不做</b>门店级可配：甲方从没要过 &gt;1（抱怨是「一天上不了多少人」，
+     * 而 3 档 → 12 格已把日容量翻 4 倍）；放 {@code gz_bean_store} 是错的（那是回收与拼豆<b>共用</b>的
+     * 门店主数据表）；容量 &gt;1 会连锁破坏周看板「一格一单」cell 模型 / 手动占用语义 / 改期归属判定。
+     * 后路已留：容量判定收在 {@code active >= SLOT_CAPACITY} 一个表达式里，将来要配只需把常量换成
+     * {@code slotCapacityOf(storeId, cell)}。</p>
+     */
+    private static final int SLOT_CAPACITY = 1;
+    private static final int MINUTES_PER_HOUR = 60;
+    /** 小时格展示文案格式（"09:00"），前端直接渲染 */
+    private static final DateTimeFormatter HOUR_LABEL_FORMAT = DateTimeFormatter.ofPattern("HH:mm");
 
     // 旧到店档常量（GZ-RECYCLE-006 起到店时段改 admin 按门店可配；下列仅 deriveArrivalSlot 用于
     // 回显历史单的 morning/afternoon 标签，提交链路已改走 timeSlotService）。
@@ -204,21 +222,26 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             throw new ServiceException(GzRecycleErrorCode.ONE_ACTIVE_APPOINTMENT_MSG, GzRecycleErrorCode.ONE_ACTIVE_APPOINTMENT);
         }
 
-        // ④ 到店时段容量防超卖（GZ-RECYCLE-010 抽公共方法，AC7）：本店 enabled 有序列表中定位选中档
-        //    （非法/跨店/已关闭 → 4124）+ 计算下一档 + FLAT 规则（客户 7.08）大单（occupy_next_slot=1）额外占下一
-        //    enabled 档（末档无下一档 → 不占，晚 7 点例外）。(store,date) Redis 锁串行化同门店同日下单 +
-        //    FOR UPDATE 计活跃占用（RR 间隙锁兜底），任一档已占则拒（excludeId=null，普通提交场景）。
-        boolean occupyNext = bucket.getOccupyNextSlot() != null && bucket.getOccupyNextSlot() == 1;
+        // ④ 小时格连占防超卖（GZ-RECYCLE-012 / ADR-0022）：点数档决定占几个 1 小时格
+        //    （N = ceil(duration_minutes/60)，甲方口径「每 50 点 1 小时」），用户只选起始整点，
+        //    系统自动连占 N 格；放不下（越出营业窗口 / 跨午休 gap / 中间任一格被占）即拒。
+        //    (store,date) Redis 锁串行化同门店同日下单（快速失败优化）+ 逐格升序 FOR UPDATE 计活跃占用
+        //    （RR 间隙锁才是正确性根基）。excludeId=null = 普通提交场景。
+        int spanHours = spanHoursOf(bucket.getDurationMinutes());
+        LocalTime slotStart = resolveSubmitStart(bo, bo.getStoreId());
+        // 过期守卫（GZ-RECYCLE-012）：改 12 格后「选今天已过的时间」是高频误操作。不拦就会产出一张
+        //   必然 no_show 的脏单还白占 N 格 —— 而 prod SnailJob 没部署、no_show cron 根本不跑。
+        if (bo.getApptDate() != null && bo.getApptDate().equals(LocalDate.now()) && !slotStart.isAfter(LocalTime.now())) {
+            throw new ServiceException(GzRecycleErrorCode.SLOT_PAST_MSG, GzRecycleErrorCode.SLOT_PAST);
+        }
         String lockKey = LOCK_SLOT_PREFIX + bo.getStoreId() + ":" + bo.getApptDate();
         if (!tryAcquireRedisLock(lockKey)) {
             throw new ServiceException(GzRecycleErrorCode.SLOT_LOCK_BUSY_MSG, GzRecycleErrorCode.SLOT_LOCK_BUSY);
         }
         registerLockReleaseOnTxEnd(lockKey);
 
-        SlotResolution resolution = resolveSlotAndAssertCapacity(
-            tenantId, bo.getStoreId(), bo.getApptDate(), bo.getTimeSlotId(), occupyNext, null);
-        GzRecycleTimeSlotVO chosen = resolution.chosen();
-        Long spillSlotId = resolution.spillSlotId();
+        SlotSpan span = resolveSpanAndAssertCapacity(
+            tenantId, bo.getStoreId(), bo.getApptDate(), slotStart, spanHours, null);
 
         // ⑥ product_snapshot_json 落对象（放开后去 IP：ip 字段留空，兼容老 VO 结构 + 老单展示）
         GzRecycleProductVO snapshot = new GzRecycleProductVO();
@@ -229,9 +252,10 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         snapshot.setCustomIps(List.of());
         snapshot.setQtyBucketCode(bucket.getCode());
         snapshot.setQtyBucketLabel(bucket.getLabel());
-        // 冻结占格面（D21 对抗性测试 F1）：本单占 1 格还是 2 格在提交这一刻定死，此后点数档被禁用 / 被编辑
-        // 都不得改变既有单的占用面（改期重算 spill 读本快照，不活查点数档表）。
-        snapshot.setOccupyNextSlot(occupyNext ? 1 : 0);
+        // 冻结占格面（D21 对抗性测试 F1，GZ-RECYCLE-012 由布尔升级为小时数）：本单占几个小时格在提交
+        // 这一刻定死，此后点数档被禁用 / 被改时长都不得改变既有单的占用面（改期重算 span 只读本快照，
+        // **绝不活查点数档表** —— 活查是超卖入口）。
+        snapshot.setSpanHours(spanHours);
         String productJson = writeProductJson(snapshot);
 
         // ⑦ 生成业务码 + INSERT（放开后：无实物照 / 无微信号快照；带 time_slot_id + spill_time_slot_id；去估价 null）
@@ -246,10 +270,10 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             .matchedDurationMinutes(bucket.getDurationMinutes())
             .estimatedAmountCent(null)
             .apptDate(bo.getApptDate())
-            .slotStart(chosen.getStartTime())
-            .slotEnd(chosen.getEndTime())
-            .timeSlotId(chosen.getId())
-            .spillTimeSlotId(spillSlotId)
+            .slotStart(span.start())
+            .slotEnd(span.end())
+            .timeSlotId(null)
+            .spillTimeSlotId(null)
             .submitImageIds(null)
             .receiverOpenid(user.getOpenid())
             .mobileSnapshot(user.getMobile())
@@ -259,43 +283,94 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             .build();
         baseMapper.insert(entity);
 
-        log.info("[gz-recycle] appointment SUBMIT no={} userId={} storeId={} date={} slot={} spill={} categories={} bucket={} duration={}",
-            appointmentNo, userId, bo.getStoreId(), bo.getApptDate(), chosen.getId(), spillSlotId,
+        log.info("[gz-recycle] appointment SUBMIT no={} userId={} storeId={} date={} span={}-{} hours={} categories={} bucket={} duration={}",
+            appointmentNo, userId, bo.getStoreId(), bo.getApptDate(), span.start(), span.end(), spanHours,
             snapshot.getCategories(), bucket.getCode(), bucket.getDurationMinutes());
 
         return toVO(entity);
     }
 
     @Override
-    public List<RecycleSlotAvailabilityVO> getSlotAvailability(Long storeId, LocalDate date) {
-        List<GzRecycleTimeSlotVO> slots = timeSlotService.listEnabledByStore(storeId);
-        if (slots.isEmpty()) {
-            return List.of();
+    public RecycleSlotAvailabilityVO getSlotAvailability(Long storeId, LocalDate date, String qtyBucketCode) {
+        // 占用小时数：未传 code（用户还没选点数档 / 匿名 browse-first）→ N=1 的纯占用视图。
+        // 未知 code **不抛 4107** —— 本端点 @SaIgnore 匿名可读，抛业务异常会把浏览态用户打断；
+        // 降级 N=1，真正的权威判定由 submit 兜底。
+        int spanHours = 1;
+        if (StrUtil.isNotBlank(qtyBucketCode)) {
+            GzRecycleQtyRangeVO bucket = qtyRangeService.getEnabledByCode(qtyBucketCode);
+            if (bucket != null) {
+                spanHours = spanHoursOf(bucket.getDurationMinutes());
+            }
         }
-        Set<Long> taken = new HashSet<>();
+        return buildHourSlots(storeId, date, spanHours, null);
+    }
+
+    @Override
+    public RecycleSlotAvailabilityVO getHourSlotsForAdmin(Long storeId, LocalDate date, Integer spanHours,
+                                                          Long excludeAppointmentId) {
+        return buildHourSlots(storeId, date, spanHours == null ? 1 : Math.max(1, spanHours), excludeAppointmentId);
+    }
+
+    /**
+     * 小时格可用性核心（mp / admin 共用，无锁）。
+     *
+     * @param excludeAppointmentId 计算占用时排除的单 id（改期场景传自身；null = 不排除）
+     */
+    private RecycleSlotAvailabilityVO buildHourSlots(Long storeId, LocalDate date, int spanHours,
+                                                     Long excludeAppointmentId) {
+        RecycleSlotAvailabilityVO result = new RecycleSlotAvailabilityVO();
+        result.setDate(date);
+        result.setSpanHours(spanHours);
+
+        // 按目标日期取生效窗口（GZ-RECYCLE-015：weekdays + 生效区间）—— 周末与平时营业时间可不同
+        List<LocalTime> cells = sliceWindowsToHourCells(timeSlotService.listEnabledForDate(storeId, date));
+        if (cells.isEmpty()) {
+            result.setSlots(List.of());
+            return result;
+        }
+
+        // 无锁读：一次拉当日活跃单，内存展开成「被占格集合」。与 submit 的 FOR UPDATE 之间有天然竞态窗口
+        // （UI 显示可约 → 提交拿 4122），这是有意设计 —— 展示路径不该为了消除竞态去加锁。
+        Set<LocalTime> taken = new HashSet<>();
         if (date != null) {
             List<GzRecycleAppointment> active = baseMapper.selectList(Wrappers.<GzRecycleAppointment>lambdaQuery()
                 .eq(GzRecycleAppointment::getStoreId, storeId)
                 .eq(GzRecycleAppointment::getApptDate, date)
                 .in(GzRecycleAppointment::getStatus, ACTIVE_HOLD_STATUSES));
             for (GzRecycleAppointment a : active) {
-                if (a.getTimeSlotId() != null) {
-                    taken.add(a.getTimeSlotId());
+                // 改期弹窗：本单自己的原区间不算占用，否则相邻起点永远选不了
+                if (excludeAppointmentId != null && excludeAppointmentId.equals(a.getId())) {
+                    continue;
                 }
-                if (a.getSpillTimeSlotId() != null) {
-                    taken.add(a.getSpillTimeSlotId());
-                }
+                taken.addAll(coveredHourCells(a.getSlotStart(), a.getSlotEnd()));
             }
         }
-        return slots.stream().map(s -> {
-            RecycleSlotAvailabilityVO vo = new RecycleSlotAvailabilityVO();
-            vo.setId(s.getId());
-            vo.setLabel(s.getLabel());
-            vo.setStartTime(s.getStartTime());
-            vo.setEndTime(s.getEndTime());
-            vo.setTaken(taken.contains(s.getId()));
-            return vo;
-        }).toList();
+
+        boolean isToday = date != null && date.equals(LocalDate.now());
+        LocalTime now = LocalTime.now();
+        Set<LocalTime> cellSet = new HashSet<>(cells);
+        List<RecycleHourSlotVO> slots = new ArrayList<>(cells.size());
+        for (LocalTime cell : cells) {
+            RecycleHourSlotVO vo = new RecycleHourSlotVO();
+            vo.setStartTime(cell);
+            vo.setEndTime(cell.plusHours(1));
+            vo.setLabel(cell.format(HOUR_LABEL_FORMAT));
+            boolean cellTaken = taken.contains(cell);
+            boolean cellPast = isToday && !cell.isAfter(now);
+            vo.setTaken(cellTaken);
+            vo.setPast(cellPast);
+            // 可选 = 自己没被占、没过时，且**连续 N 格**都在营业窗口内且都没被占
+            //（与 resolveSpanAndAssertCapacity 同口径，逐格判定不走「起点+N ≤ 窗口尾」的近似）
+            boolean fits = !cellTaken && !cellPast;
+            for (int i = 1; fits && i < spanHours; i++) {
+                LocalTime next = cell.plusHours(i);
+                fits = cellSet.contains(next) && !taken.contains(next);
+            }
+            vo.setSelectable(fits);
+            slots.add(vo);
+        }
+        result.setSlots(slots);
+        return result;
     }
 
     @Override
@@ -313,68 +388,208 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
     }
 
     /** 在本店 enabled 时段有序列表中定位 timeSlotId 的下标（未命中返 -1）。 */
-    private int indexOfSlot(List<GzRecycleTimeSlotVO> slots, Long timeSlotId) {
-        if (timeSlotId == null) {
-            return -1;
-        }
-        for (int i = 0; i < slots.size(); i++) {
-            if (timeSlotId.equals(slots.get(i).getId())) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    /** {@link #resolveSlotAndAssertCapacity} 结果：定位到的档 + 按位置计算出的 spill 档 id（可空）。 */
-    private record SlotResolution(GzRecycleTimeSlotVO chosen, Long spillSlotId) {
+    /**
+     * {@link #resolveSpanAndAssertCapacity} 结果：占用区间起 / 止 + 覆盖到的 1 小时格（升序）。
+     *
+     * @param start 起始整点（左闭）
+     * @param end   结束整点（右开）= start + N 小时
+     * @param cells 覆盖的格起点，升序；调用方无需再算
+     */
+    private record SlotSpan(LocalTime start, LocalTime end, List<LocalTime> cells) {
     }
 
     /**
-     * 时段合法性 + 容量防超卖公共方法（GZ-RECYCLE-010 AC7，submit / manualHold / reschedule 三处共用）。
+     * 起点合法性 + 连占 N 格放得下 + 逐格防超卖（GZ-RECYCLE-012 / ADR-0022；
+     * submit / manualHold / reschedule 三处共用，取代旧的 {@code resolveSlotAndAssertCapacity}）。
      *
-     * <p>① 在本店 enabled 有序列表中定位 {@code timeSlotId}（非法/跨店/已关闭 → 4124 SLOT_INVALID）；
-     * ② 若 {@code occupyNext} 为真且非末档，计算下一档为 spill；③ 按 {@code excludeId} 是否为空选用
-     * {@code countActiveHoldingSlotForUpdate}（普通场景）或 {@code countActiveHoldingSlotExcludingForUpdate}
-     * （改期场景，排除自身，ADR-0021 坑位 4）判定本档 / spill 档是否已被占（4122 / 4123）。</p>
+     * <p>① 门店营业窗口按 1h 切格（空 → 4124）；② 起点须整点且落在格上（否则 4124）；
+     * ③ <b>逐格</b>校验连占 N 格都在窗口内（越出窗口尾 / 跨午休 gap → 4123）；
+     * ④ 按格<b>升序</b>逐格 {@code FOR UPDATE} 判占（起始格被占 → 4122；后续格被占 → 4123）。</p>
      *
-     * <p>调用方须已持有 {@code (store, date)} Redis 锁（本方法不抢锁，由调用方按各自的锁粒度处理——
+     * <p>调用方须已持有 {@code (store, date)} Redis 锁（本方法不抢锁，由调用方按各自的锁粒度处理 ——
      * submit/manualHold 锁目标 date，reschedule 只锁<b>新</b> date，ADR-0021 §2 约束 3）。</p>
      *
-     * @param tenantId  租户 id（显式传）
-     * @param storeId   门店 id
-     * @param apptDate  目标日期
-     * @param timeSlotId 目标到店时段 id
-     * @param occupyNext 是否需要额外占用下一档（点数档 occupy_next_slot=1；手动占用恒 false）
-     * @param excludeId 改期场景传本单 id（排除自身）；普通提交 / 手动占用传 null
-     * @return 定位到的档 + spill 档 id（无 spill 时为 null）
+     * @param tenantId   租户 id（显式传）
+     * @param storeId    门店 id
+     * @param apptDate   目标日期
+     * @param slotStart  目标起始整点
+     * @param spanHours  占用小时数（点数档 {@code ceil(duration/60)}；手动占用恒 1）
+     * @param excludeId  改期场景传本单 id（排除自身）；普通提交 / 手动占用传 null
+     * @return 占用区间 + 覆盖格
      */
-    private SlotResolution resolveSlotAndAssertCapacity(String tenantId, Long storeId, LocalDate apptDate,
-                                                          Long timeSlotId, boolean occupyNext, Long excludeId) {
-        List<GzRecycleTimeSlotVO> enabledSlots = timeSlotService.listEnabledByStore(storeId);
-        int idx = indexOfSlot(enabledSlots, timeSlotId);
-        if (idx < 0) {
-            throw new ServiceException(GzRecycleErrorCode.SLOT_INVALID_MSG, GzRecycleErrorCode.SLOT_INVALID);
+    /**
+     * 提交起点解析（GZ-RECYCLE-012 过渡期）：新契约 {@code slotStart} 优先；
+     * 老版本小程序只发 {@code timeSlotId} → 映射为该营业窗口的 {@code start_time}。
+     *
+     * <p>小程序发布后用户端有缓存版本，老包发不出 {@code slotStart}。不做这层映射它们会全部 400，
+     * 而甲方的门店在过渡期照常营业。<b>上线两周后连同 BO 字段一起删</b>。</p>
+     */
+    private LocalTime resolveSubmitStart(GzRecycleAppointmentSubmitBo bo, Long storeId) {
+        if (bo.getSlotStart() != null) {
+            return bo.getSlotStart();
         }
-        GzRecycleTimeSlotVO chosen = enabledSlots.get(idx);
-        GzRecycleTimeSlotVO next = (idx + 1 < enabledSlots.size()) ? enabledSlots.get(idx + 1) : null;
-        boolean occupiesNext = occupyNext && next != null;
-        Long spillSlotId = occupiesNext ? next.getId() : null;
-
-        long chosenTaken = (excludeId == null)
-            ? baseMapper.countActiveHoldingSlotForUpdate(tenantId, storeId, apptDate, chosen.getId())
-            : baseMapper.countActiveHoldingSlotExcludingForUpdate(tenantId, storeId, apptDate, chosen.getId(), excludeId);
-        if (chosenTaken > 0) {
-            throw new ServiceException(GzRecycleErrorCode.SLOT_TAKEN_MSG, GzRecycleErrorCode.SLOT_TAKEN);
-        }
-        if (occupiesNext) {
-            long spillTaken = (excludeId == null)
-                ? baseMapper.countActiveHoldingSlotForUpdate(tenantId, storeId, apptDate, spillSlotId)
-                : baseMapper.countActiveHoldingSlotExcludingForUpdate(tenantId, storeId, apptDate, spillSlotId, excludeId);
-            if (spillTaken > 0) {
-                throw new ServiceException(GzRecycleErrorCode.SLOT_SPILL_BLOCKED_MSG, GzRecycleErrorCode.SLOT_SPILL_BLOCKED);
+        if (bo.getTimeSlotId() != null) {
+            LocalTime legacyStart = timeSlotService.listEnabledForDate(storeId, bo.getApptDate()).stream()
+                .filter(w -> bo.getTimeSlotId().equals(w.getId()))
+                .map(GzRecycleTimeSlotVO::getStartTime)
+                .findFirst().orElse(null);
+            if (legacyStart != null) {
+                log.info("[gz-recycle] legacy submit via timeSlotId={} → slotStart={}（GZ-RECYCLE-012 过渡 shim）",
+                    bo.getTimeSlotId(), legacyStart);
+                return legacyStart;
             }
         }
-        return new SlotResolution(chosen, spillSlotId);
+        throw new ServiceException(GzRecycleErrorCode.SLOT_INVALID_MSG, GzRecycleErrorCode.SLOT_INVALID);
+    }
+
+    private SlotSpan resolveSpanAndAssertCapacity(String tenantId, Long storeId, LocalDate apptDate,
+                                                  LocalTime slotStart, int spanHours, Long excludeId) {
+        // ① 门店**该日生效**的营业窗口 → 1h 格序列（残格不生成、午休 gap 天然不在集合内）。
+        //    GZ-RECYCLE-015：按 weekdays + 生效区间过滤 —— 周末与平时营业时间可不同。
+        List<LocalTime> cells = sliceWindowsToHourCells(timeSlotService.listEnabledForDate(storeId, apptDate));
+        if (cells.isEmpty()) {
+            throw new ServiceException(GzRecycleErrorCode.SLOT_INVALID_MSG, GzRecycleErrorCode.SLOT_INVALID);
+        }
+        // ② 起点必须是整点、且落在营业窗口切出的格上
+        if (slotStart == null || !isWholeHour(slotStart) || !cells.contains(slotStart)) {
+            throw new ServiceException(GzRecycleErrorCode.SLOT_INVALID_MSG, GzRecycleErrorCode.SLOT_INVALID);
+        }
+        // ③ 连占 N 格必须**逐格**都在营业窗口内。
+        //    ⚠️ 不能只判「slotStart + N ≤ 窗口结束」—— 那会让 12:00 起 3h 的单跨过 13-14 午休 gap，
+        //    把店员的休息时间排上单（ADR-0022 坑位 3）。
+        int span = Math.max(1, spanHours);
+        List<LocalTime> reqCells = new ArrayList<>(span);
+        for (int i = 0; i < span; i++) {
+            LocalTime gi = slotStart.plusHours(i);
+            if (!cells.contains(gi)) {
+                throw new ServiceException(GzRecycleErrorCode.slotSpanBlockedMsg(span),
+                    GzRecycleErrorCode.SLOT_SPAN_BLOCKED);
+            }
+            reqCells.add(gi);
+        }
+        // ④ 逐格 FOR UPDATE 防超卖。**必须升序**：交叠区间的加锁顺序一致才无死锁（镜像拼豆 submitPaid）。
+        for (LocalTime gi : reqCells) {
+            long active = (excludeId == null)
+                ? baseMapper.countActiveCoveringHourForUpdate(tenantId, storeId, apptDate, gi)
+                : baseMapper.countActiveCoveringHourExcludingForUpdate(tenantId, storeId, apptDate, gi, excludeId);
+            if (active >= SLOT_CAPACITY) {
+                // 起始格被占 = 「换个时间」；后续格被占 = 「这个时长放不下」，两种文案对用户含义完全不同
+                if (gi.equals(slotStart)) {
+                    throw new ServiceException(GzRecycleErrorCode.SLOT_TAKEN_MSG, GzRecycleErrorCode.SLOT_TAKEN);
+                }
+                throw new ServiceException(GzRecycleErrorCode.slotSpanBlockedMsg(span),
+                    GzRecycleErrorCode.SLOT_SPAN_BLOCKED);
+            }
+        }
+        return new SlotSpan(slotStart, slotStart.plusHours(span), reqCells);
+    }
+
+    /**
+     * 把门店启用营业窗口切成升序去重的 1 小时格起点（逐字镜像拼豆 {@code sliceWindowsToHourSlots}）。
+     *
+     * <p>窗口 {@code [s, e)} → {@code s, s+1h, ..., e-1h}；<b>残格不生成</b>（10:00-13:30 只出 10/11/12），
+     * 多窗口之间的 gap（午休）天然不在集合内 —— 这正是「跨窗口不可连占」的实现基础。</p>
+     */
+    private List<LocalTime> sliceWindowsToHourCells(List<GzRecycleTimeSlotVO> windows) {
+        TreeSet<LocalTime> cells = new TreeSet<>();
+        if (windows == null) {
+            return List.of();
+        }
+        for (GzRecycleTimeSlotVO w : windows) {
+            LocalTime start = w.getStartTime();
+            LocalTime end = w.getEndTime();
+            if (start == null || end == null || !start.isBefore(end)) {
+                continue;
+            }
+            // ⚠️ 用「距零点分钟数」整数算，不用 LocalTime.plusHours —— LocalTime 是**环形**的：
+            //    23:00 + 1h = 00:00，而 00:00.isAfter(23:00) 为 false，会让 end=23:00 的窗口
+            //    多吐一个窗口外的 23:00 格（真库端到端逮到：09:00-23:00 出了 15 格而不是 14 格）。
+            //    两端已由 validateTimeRange 保证整点，直接按小时数循环即可。
+            int startMinute = start.getHour() * MINUTES_PER_HOUR;
+            int endMinute = end.getHour() * MINUTES_PER_HOUR;
+            for (int m = startMinute; m + MINUTES_PER_HOUR <= endMinute; m += MINUTES_PER_HOUR) {
+                cells.add(LocalTime.of(m / MINUTES_PER_HOUR, 0));
+            }
+        }
+        return new ArrayList<>(cells);
+    }
+
+    /** 整点判定（分 = 秒 = 纳秒 = 0），镜像拼豆 {@code isWholeHour}。 */
+    private boolean isWholeHour(LocalTime t) {
+        return t != null && t.getMinute() == 0 && t.getSecond() == 0 && t.getNano() == 0;
+    }
+
+    /**
+     * 点数档 → 占用小时数：{@code N = max(1, ceil(durationMinutes / 60))}（甲方口径「每 50 点 1 小时」）。
+     * 空 / 非正值兜到 1 —— 占 0 格是无意义状态，会让防超卖整段空转。
+     */
+    private int spanHoursOf(Integer durationMinutes) {
+        if (durationMinutes == null || durationMinutes <= 0) {
+            return 1;
+        }
+        return Math.max(1, (durationMinutes + MINUTES_PER_HOUR - 1) / MINUTES_PER_HOUR);
+    }
+
+    /**
+     * 把区间 {@code [start, end)} 展开为它覆盖到的整点格（起点下取整、止点上取整）。
+     *
+     * <p>展示路径（可用性 / 周看板）专用，<b>无锁</b>。向外取整是为了兼容历史非整点单
+     * （如 Kevin 手工加过的 19:30-21:00）—— 宁可多标一格已占，也不能漏标（漏标 = UI 显示可约但提交被拒）。</p>
+     */
+    private List<LocalTime> coveredHourCells(LocalTime start, LocalTime end) {
+        if (start == null || end == null || !start.isBefore(end)) {
+            return List.of();
+        }
+        LocalTime floor = LocalTime.of(start.getHour(), 0);
+        List<LocalTime> cells = new ArrayList<>();
+        for (LocalTime cursor = floor; cursor.isBefore(end); cursor = cursor.plusHours(1)) {
+            cells.add(cursor);
+            if (cursor.plusHours(1).isBefore(cursor)) {
+                break; // 23:00 环形保护
+            }
+        }
+        return cells;
+    }
+
+    /**
+     * 已有单的占用小时数 —— 改期重算 span 用（GZ-RECYCLE-012，延续 D21 F1「<b>绝不活查点数档表</b>」铁律）。
+     *
+     * <p>禁止活查的理由：禁用某点数档 / 改它的时长都是正常运营动作，若改期时活查
+     * （{@code getEnabledByCode} 对禁用档返 null），既有大单的后续小时会被静默放开 →
+     * 与顾客实际到店时长<b>物理双占</b>（超卖）。口径不确定时一律偏向不放开格。</p>
+     *
+     * <p>回退链：</p>
+     * <ul>
+     *   <li>{@code source=manual} → 当前区间宽度（新手动行恒 1；存量整档行保持它原本挡住的宽度）</li>
+     *   <li>{@code source=mp} → ① 快照 {@code product_snapshot_json.spanHours}（012 后新单必有）
+     *       → ② {@code matched_duration_minutes}（提交时冻结列，老单最可信来源）
+     *       → ③ 当前区间宽度</li>
+     * </ul>
+     */
+    private int resolveSpanHoursForExisting(GzRecycleAppointment appt) {
+        int currentWidth = currentSpanHours(appt);
+        if (SOURCE_MANUAL.equals(appt.getSource())) {
+            return Math.max(1, currentWidth);
+        }
+        Integer snapshotSpan = readSnapshotSpanHours(appt);
+        if (snapshotSpan != null && snapshotSpan > 0) {
+            return snapshotSpan;
+        }
+        Integer matched = appt.getMatchedDurationMinutes();
+        if (matched != null && matched > 0) {
+            return spanHoursOf(matched);
+        }
+        return Math.max(1, currentWidth);
+    }
+
+    /** 本单当前区间跨几个整点格（止点向上取整，兼容历史非整点单）。 */
+    private int currentSpanHours(GzRecycleAppointment appt) {
+        return coveredHourCells(appt.getSlotStart(), appt.getSlotEnd()).size();
+    }
+
+    /** 从 product_snapshot_json 读提交时冻结的占用小时数；缺失 → null（交由回退链兜底）。 */
+    private Integer readSnapshotSpanHours(GzRecycleAppointment appt) {
+        return parseProducts(appt.getProductSnapshotJson()).getSpanHours();
     }
 
     /* ---------------- 时段容量防超卖 Redis 锁（镜像拼豆 GzBeanBookingServiceImpl） ---------------- */
@@ -758,11 +973,14 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
 
         // 多格 = 多行，同一事务内逐格校验+INSERT；任一格 4122/4123/4124 抛异常 → @Transactional 整体回滚，
         // 已 INSERT 的行随事务回滚一并撤销（AC9 all-or-nothing，不留残行）。
+        // ⚠️ 入参先 distinct + 升序（GZ-RECYCLE-012）：前端多选顺序不可信，乱序会与 submit 的升序加锁
+        //   撞出死锁（两个店员同时占 [10,11] / [11,10]）。每格 span=1 —— ADR-0021「要占两格就选两格建两行」
+        //   的规则在小时格模型下更自然。
+        List<LocalTime> starts = bo.getSlotStarts().stream().distinct().sorted().toList();
         List<GzRecycleAppointment> inserted = new ArrayList<>();
-        for (Long slotId : bo.getTimeSlotIds()) {
-            SlotResolution resolution = resolveSlotAndAssertCapacity(
-                tenantId, bo.getStoreId(), bo.getApptDate(), slotId, false, null);
-            GzRecycleTimeSlotVO chosen = resolution.chosen();
+        for (LocalTime start : starts) {
+            SlotSpan span = resolveSpanAndAssertCapacity(
+                tenantId, bo.getStoreId(), bo.getApptDate(), start, 1, null);
             String appointmentNo = apptNoGenerator.generate();
             GzRecycleAppointment entity = GzRecycleAppointment.builder()
                 .appointmentNo(appointmentNo)
@@ -771,9 +989,9 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
                 .storeId(bo.getStoreId())
                 .productSnapshotJson(null)
                 .apptDate(bo.getApptDate())
-                .slotStart(chosen.getStartTime())
-                .slotEnd(chosen.getEndTime())
-                .timeSlotId(chosen.getId())
+                .slotStart(span.start())
+                .slotEnd(span.end())
+                .timeSlotId(null)
                 .spillTimeSlotId(null)
                 .submitImageIds(null)
                 .receiverOpenid(null)
@@ -787,8 +1005,8 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             inserted.add(entity);
         }
 
-        log.info("[gz-recycle] manualHold storeId={} date={} slots={} count={} operator={}",
-            bo.getStoreId(), bo.getApptDate(), bo.getTimeSlotIds(), inserted.size(), operator);
+        log.info("[gz-recycle] manualHold storeId={} date={} starts={} count={} operator={}",
+            bo.getStoreId(), bo.getApptDate(), starts, inserted.size(), operator);
         return inserted.stream().map(this::toAdminVO).toList();
     }
 
@@ -814,6 +1032,32 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
     }
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
+    public GzRecycleAppointmentAdminVO cancelCustomerAppointment(Long id, String operator) {
+        GzRecycleAppointment appt = baseMapper.selectById(id);
+        if (appt == null) {
+            throw new ServiceException(GzRecycleErrorCode.APPOINTMENT_NOT_FOUND_MSG, GzRecycleErrorCode.APPOINTMENT_NOT_FOUND);
+        }
+        // 手动占用走 releaseHold，不走本路径（两条路径的审计语义 / 错误码不同，别合并）
+        if (!SOURCE_MP.equals(appt.getSource())) {
+            throw new ServiceException(GzRecycleErrorCode.HOLD_RELEASE_NOT_ALLOWED_MSG, GzRecycleErrorCode.HOLD_RELEASE_NOT_ALLOWED);
+        }
+        // ⚠️ 资金守卫：回收是反向打款（店家付钱给顾客）。paying / paid / payout_failed 有钱在途或已出账，
+        //    取消会让账面与实际打款脱节 → 一律 4132。前端也会先挡一道，这里是真源。
+        if (!STATUS_SUBMITTED.equals(appt.getStatus()) && !STATUS_CONFIRMED_ONSITE.equals(appt.getStatus())) {
+            throw new ServiceException(GzRecycleErrorCode.CANCEL_NOT_ALLOWED_MSG, GzRecycleErrorCode.CANCEL_NOT_ALLOWED);
+        }
+        int affected = baseMapper.cancelCustomerAppointment(id, appt.getVersion(), operator, LocalDateTime.now());
+        if (affected == 0) {
+            // version 漂移（并发取消 / 状态被并发推进到 paying）→ 同码，不静默成功
+            throw new ServiceException(GzRecycleErrorCode.CANCEL_NOT_ALLOWED_MSG, GzRecycleErrorCode.CANCEL_NOT_ALLOWED);
+        }
+        log.info("[gz-recycle] cancelCustomerAppointment id={} appointment_no={} span={}-{} operator={}",
+            id, appt.getAppointmentNo(), appt.getSlotStart(), appt.getSlotEnd(), operator);
+        return toAdminVO(baseMapper.selectById(id));
+    }
+
+    @Override
     @Transactional(rollbackFor = Exception.class, isolation = Isolation.REPEATABLE_READ)
     public GzRecycleAppointmentAdminVO reschedule(Long id, GzRecycleRescheduleBo bo, String operator) {
         String tenantId = TenantHelper.getTenantId();
@@ -833,8 +1077,9 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             throw new ServiceException(GzRecycleErrorCode.RESCHEDULE_DATE_PAST_MSG, GzRecycleErrorCode.RESCHEDULE_DATE_PAST);
         }
 
-        // occupyNext 取原单提交时冻结的占格面（手动占用无点数档恒 false，坑位 5：spill 恒 NULL）。
-        boolean occupyNext = resolveOccupyNextForReschedule(appt);
+        // 占用小时数取原单提交时冻结的占格面（GZ-RECYCLE-012；手动占用取当前区间宽度）。
+        // **绝不活查点数档表** —— 见 resolveSpanHoursForExisting 的 javadoc（活查是超卖入口）。
+        int spanHours = resolveSpanHoursForExisting(appt);
 
         // 锁只抢目标 (store, 新 date)（ADR-0021 §2 约束 3；旧格释放不需要锁，规避双向改期死锁）。
         // 不允许跨门店改期：store_id 恒取原单不变。
@@ -845,62 +1090,21 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         }
         registerLockReleaseOnTxEnd(lockKey);
 
-        // 容量校验排除自身（ADR-0021 坑位 4）：excludeId=id，否则大单本身的旧 spill 会把自己挡回 4122/4123。
-        SlotResolution resolution = resolveSlotAndAssertCapacity(
-            tenantId, storeId, bo.getApptDate(), bo.getTimeSlotId(), occupyNext, id);
-        GzRecycleTimeSlotVO chosen = resolution.chosen();
-        Long spillSlotId = resolution.spillSlotId();
+        // 容量校验排除自身（ADR-0021 坑位 4）：excludeId=id，否则本单原区间会把自己挡回 4122/4123
+        // （典型翻车：改到相邻起点，原区间正覆盖着目标格 → 相邻起点永远选不了）。
+        SlotSpan span = resolveSpanAndAssertCapacity(
+            tenantId, storeId, bo.getApptDate(), bo.getSlotStart(), spanHours, id);
 
         LocalDateTime now = LocalDateTime.now();
-        int affected = baseMapper.reschedule(id, appt.getVersion(), bo.getApptDate(), chosen.getId(),
-            chosen.getStartTime(), chosen.getEndTime(), spillSlotId, operator, now);
+        int affected = baseMapper.reschedule(id, appt.getVersion(), bo.getApptDate(),
+            span.start(), span.end(), operator, now);
         if (affected == 0) {
             // version 漂移（并发改期 / 状态被并发推进）→ 4128，不静默成功
             throw new ServiceException(GzRecycleErrorCode.RESCHEDULE_NOT_ALLOWED_MSG, GzRecycleErrorCode.RESCHEDULE_NOT_ALLOWED);
         }
-        log.info("[gz-recycle] reschedule id={} appointment_no={} → date={} slot={} spill={} occupyNext={} operator={}",
-            id, appt.getAppointmentNo(), bo.getApptDate(), chosen.getId(), spillSlotId, occupyNext, operator);
+        log.info("[gz-recycle] reschedule id={} appointment_no={} → date={} span={}-{} hours={} operator={}",
+            id, appt.getAppointmentNo(), bo.getApptDate(), span.start(), span.end(), spanHours, operator);
         return toAdminVO(baseMapper.selectById(id));
-    }
-
-    /**
-     * 改期时判定本单是否仍需额外占用下一档（D21 对抗性测试 F1 修复）。
-     *
-     * <p><b>占格面在提交那一刻定死</b>，改期只是换位置、不改「占几格」。因此这里<b>绝不能</b>去活查点数档表
-     * （{@code getEnabledByCode}）—— 点数档被禁用 / 其 {@code occupy_next_slot} 被编辑都是正常运营动作，
-     * 一旦活查，任何对既有大单的改期都会把 spill 静默算成 false → {@code spill_time_slot_id} 被显式置 NULL
-     * → 该格立刻对外放开，与本单实际到店时长物理双占（超卖）。</p>
-     *
-     * <p>取值优先级：</p>
-     * <ol>
-     *   <li><b>快照</b> {@code product_snapshot_json.occupyNextSlot}（提交时冻结，本修复后的新单必有）；</li>
-     *   <li>旧单无快照 → 按 code 查点数档 <b>忽略 enabled</b>（{@link IGzRecycleQtyRangeService#getByCodeIgnoringEnabled}），
-     *       档被禁用仍能取回原口径；</li>
-     *   <li>兜底加固：本单当前<b>已实际占着</b> spill 格（{@code spill_time_slot_id} 非空）→ 无论上面算出什么都保持
-     *       两格（口径不确定时一律偏向「不放开格」，宁可多挡一格 4123 也不制造双占）。</li>
-     * </ol>
-     *
-     * <p>手动占用（{@code source='manual'}）无点数档 → 恒 false（ADR-0021 §2 约束 2）。</p>
-     */
-    private boolean resolveOccupyNextForReschedule(GzRecycleAppointment appt) {
-        if (!SOURCE_MP.equals(appt.getSource())) {
-            return false;
-        }
-        GzRecycleProductVO product = parseProducts(appt.getProductSnapshotJson());
-        Integer frozen = product.getOccupyNextSlot();
-        boolean occupyNext;
-        if (frozen != null) {
-            occupyNext = frozen == 1;
-        } else {
-            GzRecycleQtyRangeVO bucket = qtyRangeService.getByCodeIgnoringEnabled(product.getQtyBucketCode());
-            occupyNext = bucket != null && bucket.getOccupyNextSlot() != null && bucket.getOccupyNextSlot() == 1;
-            if (!occupyNext && appt.getSpillTimeSlotId() != null) {
-                log.warn("[gz-recycle] reschedule id={} 无 occupyNextSlot 快照且点数档 {} 已不可判定，"
-                        + "但本单实际占着 spill 格 {} → 保持两格占用（防放开造成双占）",
-                    appt.getId(), product.getQtyBucketCode(), appt.getSpillTimeSlotId());
-            }
-        }
-        return occupyNext || appt.getSpillTimeSlotId() != null;
     }
 
     @Override
@@ -909,55 +1113,60 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         LocalDate monday = weekStart == null ? LocalDate.now().with(DayOfWeek.MONDAY) : weekStart.with(DayOfWeek.MONDAY);
         LocalDate sunday = monday.plusDays(6);
 
-        List<GzRecycleTimeSlotVO> enabledSlots = timeSlotService.listEnabledByStore(storeId);
-        List<GzRecycleWeekBoardVO.SlotVO> slotVOs = enabledSlots.stream().map(s -> {
-            GzRecycleWeekBoardVO.SlotVO svo = new GzRecycleWeekBoardVO.SlotVO();
-            svo.setId(s.getId());
-            svo.setLabel(s.getLabel());
-            svo.setStartTime(s.getStartTime());
-            svo.setEndTime(s.getEndTime());
-            return svo;
-        }).toList();
-
-        // 一条批量查询取整周（AC26，不按 7×N 档循环单查），在内存分格。
+        // 一条批量查询取整周（AC26，不按 7×N 格循环单查），在内存展开成小时格。
         List<GzRecycleAppointment> weekRows = baseMapper.selectList(Wrappers.<GzRecycleAppointment>lambdaQuery()
             .eq(GzRecycleAppointment::getStoreId, storeId)
             .between(GzRecycleAppointment::getApptDate, monday, sunday)
             .in(GzRecycleAppointment::getStatus, ACTIVE_HOLD_STATUSES));
 
+        // 行头 = 本周**七天各自**生效窗口切出的小时格并集 ∪ 本周活跃单覆盖到但不在任何窗口内的「孤儿格」。
+        // ⚠️ 两个并集缺一不可：
+        //   ① 七天并集（GZ-RECYCLE-015）—— 周末与平时营业时间可不同（如平时 10-22、周末 9-23），
+        //      只取某一天的窗口会让另几天的格在矩阵里没有行；
+        //   ② 孤儿格（GZ-RECYCLE-012）—— 存量整档单 / admin 事后改窄窗口留下的占用，
+        //      不并进来就会出现「这一格实际挡着下单，但看板上根本没有这一行」，
+        //      店员看到空白却约不上，是最难排查的一类投诉。
+        TreeSet<LocalTime> windowCellSet = new TreeSet<>();
+        for (int i = 0; i < 7; i++) {
+            windowCellSet.addAll(sliceWindowsToHourCells(
+                timeSlotService.listEnabledForDate(storeId, monday.plusDays(i))));
+        }
+        List<LocalTime> windowCells = new ArrayList<>(windowCellSet);
+        TreeSet<LocalTime> allCells = new TreeSet<>(windowCells);
+        for (GzRecycleAppointment row : weekRows) {
+            allCells.addAll(coveredHourCells(row.getSlotStart(), row.getSlotEnd()));
+        }
+        List<GzRecycleWeekBoardVO.SlotVO> slotVOs = allCells.stream().map(c -> {
+            GzRecycleWeekBoardVO.SlotVO svo = new GzRecycleWeekBoardVO.SlotVO();
+            svo.setStartTime(c);
+            svo.setEndTime(c.plusHours(1));
+            svo.setOutOfWindow(!windowCells.contains(c));
+            return svo;
+        }).toList();
+
+        // 每单发一个「区间块」cell（不是逐格发 N 个）：前端按 spanHours 做 rowspan 合并渲染。
+        // kind='spill' 随 spill_time_slot_id 一起退休 —— 多格占用现在由块自身的 [slotStart, slotEnd) 表达。
         List<GzRecycleWeekBoardVO.CellVO> cells = new ArrayList<>();
         for (GzRecycleAppointment row : weekRows) {
-            String qtyBucketLabel = SOURCE_MP.equals(row.getSource())
-                ? parseProducts(row.getProductSnapshotJson()).getQtyBucketLabel() : null;
-            if (row.getTimeSlotId() != null) {
-                GzRecycleWeekBoardVO.CellVO cell = new GzRecycleWeekBoardVO.CellVO();
-                cell.setApptDate(row.getApptDate());
-                cell.setTimeSlotId(row.getTimeSlotId());
-                cell.setKind(SOURCE_MANUAL.equals(row.getSource()) ? "manual" : "customer");
-                cell.setAppointmentId(row.getId());
-                cell.setAppointmentNo(row.getAppointmentNo());
-                cell.setStatus(row.getStatus());
-                cell.setSource(row.getSource());
-                cell.setMobileSnapshot(row.getMobileSnapshot());
-                cell.setQtyBucketLabel(qtyBucketLabel);
-                cell.setRemark(row.getRemark());
-                cells.add(cell);
+            List<LocalTime> covered = coveredHourCells(row.getSlotStart(), row.getSlotEnd());
+            if (covered.isEmpty()) {
+                continue;
             }
-            if (row.getSpillTimeSlotId() != null) {
-                // 大单溢出占用格：标注属于哪一单（appointmentId 指向源单），前端据此禁止在此格直接操作（AC25）。
-                GzRecycleWeekBoardVO.CellVO spillCell = new GzRecycleWeekBoardVO.CellVO();
-                spillCell.setApptDate(row.getApptDate());
-                spillCell.setTimeSlotId(row.getSpillTimeSlotId());
-                spillCell.setKind("spill");
-                spillCell.setAppointmentId(row.getId());
-                spillCell.setAppointmentNo(row.getAppointmentNo());
-                spillCell.setStatus(row.getStatus());
-                spillCell.setSource(row.getSource());
-                spillCell.setMobileSnapshot(row.getMobileSnapshot());
-                spillCell.setQtyBucketLabel(qtyBucketLabel);
-                spillCell.setRemark(row.getRemark());
-                cells.add(spillCell);
-            }
+            GzRecycleWeekBoardVO.CellVO cell = new GzRecycleWeekBoardVO.CellVO();
+            cell.setApptDate(row.getApptDate());
+            cell.setSlotStart(covered.get(0));
+            cell.setSlotEnd(covered.get(covered.size() - 1).plusHours(1));
+            cell.setSpanHours(covered.size());
+            cell.setKind(SOURCE_MANUAL.equals(row.getSource()) ? "manual" : "customer");
+            cell.setAppointmentId(row.getId());
+            cell.setAppointmentNo(row.getAppointmentNo());
+            cell.setStatus(row.getStatus());
+            cell.setSource(row.getSource());
+            cell.setMobileSnapshot(row.getMobileSnapshot());
+            cell.setQtyBucketLabel(SOURCE_MP.equals(row.getSource())
+                ? parseProducts(row.getProductSnapshotJson()).getQtyBucketLabel() : null);
+            cell.setRemark(row.getRemark());
+            cells.add(cell);
         }
 
         GzRecycleWeekBoardVO vo = new GzRecycleWeekBoardVO();

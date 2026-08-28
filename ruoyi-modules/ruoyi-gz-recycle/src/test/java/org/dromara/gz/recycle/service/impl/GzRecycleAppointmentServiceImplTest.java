@@ -45,17 +45,18 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * {@link GzRecycleAppointmentServiceImpl} 单测（GZ-RECYCLE-007 放开：去 IP / 去拍照 + 点数档 + 时段容量）。
+ * {@link GzRecycleAppointmentServiceImpl} 单测（GZ-RECYCLE-012 / ADR-0022：小时格连占模型）。
  *
- * <p>覆盖：① happy（点数档→时长 / 无金额 / 无实物照 / 无微信号快照 / 写 time_slot_id）；② 手机号缺失 4125；
- * ③ categories 空 4108；④ 点数档无效 4107；⑤ openid 缺失 4103；⑥ 时段非法 4124；⑦ 时段被占 4122；
- * ⑧ 大单占下一档写 spill_time_slot_id / 末档不占 / 下一档被占 4123；⑨ parseProducts 双分支兼容（老单 IP 展示）。</p>
+ * <p>覆盖：① happy（点数档 → 占 N 格 / 写区间 / 两个退休列 NULL / spanHours 冻结进快照）；
+ * ② 连占跨午休 gap 4123；③ 越出营业窗口尾 4123；④ 起始格被占 4122；⑤ 后续格被占 4123；
+ * ⑥ 非整点 / 窗口外起点 4124；⑦ 今日已过时 4131；⑧ 老包 timeSlotId 过渡 shim；
+ * ⑨ 逐格<b>升序</b>加锁（InOrder 断言，交叠区间无死锁的前提）；⑩ parseProducts 双分支兼容（老单展示）。</p>
  *
- * <p><b>防超卖用 Mockito 有状态桩</b>（无 DB 测试基建，镜像拼豆 GzBeanBookingServiceImplTest）：
- * {@code countActiveHoldingSlotForUpdate} 按 slotId 返回 0/1 模拟串行化后的占用结果；Redis 锁 spy override。
- * 真 DB 并发防超卖靠 Tier 1B 手动并发 curl 验证（RR + FOR UPDATE），非本单测覆盖。</p>
+ * <p><b>防超卖用 Mockito 桩</b>（无 DB 测试基建，镜像拼豆 GzBeanBookingServiceImplTest）：
+ * {@code countActiveCoveringHourForUpdate} 按格返回 0/1 模拟串行化后的占用结果；Redis 锁 spy override。
+ * <b>真并发防超卖 mock 照不出</b> —— 靠 Tier 1A 真 DB 并发脚本验证（RR + FOR UPDATE 间隙锁）。</p>
  *
- * @author kevin-coder (sensenran-guzi · GZ-RECYCLE-007)
+ * @author kevin-coder (sensenran-guzi · GZ-RECYCLE-012)
  */
 @Tag("dev")
 @ExtendWith(MockitoExtension.class)
@@ -121,12 +122,30 @@ class GzRecycleAppointmentServiceImplTest {
         return vo;
     }
 
-    /** 本店 3 档 enabled 有序时段：10(id=10) / 15(id=15) / 19(id=19)。 */
-    private List<GzRecycleTimeSlotVO> threeSlots() {
+    /** 连续营业窗口 10:00-22:00（GZ-RECYCLE-012 reseed 后的默认）→ 切出 12 个小时格。 */
+    private List<GzRecycleTimeSlotVO> oneWindow1022() {
+        return List.of(slot(1L, LocalTime.of(10, 0), LocalTime.of(22, 0), 1));
+    }
+
+    /** 带午休断档的双窗口 10:00-13:00 + 14:00-22:00 → 13:00 那格不生成（跨 gap 不可连占）。 */
+    private List<GzRecycleTimeSlotVO> twoWindowsWithLunchGap() {
         return List.of(
-            slot(10L, LocalTime.of(10, 0), LocalTime.of(13, 0), 1),
-            slot(15L, LocalTime.of(15, 0), LocalTime.of(18, 0), 2),
-            slot(19L, LocalTime.of(19, 0), LocalTime.of(22, 0), 3));
+            slot(1L, LocalTime.of(10, 0), LocalTime.of(13, 0), 1),
+            slot(2L, LocalTime.of(14, 0), LocalTime.of(22, 0), 2));
+    }
+
+    /** 所有小时格都空闲（默认桩）。 */
+    private void stubAllCellsFree() {
+        lenient().when(baseMapper.countActiveCoveringHourForUpdate(any(), anyLong(), any(), any()))
+            .thenReturn(0L);
+    }
+
+    /** 指定某格被占（其余空闲）。 */
+    private void stubCellTaken(LocalTime taken) {
+        lenient().when(baseMapper.countActiveCoveringHourForUpdate(any(), anyLong(), any(), any()))
+            .thenReturn(0L);
+        lenient().when(baseMapper.countActiveCoveringHourForUpdate(any(), anyLong(), any(), eq(taken)))
+            .thenReturn(1L);
     }
 
     private GzUser user(String openid, String mobile) {
@@ -146,13 +165,24 @@ class GzRecycleAppointmentServiceImplTest {
         return p;
     }
 
-    private GzRecycleAppointmentSubmitBo submitBo(GzRecycleAppointmentSubmitBo.ProductBo product, Long timeSlotId) {
+    /** 新契约提交：传起始整点（未来日期，避开 4131 过期守卫）。 */
+    private GzRecycleAppointmentSubmitBo submitBo(GzRecycleAppointmentSubmitBo.ProductBo product, LocalTime slotStart) {
         GzRecycleAppointmentSubmitBo bo = new GzRecycleAppointmentSubmitBo();
         bo.setStoreId(1L);
         bo.setProduct(product);
-        bo.setApptDate(LocalDate.of(2026, 7, 15));
-        bo.setTimeSlotId(timeSlotId);
+        bo.setApptDate(LocalDate.of(2099, 7, 15));
+        bo.setSlotStart(slotStart);
         bo.setRemark("旧物清仓");
+        return bo;
+    }
+
+    /** 老包提交：只发 timeSlotId（GZ-RECYCLE-012 过渡 shim 路径）。 */
+    private GzRecycleAppointmentSubmitBo legacySubmitBo(GzRecycleAppointmentSubmitBo.ProductBo product, Long timeSlotId) {
+        GzRecycleAppointmentSubmitBo bo = new GzRecycleAppointmentSubmitBo();
+        bo.setStoreId(1L);
+        bo.setProduct(product);
+        bo.setApptDate(LocalDate.of(2099, 7, 15));
+        bo.setTimeSlotId(timeSlotId);
         return bo;
     }
 
@@ -162,130 +192,229 @@ class GzRecycleAppointmentServiceImplTest {
         return captor;
     }
 
-    /* ---------------- happy ---------------- */
+    /* ---------------- happy：小时格连占 ---------------- */
 
     @Test
-    @DisplayName("happy：点数档→时长 / 无金额 / 无实物照 / 无微信号快照 / 写 time_slot_id、无 spill")
-    void submit_happy_writesTimeSlot_noImageNoWechatNoSpill() {
+    @DisplayName("happy：1 小时档 → 占 1 格，写区间 10:00-11:00，两个退休列 NULL，spanHours 冻结进快照")
+    void submit_happy_oneHour_writesInterval() {
         GzRecycleAppointmentServiceImpl spy = spyOk();
         when(qtyRangeService.getEnabledByCode("pts-1-50")).thenReturn(bucket("pts-1-50", "1-50 点", 60, 0));
         when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx_abc123", "13800000000"));
-        when(timeSlotService.listEnabledByStore(1L)).thenReturn(threeSlots());
-        when(baseMapper.countActiveHoldingSlotForUpdate(anyString(), anyLong(), any(), eq(10L))).thenReturn(0L);
-        when(apptNoGenerator.generate()).thenReturn("RCY-20260715-000001");
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(oneWindow1022());
+        stubAllCellsFree();
+        when(apptNoGenerator.generate()).thenReturn("RCY-20990715-000001");
         when(baseMapper.insert(any(GzRecycleAppointment.class))).thenReturn(1);
 
-        GzRecycleAppointmentVO vo = spy.submit(submitBo(product(List.of("card", "goods"), "pts-1-50"), 10L), 1001L);
+        GzRecycleAppointmentVO vo = spy.submit(submitBo(product(List.of("card", "goods"), "pts-1-50"), LocalTime.of(10, 0)), 1001L);
 
-        assertEquals("RCY-20260715-000001", vo.getAppointmentNo());
+        assertEquals("RCY-20990715-000001", vo.getAppointmentNo());
         assertEquals("submitted", vo.getStatus());
         assertEquals(60, vo.getMatchedDurationMinutes(), "预计时长 = 命中点数档 duration_minutes");
 
         GzRecycleAppointment saved = captureInsert().getValue();
-        assertEquals(10L, saved.getTimeSlotId());
-        assertNull(saved.getSpillTimeSlotId(), "普通档不占下一档");
+        assertEquals(LocalTime.of(10, 0), saved.getSlotStart());
+        assertEquals(LocalTime.of(11, 0), saved.getSlotEnd(), "60 分钟档 → 占 1 格");
+        assertNull(saved.getTimeSlotId(), "GZ-RECYCLE-012 退休列，新单写 NULL");
+        assertNull(saved.getSpillTimeSlotId(), "GZ-RECYCLE-012 退休列，新单写 NULL");
         assertNull(saved.getSubmitImageIds(), "放开后不采集实物照");
         assertNull(saved.getWechatIdSnapshot(), "放开后不写微信号快照");
         assertEquals("13800000000", saved.getMobileSnapshot());
         assertEquals("o_wx_abc123", saved.getReceiverOpenid());
-        assertEquals(LocalTime.of(10, 0), saved.getSlotStart());
-        assertEquals(LocalTime.of(13, 0), saved.getSlotEnd());
         assertNull(saved.getEstimatedAmountCent(), "去估价：estimated_amount_cent 落 null");
-        assertNull(saved.getTotalQty(), "无精确件数：total_qty 落 null");
         String json = saved.getProductSnapshotJson();
-        assertTrue(json.startsWith("{"), "snapshot 是对象根");
-        assertTrue(json.contains("\"categories\""));
-        assertTrue(json.contains("1-50 点"), "qtyBucketLabel 快照");
-        assertTrue(json.contains("\"occupyNextSlot\":0"), "占格面冻结进快照（普通档=0，D21 F1）");
+        assertTrue(json.contains("\"spanHours\":1"), "占格面冻结进快照（改期只读它，绝不活查点数档表）");
     }
 
-    /* ---------------- 大单占下一档 ---------------- */
-
     @Test
-    @DisplayName("大单（occupyNextSlot=1）非末档 → 写 spill_time_slot_id = 下一档 id；本档+下一档均空则成功")
-    void submit_bigOrder_notLastSlot_writesSpill() {
+    @DisplayName("每 50 点 1 小时：200-plus（300 分钟）→ 连占 5 格，区间 10:00-15:00")
+    void submit_bigOrder_spansFiveHours() {
         GzRecycleAppointmentServiceImpl spy = spyOk();
-        when(qtyRangeService.getEnabledByCode("pts-200-plus")).thenReturn(bucket("pts-200-plus", "200 点以上", 300, 1));
+        when(qtyRangeService.getEnabledByCode("pts-200-plus")).thenReturn(bucket("pts-200-plus", "200 点以上", 300, 0));
         when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx", "13800000000"));
-        when(timeSlotService.listEnabledByStore(1L)).thenReturn(threeSlots());
-        // 选 10:00 档（id=10，非末档）→ 下一档 15:00（id=15）；两档均空
-        when(baseMapper.countActiveHoldingSlotForUpdate(anyString(), anyLong(), any(), eq(10L))).thenReturn(0L);
-        when(baseMapper.countActiveHoldingSlotForUpdate(anyString(), anyLong(), any(), eq(15L))).thenReturn(0L);
-        when(apptNoGenerator.generate()).thenReturn("RCY-20260715-000002");
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(oneWindow1022());
+        stubAllCellsFree();
+        when(apptNoGenerator.generate()).thenReturn("RCY-20990715-000002");
         when(baseMapper.insert(any(GzRecycleAppointment.class))).thenReturn(1);
 
-        spy.submit(submitBo(product(List.of("card"), "pts-200-plus"), 10L), 1001L);
+        spy.submit(submitBo(product(List.of("card"), "pts-200-plus"), LocalTime.of(10, 0)), 1001L);
 
         GzRecycleAppointment saved = captureInsert().getValue();
-        assertEquals(10L, saved.getTimeSlotId());
-        assertEquals(15L, saved.getSpillTimeSlotId(), "大单额外占下一 enabled 档（15:00）");
-        assertTrue(saved.getProductSnapshotJson().contains("\"occupyNextSlot\":1"),
-            "大单占格面冻结进快照 —— 此后点数档被禁用/改配置都不得让改期把 spill 放开（D21 F1）");
+        assertEquals(LocalTime.of(10, 0), saved.getSlotStart());
+        assertEquals(LocalTime.of(15, 0), saved.getSlotEnd(), "300 分钟 → 5 格");
+        assertTrue(saved.getProductSnapshotJson().contains("\"spanHours\":5"));
     }
 
     @Test
-    @DisplayName("大单选末档（19:00）→ 无下一档 → 不占位（spill=null），仅校验本档")
-    void submit_bigOrder_lastSlot_noSpill() {
+    @DisplayName("★ 逐格加锁必须**升序**（交叠区间锁顺序一致才无死锁）")
+    void submit_locksCellsInAscendingOrder() {
         GzRecycleAppointmentServiceImpl spy = spyOk();
-        when(qtyRangeService.getEnabledByCode("pts-200-plus")).thenReturn(bucket("pts-200-plus", "200 点以上", 300, 1));
+        when(qtyRangeService.getEnabledByCode("pts-100-150")).thenReturn(bucket("pts-100-150", "100-150 点", 180, 0));
         when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx", "13800000000"));
-        when(timeSlotService.listEnabledByStore(1L)).thenReturn(threeSlots());
-        when(baseMapper.countActiveHoldingSlotForUpdate(anyString(), anyLong(), any(), eq(19L))).thenReturn(0L);
-        when(apptNoGenerator.generate()).thenReturn("RCY-20260715-000003");
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(oneWindow1022());
+        stubAllCellsFree();
+        when(apptNoGenerator.generate()).thenReturn("RCY-20990715-000003");
         when(baseMapper.insert(any(GzRecycleAppointment.class))).thenReturn(1);
 
-        spy.submit(submitBo(product(List.of("card"), "pts-200-plus"), 19L), 1001L);
+        spy.submit(submitBo(product(List.of("card"), "pts-100-150"), LocalTime.of(12, 0)), 1001L);
 
-        GzRecycleAppointment saved = captureInsert().getValue();
-        assertEquals(19L, saved.getTimeSlotId());
-        assertNull(saved.getSpillTimeSlotId(), "末档大单不占位（晚 7 点例外）");
+        org.mockito.InOrder inOrder = Mockito.inOrder(baseMapper);
+        inOrder.verify(baseMapper).countActiveCoveringHourForUpdate(any(), anyLong(), any(), eq(LocalTime.of(12, 0)));
+        inOrder.verify(baseMapper).countActiveCoveringHourForUpdate(any(), anyLong(), any(), eq(LocalTime.of(13, 0)));
+        inOrder.verify(baseMapper).countActiveCoveringHourForUpdate(any(), anyLong(), any(), eq(LocalTime.of(14, 0)));
     }
 
+    /* ---------------- 连占放不下 ---------------- */
+
     @Test
-    @DisplayName("大单非末档但下一档已被占 → 4123 SLOT_SPILL_BLOCKED，不 INSERT")
-    void submit_bigOrder_nextSlotTaken_rejects4123() {
+    @DisplayName("★ 跨午休 gap 不可连占：12:00 起 3h 需要 13:00 格，而双窗口不生成该格 → 4123")
+    void submit_spanAcrossLunchGap_rejects4123() {
         GzRecycleAppointmentServiceImpl spy = spyOk();
-        when(qtyRangeService.getEnabledByCode("pts-200-plus")).thenReturn(bucket("pts-200-plus", "200 点以上", 300, 1));
+        when(qtyRangeService.getEnabledByCode("pts-100-150")).thenReturn(bucket("pts-100-150", "100-150 点", 180, 0));
         when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx", "13800000000"));
-        when(timeSlotService.listEnabledByStore(1L)).thenReturn(threeSlots());
-        when(baseMapper.countActiveHoldingSlotForUpdate(anyString(), anyLong(), any(), eq(10L))).thenReturn(0L);
-        when(baseMapper.countActiveHoldingSlotForUpdate(anyString(), anyLong(), any(), eq(15L))).thenReturn(1L);
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(twoWindowsWithLunchGap());
+        stubAllCellsFree();
 
         ServiceException ex = assertThrows(ServiceException.class,
-            () -> spy.submit(submitBo(product(List.of("card"), "pts-200-plus"), 10L), 1001L));
-        assertEquals(GzRecycleErrorCode.SLOT_SPILL_BLOCKED, ex.getCode());
+            () -> spy.submit(submitBo(product(List.of("card"), "pts-100-150"), LocalTime.of(12, 0)), 1001L));
+        assertEquals(GzRecycleErrorCode.SLOT_SPAN_BLOCKED, ex.getCode());
+        assertTrue(ex.getMessage().contains("3 小时"), "动态文案要说清需要几小时。实际：" + ex.getMessage());
         verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
     }
 
-    /* ---------------- 时段容量 ---------------- */
+    @Test
+    @DisplayName("越出营业窗口尾：21:00 起 3h（窗口 22:00 收）→ 4123")
+    void submit_spanBeyondWindowEnd_rejects4123() {
+        GzRecycleAppointmentServiceImpl spy = spyOk();
+        when(qtyRangeService.getEnabledByCode("pts-100-150")).thenReturn(bucket("pts-100-150", "100-150 点", 180, 0));
+        when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx", "13800000000"));
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(oneWindow1022());
+        stubAllCellsFree();
+
+        ServiceException ex = assertThrows(ServiceException.class,
+            () -> spy.submit(submitBo(product(List.of("card"), "pts-100-150"), LocalTime.of(21, 0)), 1001L));
+        assertEquals(GzRecycleErrorCode.SLOT_SPAN_BLOCKED, ex.getCode());
+        verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
+    }
 
     @Test
-    @DisplayName("所选时段已被占（本档 count>0）→ 4122 SLOT_TAKEN，不 INSERT")
-    void submit_slotTaken_rejects4122() {
+    @DisplayName("后续格被占（第 2 格）→ 4123（不是 4122 —— 两种文案对用户含义不同）")
+    void submit_secondCellTaken_rejects4123() {
+        GzRecycleAppointmentServiceImpl spy = spyOk();
+        when(qtyRangeService.getEnabledByCode("pts-50-100")).thenReturn(bucket("pts-50-100", "50-100 点", 120, 0));
+        when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx", "13800000000"));
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(oneWindow1022());
+        stubCellTaken(LocalTime.of(11, 0));
+
+        ServiceException ex = assertThrows(ServiceException.class,
+            () -> spy.submit(submitBo(product(List.of("card"), "pts-50-100"), LocalTime.of(10, 0)), 1001L));
+        assertEquals(GzRecycleErrorCode.SLOT_SPAN_BLOCKED, ex.getCode());
+        verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
+    }
+
+    /* ---------------- 小时格容量 / 合法性 ---------------- */
+
+    @Test
+    @DisplayName("起始格已被占 → 4122 SLOT_TAKEN，不 INSERT")
+    void submit_startCellTaken_rejects4122() {
         GzRecycleAppointmentServiceImpl spy = spyOk();
         when(qtyRangeService.getEnabledByCode("pts-1-50")).thenReturn(bucket("pts-1-50", "1-50 点", 60, 0));
         when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx", "13800000000"));
-        when(timeSlotService.listEnabledByStore(1L)).thenReturn(threeSlots());
-        when(baseMapper.countActiveHoldingSlotForUpdate(anyString(), anyLong(), any(), eq(15L))).thenReturn(1L);
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(oneWindow1022());
+        stubCellTaken(LocalTime.of(15, 0));
 
         ServiceException ex = assertThrows(ServiceException.class,
-            () -> spy.submit(submitBo(product(List.of("card"), "pts-1-50"), 15L), 1001L));
+            () -> spy.submit(submitBo(product(List.of("card"), "pts-1-50"), LocalTime.of(15, 0)), 1001L));
         assertEquals(GzRecycleErrorCode.SLOT_TAKEN, ex.getCode());
         verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
     }
 
     @Test
-    @DisplayName("时段 id 不在本店 enabled 列表（跨店/已关闭）→ 4124 SLOT_INVALID，不 INSERT")
-    void submit_slotInvalid_rejects4124() {
+    @DisplayName("起点非整点（10:30）→ 4124，不 INSERT")
+    void submit_nonWholeHourStart_rejects4124() {
         GzRecycleAppointmentServiceImpl spy = spyOk();
         when(qtyRangeService.getEnabledByCode("pts-1-50")).thenReturn(bucket("pts-1-50", "1-50 点", 60, 0));
         when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx", "13800000000"));
-        when(timeSlotService.listEnabledByStore(1L)).thenReturn(threeSlots());
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(oneWindow1022());
 
         ServiceException ex = assertThrows(ServiceException.class,
-            () -> spy.submit(submitBo(product(List.of("card"), "pts-1-50"), 999L), 1001L));
+            () -> spy.submit(submitBo(product(List.of("card"), "pts-1-50"), LocalTime.of(10, 30)), 1001L));
         assertEquals(GzRecycleErrorCode.SLOT_INVALID, ex.getCode());
         verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
+    }
+
+    @Test
+    @DisplayName("起点在营业窗口外（09:00）→ 4124，不 INSERT")
+    void submit_startOutsideWindow_rejects4124() {
+        GzRecycleAppointmentServiceImpl spy = spyOk();
+        when(qtyRangeService.getEnabledByCode("pts-1-50")).thenReturn(bucket("pts-1-50", "1-50 点", 60, 0));
+        when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx", "13800000000"));
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(oneWindow1022());
+
+        ServiceException ex = assertThrows(ServiceException.class,
+            () -> spy.submit(submitBo(product(List.of("card"), "pts-1-50"), LocalTime.of(9, 0)), 1001L));
+        assertEquals(GzRecycleErrorCode.SLOT_INVALID, ex.getCode());
+    }
+
+    @Test
+    @DisplayName("门店没配营业窗口 → 4124，不 INSERT")
+    void submit_noBusinessWindow_rejects4124() {
+        GzRecycleAppointmentServiceImpl spy = spyOk();
+        when(qtyRangeService.getEnabledByCode("pts-1-50")).thenReturn(bucket("pts-1-50", "1-50 点", 60, 0));
+        when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx", "13800000000"));
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(List.of());
+
+        ServiceException ex = assertThrows(ServiceException.class,
+            () -> spy.submit(submitBo(product(List.of("card"), "pts-1-50"), LocalTime.of(10, 0)), 1001L));
+        assertEquals(GzRecycleErrorCode.SLOT_INVALID, ex.getCode());
+    }
+
+    @Test
+    @DisplayName("★ 今天且时刻已过 → 4131 SLOT_PAST（改 12 格后是高频误操作，脏单会白占 N 格）")
+    void submit_todayPastTime_rejects4131() {
+        GzRecycleAppointmentServiceImpl spy = spyOk();
+        when(qtyRangeService.getEnabledByCode("pts-1-50")).thenReturn(bucket("pts-1-50", "1-50 点", 60, 0));
+        when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx", "13800000000"));
+        lenient().when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(oneWindow1022());
+
+        GzRecycleAppointmentSubmitBo bo = submitBo(product(List.of("card"), "pts-1-50"), LocalTime.of(0, 0));
+        bo.setApptDate(LocalDate.now());
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> spy.submit(bo, 1001L));
+        assertEquals(GzRecycleErrorCode.SLOT_PAST, ex.getCode());
+        verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
+    }
+
+    /* ---------------- 老包过渡 shim ---------------- */
+
+    @Test
+    @DisplayName("老版本小程序只发 timeSlotId → 映射为该营业窗口 start_time，正常下单（过渡 shim）")
+    void submit_legacyTimeSlotId_mapsToWindowStart() {
+        GzRecycleAppointmentServiceImpl spy = spyOk();
+        when(qtyRangeService.getEnabledByCode("pts-1-50")).thenReturn(bucket("pts-1-50", "1-50 点", 60, 0));
+        when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx", "13800000000"));
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(oneWindow1022());
+        stubAllCellsFree();
+        when(apptNoGenerator.generate()).thenReturn("RCY-20990715-000004");
+        when(baseMapper.insert(any(GzRecycleAppointment.class))).thenReturn(1);
+
+        spy.submit(legacySubmitBo(product(List.of("card"), "pts-1-50"), 1L), 1001L);
+
+        GzRecycleAppointment saved = captureInsert().getValue();
+        assertEquals(LocalTime.of(10, 0), saved.getSlotStart(), "映射到窗口起点");
+        assertEquals(LocalTime.of(11, 0), saved.getSlotEnd());
+    }
+
+    @Test
+    @DisplayName("既没 slotStart 也没有效 timeSlotId → 4124")
+    void submit_noStartAtAll_rejects4124() {
+        GzRecycleAppointmentServiceImpl spy = spyOk();
+        when(qtyRangeService.getEnabledByCode("pts-1-50")).thenReturn(bucket("pts-1-50", "1-50 点", 60, 0));
+        when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx", "13800000000"));
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(oneWindow1022());
+
+        ServiceException ex = assertThrows(ServiceException.class,
+            () -> spy.submit(legacySubmitBo(product(List.of("card"), "pts-1-50"), 999L), 1001L));
+        assertEquals(GzRecycleErrorCode.SLOT_INVALID, ex.getCode());
     }
 
     /* ---------------- 提交校验 ---------------- */
@@ -296,12 +425,12 @@ class GzRecycleAppointmentServiceImplTest {
         GzRecycleAppointmentServiceImpl spy = spyOk();
         when(qtyRangeService.getEnabledByCode("pts-1-50")).thenReturn(bucket("pts-1-50", "1-50 点", 60, 0));
         when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx_abc123", "13800000000"));
-        when(timeSlotService.listEnabledByStore(1L)).thenReturn(threeSlots());
-        when(baseMapper.countActiveHoldingSlotForUpdate(anyString(), anyLong(), any(), eq(10L))).thenReturn(0L);
-        when(apptNoGenerator.generate()).thenReturn("RCY-20260715-000009");
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(oneWindow1022());
+        stubAllCellsFree();
+        when(apptNoGenerator.generate()).thenReturn("RCY-20990715-000009");
         when(baseMapper.insert(any(GzRecycleAppointment.class))).thenReturn(1);
 
-        GzRecycleAppointmentVO vo = spy.submit(submitBo(product(new ArrayList<>(), "pts-1-50"), 10L), 1001L);
+        GzRecycleAppointmentVO vo = spy.submit(submitBo(product(new ArrayList<>(), "pts-1-50"), LocalTime.of(10, 0)), 1001L);
 
         assertEquals("submitted", vo.getStatus());
         GzRecycleAppointment saved = captureInsert().getValue();
@@ -315,7 +444,7 @@ class GzRecycleAppointmentServiceImplTest {
         GzRecycleAppointmentServiceImpl spy = spyOk();
         when(qtyRangeService.getEnabledByCode("pts-x")).thenReturn(null);
         ServiceException ex = assertThrows(ServiceException.class,
-            () -> spy.submit(submitBo(product(List.of("card"), "pts-x"), 10L), 1001L));
+            () -> spy.submit(submitBo(product(List.of("card"), "pts-x"), LocalTime.of(10, 0)), 1001L));
         assertEquals(GzRecycleErrorCode.QTY_BUCKET_INVALID, ex.getCode());
         verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
     }
@@ -328,7 +457,7 @@ class GzRecycleAppointmentServiceImplTest {
         when(gzUserMapper.selectById(1001L)).thenReturn(user("", "13800000000"));
 
         ServiceException ex = assertThrows(ServiceException.class,
-            () -> spy.submit(submitBo(product(List.of("card"), "pts-1-50"), 10L), 1001L));
+            () -> spy.submit(submitBo(product(List.of("card"), "pts-1-50"), LocalTime.of(10, 0)), 1001L));
         assertEquals(GzRecycleErrorCode.OPENID_REQUIRED, ex.getCode());
         verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
     }
@@ -341,7 +470,7 @@ class GzRecycleAppointmentServiceImplTest {
         when(gzUserMapper.selectById(1001L)).thenReturn(user("o_wx", ""));
 
         ServiceException ex = assertThrows(ServiceException.class,
-            () -> spy.submit(submitBo(product(List.of("card"), "pts-1-50"), 10L), 1001L));
+            () -> spy.submit(submitBo(product(List.of("card"), "pts-1-50"), LocalTime.of(10, 0)), 1001L));
         assertEquals(GzRecycleErrorCode.MOBILE_REQUIRED, ex.getCode());
         verify(baseMapper, never()).insert(any(GzRecycleAppointment.class));
     }
@@ -414,5 +543,36 @@ class GzRecycleAppointmentServiceImplTest {
         when(baseMapper.selectById(5L)).thenReturn(e);
 
         assertNull(service.selectMyDetail(5L, 1001L));
+    }
+
+    @Test
+    @DisplayName("★ 切格回归：营业窗口 09:00-23:00 → 恰 14 格（09..22），**不能多吐窗口外的 23:00 格**")
+    void slicing_windowEndingAt23_hasNoSpuriousCell() {
+        // LocalTime 是环形的：23:00 + 1h = 00:00，而 00:00.isAfter(23:00) 为 false。
+        // 用 LocalTime.plusHours 做循环条件会让 end=23:00 的窗口多吐一个 23:00 格
+        // （真库端到端逮到：周末窗口 09:00-23:00 出了 15 格）。改用整数分钟算后守住这条。
+        when(timeSlotService.listEnabledForDate(eq(1L), any()))
+            .thenReturn(List.of(slot(1L, LocalTime.of(9, 0), LocalTime.of(23, 0), 1)));
+        when(baseMapper.selectList(any())).thenReturn(List.of());
+
+        var result = service.getSlotAvailability(1L, LocalDate.of(2099, 9, 5), null);
+
+        assertEquals(14, result.getSlots().size(), "09:00-23:00 = 14 格");
+        assertEquals(LocalTime.of(9, 0), result.getSlots().get(0).getStartTime());
+        assertEquals(LocalTime.of(22, 0), result.getSlots().get(13).getStartTime(), "末格是 22:00（22-23），不是 23:00");
+        assertTrue(result.getSlots().stream().noneMatch(x -> x.getStartTime().equals(LocalTime.of(23, 0))),
+            "绝不能出现 23:00 格 —— 那是窗口外的 23:00-24:00");
+    }
+
+    @Test
+    @DisplayName("切格：多窗口并集去重（平时 10-22 + 周末 09-23 同日生效 → 09..22 共 14 格，不重复）")
+    void slicing_multipleWindowsDedup() {
+        when(timeSlotService.listEnabledForDate(eq(1L), any())).thenReturn(List.of(
+            slot(1L, LocalTime.of(10, 0), LocalTime.of(22, 0), 1),
+            slot(2L, LocalTime.of(9, 0), LocalTime.of(23, 0), 2)));
+        when(baseMapper.selectList(any())).thenReturn(List.of());
+
+        var result = service.getSlotAvailability(1L, LocalDate.of(2099, 9, 5), null);
+        assertEquals(14, result.getSlots().size(), "并集 09..22，重叠部分 TreeSet 去重");
     }
 }

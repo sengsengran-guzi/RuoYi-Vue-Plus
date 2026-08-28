@@ -70,6 +70,12 @@ public class GzBeanSeatTypeConfigVO implements Serializable {
     /** 0=停用 / 1=启用 */
     private Integer enabled;
 
+    /**
+     * 是否对小程序开放：1=开放可订 / 0=仅后台看板可见的**临时桌**（GZ-BEAN-054 / ADR-0023）。
+     * 与 {@code enabled} 正交 —— 详见 {@link org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig#getMpVisible()}。
+     */
+    private Integer mpVisible;
+
     /** 排序值 */
     private Integer sortNo;
 

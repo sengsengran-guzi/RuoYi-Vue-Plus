@@ -51,71 +51,74 @@ public interface GzRecycleAppointmentMapper extends BaseMapperPlus<GzRecycleAppo
     String selectStoreNameById(@Param("storeId") Long storeId);
 
     /**
-     * 某门店某日某到店时段的活跃占用数（GZ-RECYCLE-007 时段容量防超卖，FOR UPDATE）。
+     * 某门店某日「覆盖 1 小时格 gi」的活跃占用数（GZ-RECYCLE-012 / ADR-0022 逐格防超卖，FOR UPDATE）。
      *
-     * <p>「占用该档」= 活跃单 {@code time_slot_id = slotId}（本单选此档）<b>或</b> {@code spill_time_slot_id = slotId}
-     * （某大单溢出占了此档）。活跃态 = {@code submitted / confirmed_onsite / paying / paid / payout_failed /
-     * manual_hold}（{@code cancelled / no_show} 释放不计）。每档容量 = 1，故调用方 {@code >0 即已占}。</p>
+     * <p><b>「覆盖 gi」= 区间与格 {@code [gi, gi+1h)} 重叠，不是 slot_start 相等</b>（逐字镜像拼豆
+     * {@code countActiveCoveringSlotForUpdate}，ADR-0011 §3）：一张 10:00-14:00 的活跃单确实占了 12:00 这格，
+     * 但它的 {@code slot_start != 12:00}。重叠条件 = {@code slot_start < gi+1h AND slot_end > gi}。
+     * 回收没有拼豆的「提前放座」概念，止界直接用 {@code slot_end}，不需要
+     * {@code COALESCE(actual_end_slot, slot_end)}。</p>
      *
-     * <p><b>防超卖正确性前提</b>（镜像拼豆 {@code countActiveCoveringSlotForUpdate}）：{@code FOR UPDATE} 靠 InnoDB
-     * 间隙锁串行化并发同档下单（命中 0 行也锁索引区段挡并发 INSERT 后读旧 count），<b>仅 REPEATABLE_READ 成立</b>，
-     * service 上 {@code @Transactional(isolation = REPEATABLE_READ)} + {@code (store,date)} Redis 锁双保险。</p>
+     * <p>活跃态 = {@code submitted / confirmed_onsite / paying / paid / payout_failed / manual_hold}
+     * （{@code cancelled / no_show} 释放不计）。每格容量 = 1（{@code SLOT_CAPACITY}），故调用方 {@code >0 即已占}。</p>
+     *
+     * <p><b>防超卖正确性前提</b>：{@code FOR UPDATE} 靠 InnoDB 间隙锁串行化并发同格下单（命中 0 行也锁索引
+     * 区段挡并发 INSERT 后读旧 count），<b>仅 REPEATABLE_READ 成立</b>，service 上
+     * {@code @Transactional(isolation = REPEATABLE_READ)} + {@code (store,date)} Redis 锁双保险。
+     * 调用方必须<b>按格升序</b>逐格加锁，交叠区间锁顺序一致才无死锁。</p>
      *
      * <p><b>tenant_id 显式传</b>：mp 下单事务用户态 JWT 无 tenant，不依赖 ruoyi 拦截器自动注入（同拼豆 submit），
      * 由 service 从 user 取 tenant 显式传入。</p>
      *
-     * <p>⚠️ 状态集须与 {@code GzRecycleAppointmentServiceImpl.ACTIVE_HOLD_STATUSES}（{@code getSlotAvailability}
-     * mp 灰格用）保持一致（MyBatis {@code @Select} 无法引用 Java 常量，故此处内联字面量，ADR-0021 坑位 2）。
-     * 改口径需两处同步，否则防超卖与 mp 灰格 UI 口径分叉。</p>
+     * <p>⚠️ 状态集是 {@code GzRecycleAppointmentServiceImpl.ACTIVE_HOLD_STATUSES} 的<b>物理拷贝</b>
+     * （MyBatis {@code @Select} 无法引用 Java 常量），本类内还有第二份（Excluding 变体）→ <b>共 3 份</b>。
+     * 改口径必须三处同步，否则防超卖与 mp 灰格 / 周看板口径分叉（漏拦 = 超卖）。
+     * 一致性由 {@code GzRecycleActiveStatusConsistencyTest} 反射机械守卫。</p>
      *
      * @param tenantId 租户 id（显式传）
      * @param storeId  门店 id
      * @param apptDate 到店日期
-     * @param slotId   待判定占用的到店时段 id
-     * @return 该档当前活跃占用数（≥ 1 即已被占）
+     * @param slot     待判定的 1 小时格起点（整点）
+     * @return 覆盖该格的活跃占用数（≥ 1 即已被占）
      */
     @Select("SELECT COUNT(*) FROM gz_recycle_appointment " +
         "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND appt_date = #{apptDate} " +
-        "  AND (time_slot_id = #{slotId} OR spill_time_slot_id = #{slotId}) " +
+        "  AND slot_start < ADDTIME(#{slot}, '01:00:00') AND slot_end > #{slot} " +
         "  AND status IN ('submitted', 'confirmed_onsite', 'paying', 'paid', 'payout_failed', 'manual_hold') AND del_flag = '0' " +
         "FOR UPDATE")
-    long countActiveHoldingSlotForUpdate(@Param("tenantId") String tenantId,
-                                         @Param("storeId") Long storeId,
-                                         @Param("apptDate") LocalDate apptDate,
-                                         @Param("slotId") Long slotId);
+    long countActiveCoveringHourForUpdate(@Param("tenantId") String tenantId,
+                                          @Param("storeId") Long storeId,
+                                          @Param("apptDate") LocalDate apptDate,
+                                          @Param("slot") LocalTime slot);
 
     /**
-     * 某门店某日某到店时段的活跃占用数——<b>排除自身 id</b>（ADR-0021 §2 坑位 4，改期容量校验专用）。
+     * 同上，但<b>排除自身 id</b>（ADR-0021 §2 坑位 4，改期容量校验专用）。
      *
-     * <p>与 {@link #countActiveHoldingSlotForUpdate} 逐字一致，仅多 {@code AND id <> #{excludeId}}：改期目标格
-     * 的占用判定不能把「本单自己」算成占用者（典型翻车：大单原本 spill 占着目标格，改期到该格会被自己的旧占用
-     * 挡回 4122/4123）。改期路径<b>只</b>用本变体，普通提交 / 手动占用（excludeId 为 null 场景）仍用上面的原版。</p>
+     * <p>与 {@link #countActiveCoveringHourForUpdate} 逐字一致，仅多 {@code AND id <> #{excludeId}}：
+     * 改期目标格的占用判定不能把「本单自己」算成占用者 —— 典型翻车是大单原区间正覆盖着目标格，
+     * 改到相邻起点会被自己的旧占用挡回 4122/4123，相邻起点永远选不了。
+     * 改期路径<b>只</b>用本变体；提交 / 手动占用用上面的原版。</p>
      *
-     * @param tenantId  租户 id（显式传，admin 会话用 {@code TenantHelper.getTenantId()}）
-     * @param storeId   门店 id
-     * @param apptDate  到店日期（改期目标日期）
-     * @param slotId    待判定占用的到店时段 id（改期目标格）
      * @param excludeId 排除的预约单 id（改期单自身）
-     * @return 该档当前活跃占用数（不含自身，≥ 1 即已被他单占）
      */
     @Select("SELECT COUNT(*) FROM gz_recycle_appointment " +
         "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND appt_date = #{apptDate} " +
-        "  AND (time_slot_id = #{slotId} OR spill_time_slot_id = #{slotId}) " +
+        "  AND slot_start < ADDTIME(#{slot}, '01:00:00') AND slot_end > #{slot} " +
         "  AND status IN ('submitted', 'confirmed_onsite', 'paying', 'paid', 'payout_failed', 'manual_hold') AND del_flag = '0' " +
         "  AND id <> #{excludeId} " +
         "FOR UPDATE")
-    long countActiveHoldingSlotExcludingForUpdate(@Param("tenantId") String tenantId,
-                                                  @Param("storeId") Long storeId,
-                                                  @Param("apptDate") LocalDate apptDate,
-                                                  @Param("slotId") Long slotId,
-                                                  @Param("excludeId") Long excludeId);
+    long countActiveCoveringHourExcludingForUpdate(@Param("tenantId") String tenantId,
+                                                   @Param("storeId") Long storeId,
+                                                   @Param("apptDate") LocalDate apptDate,
+                                                   @Param("slot") LocalTime slot,
+                                                   @Param("excludeId") Long excludeId);
 
     /**
      * 同一用户当前进行中的回收预约数（客户 7.24「一人一单」守卫，FOR UPDATE）。
      *
      * <p>「进行中」= {@code submitted / confirmed_onsite / paying / payout_failed}
      * （{@code paid 已到账 / cancelled 已取消 / no_show 已过期} 三终态释放，可再预约）。
-     * <b>注意与 {@link #countActiveHoldingSlotForUpdate} 活跃集不同</b>：那个含 {@code paid}（当天仍占时段档），
+     * <b>注意与 {@link #countActiveCoveringHourForUpdate} 活跃集不同</b>：那个含 {@code paid}（当天仍占小时格），
      * 本守卫排除 {@code paid}（拿到钱即结清，可再约）。</p>
      *
      * <p>并发：service 上层先抢 {@code gz:recycle:lock:user_submit:{userId}} Redis 锁串行化同用户提交（防连点两单都过），
@@ -278,6 +281,30 @@ public interface GzRecycleAppointmentMapper extends BaseMapperPlus<GzRecycleAppo
      * @param cancelledTime 取消时间
      * @return 受影响行数（1 = 释放成功 / 0 = 非手动占用记录 / 已释放 / 并发冲突）
      */
+    /**
+     * 取消顾客单（GZ-RECYCLE-014）：{@code submitted / confirmed_onsite → cancelled}（原子写）。
+     *
+     * <p><b>状态白名单严格限这两态</b>：回收是<b>反向打款</b>（店家付钱给顾客），
+     * {@code paying / paid / payout_failed} 有资金动作在途或已完成，取消它们会让账面与实际打款脱节 ——
+     * WHERE 直接挡住，service 层据此报错，绝不静默成功。</p>
+     *
+     * <p><b>为什么需要这个入口</b>：prod SnailJob 根本没部署（no_show cron 从来没跑过），店员此前对
+     * 顾客爽约单<b>没有任何释放手段</b>（{@code releaseHold} 只认 {@code source='manual'}）。
+     * 改小时格后一张 5 小时大单爽约 = 当天 5 个格全废，与甲方「一天上更多人」的诉求直接冲突。</p>
+     *
+     * <p>操作人写进 {@code last_reschedule_by / last_reschedule_time}（复用既有审计列，不新增列）。</p>
+     *
+     * @return 受影响行数（1 = 取消成功 / 0 = 状态不允许 / 并发冲突）
+     */
+    @Update("UPDATE gz_recycle_appointment " +
+        "SET status = 'cancelled', cancelled_time = #{cancelledTime}, " +
+        "    last_reschedule_by = #{operator}, last_reschedule_time = #{cancelledTime}, version = version + 1 " +
+        "WHERE id = #{id} AND version = #{version} AND source = 'mp' " +
+        "  AND status IN ('submitted', 'confirmed_onsite') AND del_flag = '0'")
+    int cancelCustomerAppointment(@Param("id") Long id, @Param("version") Integer version,
+                                  @Param("operator") String operator,
+                                  @Param("cancelledTime") LocalDateTime cancelledTime);
+
     @Update("UPDATE gz_recycle_appointment " +
         "SET status = 'cancelled', cancelled_time = #{cancelledTime}, version = version + 1 " +
         "WHERE id = #{id} AND version = #{version} AND source = 'manual' AND status = 'manual_hold' AND del_flag = '0'")
@@ -287,13 +314,14 @@ public interface GzRecycleAppointmentMapper extends BaseMapperPlus<GzRecycleAppo
     /**
      * 预约改期——同一行原地 UPDATE（ADR-0021 §2，不取消重建）。
      *
-     * <p>一次性更新 {@code appt_date / time_slot_id / slot_start / slot_end / spill_time_slot_id}
-     * + 审计三列（{@code reschedule_count+1 / last_reschedule_by / last_reschedule_time}）+
-     * {@code version+1}；{@code id / appointment_no / user_id / product_snapshot_json / 点数档}
-     * 全部不变（不在本 UPDATE 涉及列内）。</p>
+     * <p>一次性更新 {@code appt_date / slot_start / slot_end} + 审计三列
+     * （{@code reschedule_count+1 / last_reschedule_by / last_reschedule_time}）+ {@code version+1}；
+     * {@code id / appointment_no / user_id / product_snapshot_json / 点数档} 全部不变
+     * （不在本 UPDATE 涉及列内）。</p>
      *
-     * <p><b>spill 允许显式置 NULL</b>（ADR-0021 §2 坑位 5）：{@code #{spillTimeSlotId}} 为 null 时 MyBatis
-     * 按参数类型绑定 JDBC NULL，{@code SET spill_time_slot_id = NULL} 正常执行——改到末档后不残留旧 spill。</p>
+     * <p><b>两个退休列显式置 NULL</b>（GZ-RECYCLE-012 / ADR-0022）：{@code time_slot_id} /
+     * {@code spill_time_slot_id} 在区间模型下已无意义，改期时硬写 NULL —— 存量老单一旦被改期就彻底切到
+     * 新模型，不会留下「区间已变但旧档 id 还指着别处」的分裂状态。</p>
      *
      * <p>WHERE 守卫 {@code status IN ('submitted','manual_hold') AND version=#{version}} ——
      * 其余状态（{@code confirmed_onsite} 起 / 终态）或版本漂移（并发）→ {@code affected=0}，
@@ -302,26 +330,22 @@ public interface GzRecycleAppointmentMapper extends BaseMapperPlus<GzRecycleAppo
      * @param id                预约单 id
      * @param version           期望版本号
      * @param apptDate          新到店日期
-     * @param timeSlotId        新到店时段 id
-     * @param slotStart         新到店时段开始（按新档快照）
-     * @param slotEnd           新到店时段结束（按新档快照）
-     * @param spillTimeSlotId   按新档位置重算的 spill 时段 id（末档 / 手动占用 / 非大单为 null）
+     * @param slotStart         新到店起始整点（占用真源起界）
+     * @param slotEnd           新到店结束整点（= slotStart + 本单占用小时数；GZ-RECYCLE-012）
      * @param lastRescheduleBy  改期操作人（admin 用户名）
      * @param lastRescheduleTime 改期时间
      * @return 受影响行数（1 = 改期成功 / 0 = 状态不可改 / 并发冲突）
      */
     @Update("UPDATE gz_recycle_appointment " +
-        "SET appt_date = #{apptDate}, time_slot_id = #{timeSlotId}, slot_start = #{slotStart}, slot_end = #{slotEnd}, " +
-        "    spill_time_slot_id = #{spillTimeSlotId}, reschedule_count = reschedule_count + 1, " +
+        "SET appt_date = #{apptDate}, slot_start = #{slotStart}, slot_end = #{slotEnd}, " +
+        "    time_slot_id = NULL, spill_time_slot_id = NULL, reschedule_count = reschedule_count + 1, " +
         "    last_reschedule_by = #{lastRescheduleBy}, last_reschedule_time = #{lastRescheduleTime}, version = version + 1 " +
         "WHERE id = #{id} AND version = #{version} AND status IN ('submitted', 'manual_hold') AND del_flag = '0'")
     int reschedule(@Param("id") Long id,
                    @Param("version") Integer version,
                    @Param("apptDate") LocalDate apptDate,
-                   @Param("timeSlotId") Long timeSlotId,
                    @Param("slotStart") LocalTime slotStart,
                    @Param("slotEnd") LocalTime slotEnd,
-                   @Param("spillTimeSlotId") Long spillTimeSlotId,
                    @Param("lastRescheduleBy") String lastRescheduleBy,
                    @Param("lastRescheduleTime") LocalDateTime lastRescheduleTime);
 }

@@ -10,6 +10,7 @@ import org.springframework.format.annotation.DateTimeFormat;
 import java.io.Serial;
 import java.io.Serializable;
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.List;
 
 /**
@@ -54,12 +55,25 @@ public class GzRecycleAppointmentSubmitBo implements Serializable {
     private LocalDate apptDate;
 
     /**
-     * 到店时段 id（GZ-RECYCLE-006，gz_recycle_time_slot.id；按门店可配，取代写死的 morning/afternoon）。
+     * 到店<b>起始整点</b>（GZ-RECYCLE-012 / ADR-0022，取代 {@link #timeSlotId}）。
      *
-     * <p>service 按 timeSlotId 校验「属于本门店 + 启用」并取其 start_time/end_time 落预约单
-     * slot_start/slot_end（前端不传时间）。非法 / 跨店 / 已停用由 service 抛业务异常。</p>
+     * <p>只传起点，<b>不传结束时间</b> —— 占用时长由点数档决定（{@code N = ceil(duration_minutes/60)}，
+     * 甲方口径「每 50 点 1 小时」），服务端权威。前端传结束时间只会制造前后端不一致的拒单。</p>
+     *
+     * <p>service 校验「整点 + 落在门店营业窗口切出的 1h 格上 + 连占 N 格都放得下」，
+     * 非法 → 4124 / 放不下 → 4123 / 起始格被占 → 4122 / 已过时 → 4131。</p>
      */
-    @NotNull(message = "请选择到店时段")
+    @DateTimeFormat(pattern = "HH:mm:ss")
+    private LocalTime slotStart;
+
+    /**
+     * 【过渡期兼容 GZ-RECYCLE-012】旧版小程序的到店时段 id（{@code gz_recycle_time_slot.id}）。
+     *
+     * <p>小程序发布后用户端有缓存版本，老包只会发这个字段。service 的 {@code resolveSubmitStart}
+     * 把它映射成该营业窗口的 {@code start_time} 作为起点 —— 业务上说得通、不会 400/500。</p>
+     *
+     * <p>⚠️ 过渡 shim，<b>发布后至少保留两周</b>再连同本字段一起删。新版小程序一律传 {@link #slotStart}。</p>
+     */
     private Long timeSlotId;
 
     /** 去重 token（可选） */

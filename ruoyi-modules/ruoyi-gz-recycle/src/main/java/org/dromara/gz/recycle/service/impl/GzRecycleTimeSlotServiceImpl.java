@@ -1,6 +1,7 @@
 package org.dromara.gz.recycle.service.impl;
 
 import cn.hutool.core.util.ObjectUtil;
+import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
@@ -18,6 +19,8 @@ import org.dromara.gz.recycle.service.IGzRecycleTimeSlotService;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
+import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.List;
 
@@ -37,6 +40,8 @@ public class GzRecycleTimeSlotServiceImpl implements IGzRecycleTimeSlotService {
 
     private static final int ENABLED_ON = 1;
     private static final int ENABLED_OFF = 0;
+    /** 生效星期默认值：全周（ISO 1=周一..7=周日）—— 与 DB DEFAULT 一致，存量行行为不变 */
+    private static final String ALL_WEEKDAYS = "1,2,3,4,5,6,7";
 
     private final GzRecycleTimeSlotMapper baseMapper;
 
@@ -67,7 +72,7 @@ public class GzRecycleTimeSlotServiceImpl implements IGzRecycleTimeSlotService {
     @Transactional(rollbackFor = Exception.class)
     public Long insertByBo(GzRecycleTimeSlotBo bo) {
         validateTimeRange(bo.getStartTime(), bo.getEndTime());
-        assertSlotUnique(bo.getStoreId(), bo.getStartTime(), bo.getEndTime(), null);
+        assertSlotUnique(bo.getStoreId(), bo.getStartTime(), bo.getEndTime(), bo.getWeekdays(), null);
         GzRecycleTimeSlot add = new GzRecycleTimeSlot();
         copyEditableFields(bo, add);
         add.setEnabled(bo.getEnabled() == null ? ENABLED_ON : normalizeEnabled(bo.getEnabled()));
@@ -78,8 +83,8 @@ public class GzRecycleTimeSlotServiceImpl implements IGzRecycleTimeSlotService {
         if (!ok) {
             throw new ServiceException("时段新建失败");
         }
-        log.info("[gz-recycle] timeSlot INSERT id={} storeId={} {}-{} label={}",
-            add.getId(), add.getStoreId(), add.getStartTime(), add.getEndTime(), add.getLabel());
+        log.info("[gz-recycle] timeSlot INSERT id={} storeId={} {}-{} weekdays={} label={}",
+            add.getId(), add.getStoreId(), add.getStartTime(), add.getEndTime(), add.getWeekdays(), add.getLabel());
         return add.getId();
     }
 
@@ -94,7 +99,7 @@ public class GzRecycleTimeSlotServiceImpl implements IGzRecycleTimeSlotService {
             throw new ServiceException("时段不存在：" + bo.getId());
         }
         validateTimeRange(bo.getStartTime(), bo.getEndTime());
-        assertSlotUnique(bo.getStoreId(), bo.getStartTime(), bo.getEndTime(), bo.getId());
+        assertSlotUnique(bo.getStoreId(), bo.getStartTime(), bo.getEndTime(), bo.getWeekdays(), bo.getId());
         GzRecycleTimeSlot update = new GzRecycleTimeSlot();
         update.setId(bo.getId());
         copyEditableFields(bo, update);
@@ -157,6 +162,40 @@ public class GzRecycleTimeSlotServiceImpl implements IGzRecycleTimeSlotService {
     }
 
     @Override
+    public List<GzRecycleTimeSlotVO> listEnabledForDate(Long storeId, LocalDate date) {
+        List<GzRecycleTimeSlotVO> all = listEnabledByStore(storeId);
+        if (date == null) {
+            return all;
+        }
+        String isoWeekday = String.valueOf(date.getDayOfWeek().getValue()); // 1=Mon .. 7=Sun
+        return all.stream()
+            .filter(w -> containsWeekday(w.getWeekdays(), isoWeekday))
+            .filter(w -> w.getEffectiveDate() == null || !date.isBefore(w.getEffectiveDate()))
+            .filter(w -> w.getExpireDate() == null || !date.isAfter(w.getExpireDate()))
+            .toList();
+    }
+
+    /**
+     * {@code weekdays} 逗号分隔 contains 判定（**按 token 精确匹配**，镜像拼豆 {@code containsWeekday}）。
+     *
+     * <p>不能用 {@code String.contains} —— 那会让 "1" 命中 "11"。回收当前只有 1-7 单字符所以不会撞，
+     * 但保持与拼豆同一实现，免得将来有人扩位数时踩。</p>
+     *
+     * <p>空 / 空白视作**全周生效**（存量行 DB DEFAULT 已是全周，这里兜历史脏数据）。</p>
+     */
+    private boolean containsWeekday(String weekdays, String isoWeekday) {
+        if (StrUtil.isBlank(weekdays)) {
+            return true;
+        }
+        for (String token : weekdays.split(",")) {
+            if (token.trim().equals(isoWeekday)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
     public LocalTime[] resolveEnabledSlot(Long timeSlotId, Long storeId) {
         if (ObjectUtil.isNull(timeSlotId) || ObjectUtil.isNull(storeId)) {
             return null;
@@ -179,6 +218,10 @@ public class GzRecycleTimeSlotServiceImpl implements IGzRecycleTimeSlotService {
         e.setLabel(bo.getLabel());
         e.setStartTime(bo.getStartTime());
         e.setEndTime(bo.getEndTime());
+        // GZ-RECYCLE-015：空 → 全周（老客户端不传时行为不变）；归一化后存，判重才靠得住
+        e.setWeekdays(normalizeWeekdays(bo.getWeekdays()));
+        e.setEffectiveDate(bo.getEffectiveDate());
+        e.setExpireDate(bo.getExpireDate());
         e.setSortNo(bo.getSortNo());
         e.setRemark(bo.getRemark());
     }
@@ -187,7 +230,12 @@ public class GzRecycleTimeSlotServiceImpl implements IGzRecycleTimeSlotService {
         return (enabled != null && enabled == ENABLED_ON) ? ENABLED_ON : ENABLED_OFF;
     }
 
-    /** end 必须晚于 start。 */
+    /**
+     * 营业窗口校验（GZ-RECYCLE-012 / ADR-0022）：end 晚于 start + <b>两端必须整点</b> + 至少 1 小时。
+     *
+     * <p>整点是硬要求：系统按 1h 切格且<b>残格不生成</b>，配一个 {@code 10:00-13:30} 会静默丢掉
+     * 13:00-13:30 这半小时 —— admin 以为开了、顾客约不到、店员对不上账。宁可在保存时报错。</p>
+     */
     private void validateTimeRange(LocalTime start, LocalTime end) {
         if (start == null || end == null) {
             throw new ServiceException("开始/结束时间不能为空");
@@ -195,12 +243,30 @@ public class GzRecycleTimeSlotServiceImpl implements IGzRecycleTimeSlotService {
         if (!end.isAfter(start)) {
             throw new ServiceException("结束时间必须晚于开始时间");
         }
+        if (!isWholeHour(start) || !isWholeHour(end)) {
+            throw new ServiceException("营业时间必须是整点（如 10:00、22:00）—— 系统按 1 小时切格，非整点会丢掉不足一小时的残格");
+        }
+        if (Duration.between(start, end).toHours() < 1) {
+            throw new ServiceException("营业时间至少 1 小时");
+        }
+    }
+
+    /** 整点判定（分 = 秒 = 纳秒 = 0）。 */
+    private boolean isWholeHour(LocalTime t) {
+        return t != null && t.getMinute() == 0 && t.getSecond() == 0 && t.getNano() == 0;
     }
 
     /**
-     * 同门店时段不重复预检（DB UNIQUE(tenant_id, store_id, start_time, end_time) 兜底；编辑时排除自身）。
+     * 同门店「窗口 + 星期」组合不重复预检（GZ-RECYCLE-015；编辑时排除自身）。
+     *
+     * <p>DB 层的 {@code uk_tenant_store_time} 已随 GZ-RECYCLE-015 <b>DROP</b> —— 加了 {@code weekdays}
+     * 之后 `(store, start, end)` 唯一是错的（「周一至周五 10:00-22:00」+「周六周日 10:00-22:00」
+     * 是两行合法配置）。判重下沉到 service，口径改为**起止 + 星期完全相同**才算重复。</p>
+     *
+     * <p><b>窗口重叠不拦</b>（与拼豆同口径）：切格走 {@code TreeSet} 去重，重叠窗口不会产生重复格，
+     * 天然安全；真要拦重叠反而会挡住「10-13 + 12-22」这类合法的分段配置。</p>
      */
-    private void assertSlotUnique(Long storeId, LocalTime start, LocalTime end, Long excludeId) {
+    private void assertSlotUnique(Long storeId, LocalTime start, LocalTime end, String weekdays, Long excludeId) {
         if (storeId == null) {
             throw new ServiceException("门店不能为空");
         }
@@ -208,11 +274,29 @@ public class GzRecycleTimeSlotServiceImpl implements IGzRecycleTimeSlotService {
             .eq(GzRecycleTimeSlot::getStoreId, storeId)
             .eq(GzRecycleTimeSlot::getStartTime, start)
             .eq(GzRecycleTimeSlot::getEndTime, end)
+            .eq(GzRecycleTimeSlot::getWeekdays, normalizeWeekdays(weekdays))
             .ne(excludeId != null, GzRecycleTimeSlot::getId, excludeId);
         Long cnt = baseMapper.selectCount(lqw);
         if (cnt != null && cnt > 0) {
-            throw new ServiceException("该门店已存在相同时段「" + start + "-" + end + "」，请勿重复添加");
+            throw new ServiceException("该门店已存在相同的营业时间「" + start + "-" + end + "」+ 相同生效星期，请勿重复添加");
         }
+    }
+
+    /**
+     * 归一化 {@code weekdays}：空 → 全周；去空格 + 按 ISO 升序 + 去重。
+     *
+     * <p>排序是判重正确性的前提 —— `"1,2"` 与 `"2,1"` 语义相同，不归一化会被当成两行不同配置。</p>
+     */
+    private String normalizeWeekdays(String weekdays) {
+        if (StrUtil.isBlank(weekdays)) {
+            return ALL_WEEKDAYS;
+        }
+        return java.util.Arrays.stream(weekdays.split(","))
+            .map(String::trim)
+            .filter(StrUtil::isNotBlank)
+            .distinct()
+            .sorted()
+            .collect(java.util.stream.Collectors.joining(","));
     }
 
     private GzRecycleTimeSlotVO toVO(GzRecycleTimeSlot e) {
@@ -223,6 +307,9 @@ public class GzRecycleTimeSlotServiceImpl implements IGzRecycleTimeSlotService {
         vo.setLabel(e.getLabel());
         vo.setStartTime(e.getStartTime());
         vo.setEndTime(e.getEndTime());
+        vo.setWeekdays(e.getWeekdays());
+        vo.setEffectiveDate(e.getEffectiveDate());
+        vo.setExpireDate(e.getExpireDate());
         vo.setEnabled(e.getEnabled());
         vo.setSortNo(e.getSortNo());
         vo.setCreateTime(e.getCreateTime());

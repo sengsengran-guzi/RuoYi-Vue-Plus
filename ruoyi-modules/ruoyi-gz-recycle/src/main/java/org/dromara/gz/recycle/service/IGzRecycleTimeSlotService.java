@@ -6,6 +6,7 @@ import org.dromara.gz.recycle.domain.bo.GzRecycleTimeSlotBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleTimeSlotQueryBo;
 import org.dromara.gz.recycle.domain.vo.GzRecycleTimeSlotVO;
 
+import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.List;
 
@@ -43,11 +44,28 @@ public interface IGzRecycleTimeSlotService {
     boolean toggleEnabled(Long id, Integer enabled);
 
     /**
-     * 某门店启用时段列表（mp 填单单选源）。
+     * 某门店全部启用营业窗口（**不按日期过滤**）。
      *
      * <p>仅返 {@code store_id=storeId AND enabled=1}，按 {@code sort_no, start_time, id} 升序。</p>
+     *
+     * <p>⚠️ GZ-RECYCLE-015 起窗口有 {@code weekdays} / 生效区间维度，**凡是与「某一天」相关的判定
+     * （下单 / 可用性 / 手动占用 / 改期 / 看板行头）一律改用 {@link #listEnabledForDate}**。
+     * 本方法只剩「不关心具体日期」的场景（admin 配置页概览 / 老包 timeSlotId 兜底映射）。</p>
      */
     List<GzRecycleTimeSlotVO> listEnabledByStore(Long storeId);
+
+    /**
+     * 某门店在**指定日期**生效的营业窗口（GZ-RECYCLE-015，逐字镜像拼豆 {@code selectEnabledSlotsForDate}）。
+     *
+     * <p>在 {@link #listEnabledByStore} 基础上再过滤三条：① {@code weekdays} 含该日 ISO 星期；
+     * ② {@code effective_date} 为空或 ≤ 该日；③ {@code expire_date} 为空或 ≥ 该日。</p>
+     *
+     * <p>切格算法本身不受影响 —— 只是取窗口时多一层过滤，拿到的窗口列表照旧按 1h 切。</p>
+     *
+     * @param storeId 门店 id
+     * @param date    目标日期（null → 退化为不按日期过滤）
+     */
+    List<GzRecycleTimeSlotVO> listEnabledForDate(Long storeId, LocalDate date);
 
     /**
      * 按 id 取启用时段的起止时间（提交校验 + 落预约单 slot_start/slot_end）。
