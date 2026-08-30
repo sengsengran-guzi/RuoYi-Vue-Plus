@@ -13,6 +13,7 @@ import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.satoken.utils.LoginHelper;
 import org.dromara.common.web.core.BaseController;
 import org.dromara.gz.recycle.domain.bo.GzRecycleAppointmentQueryBo;
+import org.dromara.gz.recycle.domain.bo.GzRecycleBatchReleaseBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleManualHoldBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleRescheduleBo;
 import org.dromara.gz.recycle.domain.bo.GzRecycleVerifyBo;
@@ -206,5 +207,48 @@ public class GzRecycleAppointmentController extends BaseController {
             @RequestParam(required = false) Integer spanHours,
             @RequestParam(required = false) Long excludeAppointmentId) {
         return R.ok(appointmentService.getHourSlotsForAdmin(storeId, date, spanHours, excludeAppointmentId));
+    }
+
+    // ============================================================
+    //  GZ-RECYCLE-017 过期未核销单：批量筛选 + 释放（甲方 8.28）
+    // ============================================================
+
+    /**
+     * 过期未核销单列表：到店日已过、仍停在 {@code submitted} 的顾客单。
+     *
+     * <pre>GET /system/gz/recycle/appointment/expired-unsettled?storeId=&amp;dateFrom=&amp;dateTo=</pre>
+     *
+     * <p>三个参数全可选（都不传 = 全门店全部历史过期单）。上界后端硬夹到「昨天」，
+     * 当天的单不算过期（当天仍可到店核对）。</p>
+     */
+    @SaCheckPermission("gz:recycle:appointment:list")
+    @GetMapping("/expired-unsettled")
+    public R<List<GzRecycleAppointmentAdminVO>> expiredUnsettled(
+            @RequestParam(required = false) Long storeId,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate dateFrom,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate dateTo) {
+        return R.ok(appointmentService.listExpiredUnsettled(storeId, dateFrom, dateTo));
+    }
+
+    /**
+     * 批量释放过期未核销单：{@code submitted → no_show}。
+     *
+     * <pre>POST /system/gz/recycle/appointment/batch-release-expired   body: {"ids":[1,2,3]}</pre>
+     *
+     * <p>复用既有 {@code hold} 权限（与「取消顾客单」同一类释放动作），不新增 menu。</p>
+     *
+     * <p><b>释放解决的真问题</b>：一人一单守卫按 {@code submitted} 计数且<b>不带日期条件</b>，
+     * 顾客一张一个月前的爽约单会让他永久约不了下一单（4127）。标 {@code no_show} 即解封。</p>
+     */
+    @SaCheckPermission("gz:recycle:appointment:hold")
+    @Log(title = "回收过期单批量释放", businessType = BusinessType.UPDATE)
+    @RepeatSubmit()
+    @PostMapping("/batch-release-expired")
+    public R<IGzRecycleAppointmentService.BatchReleaseResult> batchReleaseExpired(
+            @Valid @RequestBody GzRecycleBatchReleaseBo bo) {
+        String operator = LoginHelper.getUsername();
+        log.info("[gz-recycle-admin] batchReleaseExpired count={} by={}",
+            bo.getIds() == null ? 0 : bo.getIds().size(), operator);
+        return R.ok(appointmentService.batchReleaseExpired(bo.getIds(), operator));
     }
 }

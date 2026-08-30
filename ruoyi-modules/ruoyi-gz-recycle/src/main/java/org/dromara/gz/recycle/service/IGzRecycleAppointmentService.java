@@ -279,4 +279,50 @@ public interface IGzRecycleAppointmentService {
      * @return 周视图 VO（slots 列头 + cells 被占格）
      */
     GzRecycleWeekBoardVO selectWeekBoard(Long storeId, LocalDate weekStart);
+
+    /**
+     * 过期未核销单列表（GZ-RECYCLE-017）：到店日已过、仍停在 {@code submitted} 的顾客单。
+     *
+     * <p><b>为什么需要它</b>：{@link #markExpiredNoShow()} 那条凌晨 cron 依赖 SnailJob，而 prod
+     * <b>从未部署过 SnailJob</b>（25 个 @JobExecutor 一个都没跑）—— 于是过期单永远停在 submitted，
+     * 越积越多。这是与 GZ-BEAN-041「过期待处理 + 批量结单」完全同源的问题，解法也对齐：不上 cron 基建，
+     * 给 admin 一个手动批量口。</p>
+     *
+     * <p><b>真正的危害不是占格</b>（过去日期本来就不可约，被 4131 SLOT_PAST 挡着），而是
+     * <b>一人一单守卫</b>：{@code countActiveByUserForUpdate} 统计 submitted 时<b>不带日期条件</b>，
+     * 所以顾客一张一个月前的爽约单会让他<b>永久约不了下一单</b>（4127）。释放 = 解封这位顾客。</p>
+     *
+     * @param storeId  门店 id（null = 全门店）
+     * @param dateFrom 到店日期下界（含，null = 不限）
+     * @param dateTo   到店日期上界（含，null = 不限；上界本身仍受「早于今天」硬约束）
+     * @return 过期未核销单列表（按到店日期升序，最早的排前面）
+     */
+    List<GzRecycleAppointmentAdminVO> listExpiredUnsettled(Long storeId, LocalDate dateFrom, LocalDate dateTo);
+
+    /**
+     * 批量释放过期未核销单（GZ-RECYCLE-017）：{@code submitted → no_show}。
+     *
+     * <p>{@code no_show} 既不在 {@code ACTIVE_HOLD_STATUSES}（释放小时格）也不在
+     * {@code USER_ACTIVE_STATUSES}（解封该顾客的再约资格），一个状态解决两件事。</p>
+     *
+     * <p><b>逐单独立处理、互不影响</b>（对齐 {@code GzBeanBookingService.batchSettle}）：单条失败只计入
+     * {@code failed} 并继续下一条，不整批回滚 —— 批量操作里一条脏数据不该让店员的其余 N-1 条白点。
+     * 底层 {@code markNoShow} 的 {@code WHERE status='submitted'} 保证幂等：并发/重复点击命中 0 行
+     * 记 {@code skipped}，不会把已核对的单误标。</p>
+     *
+     * @param ids      待释放的预约单 id 列表
+     * @param operator 操作人（admin 用户名，仅写日志留痕）
+     * @return 释放结果计数
+     */
+    BatchReleaseResult batchReleaseExpired(List<Long> ids, String operator);
+
+    /**
+     * 批量释放结果（对齐 {@code GzBeanBookingService.BatchSettleResult} 三元组口径）。
+     *
+     * @param succeeded 成功标记 no_show 的条数
+     * @param skipped   幂等跳过（已非 submitted —— 并发被核对 / 重复点击）
+     * @param failed    异常失败（DB 异常等，已记 warn 日志）
+     */
+    record BatchReleaseResult(int succeeded, int skipped, int failed) {
+    }
 }

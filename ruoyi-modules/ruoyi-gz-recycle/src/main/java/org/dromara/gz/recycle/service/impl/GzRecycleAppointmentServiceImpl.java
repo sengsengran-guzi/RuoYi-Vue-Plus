@@ -896,6 +896,57 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         });
     }
 
+    /* ===================== GZ-RECYCLE-017 过期未核销单 手动批量释放 ===================== */
+
+    @Override
+    public List<GzRecycleAppointmentAdminVO> listExpiredUnsettled(Long storeId, LocalDate dateFrom, LocalDate dateTo) {
+        LocalDate today = LocalDate.now();
+        // 上界永远不超过「昨天」：今天的单当天还能到店核对，不算过期（与 markExpiredNoShow 的
+        // `appt_date < CURDATE()` 同口径）。即便前端传了未来日期也被这里夹回去，不给误释放当天单的机会。
+        LocalDate effectiveTo = (dateTo == null || !dateTo.isBefore(today)) ? today.minusDays(1) : dateTo;
+        if (dateFrom != null && dateFrom.isAfter(effectiveTo)) {
+            return List.of();
+        }
+        LambdaQueryWrapper<GzRecycleAppointment> lqw = Wrappers.<GzRecycleAppointment>lambdaQuery()
+            // 只认 submitted：confirmed_onsite 是「店员已确认」的完成态（客户 7.15 现金结算即终态），
+            // 释放它等于把一笔已付钱的交易改成「未到店」，是伪造账目 —— 绝不纳入。
+            .eq(GzRecycleAppointment::getStatus, STATUS_SUBMITTED)
+            .eq(storeId != null, GzRecycleAppointment::getStoreId, storeId)
+            .ge(dateFrom != null, GzRecycleAppointment::getApptDate, dateFrom)
+            .le(GzRecycleAppointment::getApptDate, effectiveTo)
+            .orderByAsc(GzRecycleAppointment::getApptDate)
+            .orderByAsc(GzRecycleAppointment::getId);
+        return baseMapper.selectList(lqw).stream().map(this::toAdminVO).toList();
+    }
+
+    @Override
+    public BatchReleaseResult batchReleaseExpired(List<Long> ids, String operator) {
+        if (ids == null || ids.isEmpty()) {
+            return new BatchReleaseResult(0, 0, 0);
+        }
+        int succeeded = 0;
+        int skipped = 0;
+        int failed = 0;
+        for (Long id : ids) {
+            try {
+                // markNoShow 的 WHERE 自带 status='submitted' 守卫 → 幂等：
+                // 并发被店员核对掉 / 重复点击都只会命中 0 行记 skipped，不会误改已核对单。
+                if (baseMapper.markNoShow(id) == 1) {
+                    succeeded++;
+                } else {
+                    skipped++;
+                }
+            } catch (Exception ex) {
+                // 逐单独立：一条炸不该让其余 N-1 条白点（对齐拼豆 batchSettle）
+                failed++;
+                log.warn("[gz-recycle] batchReleaseExpired 单条失败 id={} → skip: {}", id, ex.getMessage());
+            }
+        }
+        log.info("[gz-recycle] batchReleaseExpired total={} ok={} skip={} fail={} by={}",
+            ids.size(), succeeded, skipped, failed, operator);
+        return new BatchReleaseResult(succeeded, skipped, failed);
+    }
+
     /* ===================== T6 到店核销码 ===================== */
 
     @Override

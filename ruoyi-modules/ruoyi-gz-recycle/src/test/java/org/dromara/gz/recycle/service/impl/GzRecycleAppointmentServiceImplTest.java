@@ -2,6 +2,10 @@ package org.dromara.gz.recycle.service.impl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.dromara.common.core.exception.ServiceException;
+import com.baomidou.mybatisplus.core.MybatisConfiguration;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
+import com.baomidou.mybatisplus.core.MybatisMapperBuilderAssistant;
 import org.dromara.gz.common.domain.entity.GzUser;
 import org.dromara.gz.common.mapper.GzUserMapper;
 import org.dromara.gz.recycle.config.GzRecycleQrProperties;
@@ -16,6 +20,7 @@ import org.dromara.gz.recycle.mapper.GzRecycleAppointmentMapper;
 import org.dromara.gz.recycle.service.IGzRecycleQtyRangeService;
 import org.dromara.gz.recycle.service.internal.RecycleApptNoGenerator;
 import org.dromara.gz.recycle.service.internal.RecycleQrSigner;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -83,6 +88,20 @@ class GzRecycleAppointmentServiceImplTest {
     private final RecycleQrSigner qrSigner = new RecycleQrSigner(new GzRecycleQrProperties());
 
     private GzRecycleAppointmentServiceImpl service;
+
+    /**
+     * 初始化 GzRecycleAppointment 的 MyBatis-Plus lambda 列缓存（幂等、无副作用）。
+     *
+     * <p>GZ-RECYCLE-017 的断言处调 {@code wrapper.getSqlSegment()} 触发 lambda→列名解析（{@code .eq()} 是
+     * <b>延迟</b>解析，不调 getSqlSegment 则 {@code getParamNameValuePairs()} 恒空），需 TableInfo 缓存；
+     * 纯 Mockito 单测无 Spring 容器故缓存空 → 报 "can not find lambda cache"。同 GzRecycleStaffListTest。</p>
+     */
+    @BeforeAll
+    static void initLambdaCache() {
+        TableInfoHelper.initTableInfo(
+            new MybatisMapperBuilderAssistant(new MybatisConfiguration(), ""),
+            GzRecycleAppointment.class);
+    }
 
     @BeforeEach
     void setUp() {
@@ -574,5 +593,100 @@ class GzRecycleAppointmentServiceImplTest {
 
         var result = service.getSlotAvailability(1L, LocalDate.of(2099, 9, 5), null);
         assertEquals(14, result.getSlots().size(), "并集 09..22，重叠部分 TreeSet 去重");
+    }
+
+    /* ============ GZ-RECYCLE-017 过期未核销单 批量释放（甲方 8.28） ============ */
+
+    @Test
+    @DisplayName("批量释放：全部命中 → succeeded=N")
+    void batchRelease_allSucceed() {
+        when(baseMapper.markNoShow(anyLong())).thenReturn(1);
+
+        var r = service.batchReleaseExpired(List.of(1L, 2L, 3L), "admin");
+
+        assertEquals(3, r.succeeded());
+        assertEquals(0, r.skipped());
+        assertEquals(0, r.failed());
+    }
+
+    @Test
+    @DisplayName("批量释放：markNoShow 返 0（并发被核对 / 重复点击）→ 记 skipped，绝不误标已核对单")
+    void batchRelease_idempotentSkip() {
+        when(baseMapper.markNoShow(1L)).thenReturn(1);
+        when(baseMapper.markNoShow(2L)).thenReturn(0);   // WHERE status='submitted' 未命中
+
+        var r = service.batchReleaseExpired(List.of(1L, 2L), "admin");
+
+        assertEquals(1, r.succeeded());
+        assertEquals(1, r.skipped(), "幂等跳过必须计入 skipped，不能算成功");
+        assertEquals(0, r.failed());
+    }
+
+    @Test
+    @DisplayName("批量释放：单条抛异常不中断整批 —— 其余条目照常处理（对齐拼豆 batchSettle）")
+    void batchRelease_oneFailureDoesNotAbortBatch() {
+        when(baseMapper.markNoShow(1L)).thenReturn(1);
+        when(baseMapper.markNoShow(2L)).thenThrow(new RuntimeException("DB boom"));
+        when(baseMapper.markNoShow(3L)).thenReturn(1);
+
+        var r = service.batchReleaseExpired(List.of(1L, 2L, 3L), "admin");
+
+        assertEquals(2, r.succeeded(), "第 2 条炸不该让第 3 条白点");
+        assertEquals(0, r.skipped());
+        assertEquals(1, r.failed());
+    }
+
+    @Test
+    @DisplayName("批量释放：空/null 入参直接返回全 0，不打 DB")
+    void batchRelease_emptyInput() {
+        assertEquals(0, service.batchReleaseExpired(List.of(), "admin").succeeded());
+        assertEquals(0, service.batchReleaseExpired(null, "admin").succeeded());
+        verify(baseMapper, never()).markNoShow(anyLong());
+    }
+
+    @Test
+    @DisplayName("过期列表：dateTo 传未来 → 后端硬夹到「昨天」，当天单绝不进候选（当天仍可到店核对）")
+    void expiredList_upperBoundClampedToYesterday() {
+        when(baseMapper.selectList(any())).thenReturn(List.of());
+
+        service.listExpiredUnsettled(1L, null, LocalDate.now().plusDays(30));
+
+        ArgumentCaptor<LambdaQueryWrapper<GzRecycleAppointment>> cap = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(baseMapper).selectList(cap.capture());
+        // ⚠️ .eq()/.le() 是延迟解析 —— 必须先调 getSqlSegment() 才会把 lambda 解析成列名并填充参数表
+        LambdaQueryWrapper<GzRecycleAppointment> w = cap.getValue();
+        w.getSqlSegment();
+        // le(appt_date, 昨天)：参数值里必须出现昨天，且绝不出现今天（今天的单当天仍可到店核对）
+        LocalDate yesterday = LocalDate.now().minusDays(1);
+        var params = w.getParamNameValuePairs().values();
+        assertTrue(params.contains(yesterday), "上界必须被夹到昨天，实际参数=" + params);
+        assertTrue(!params.contains(LocalDate.now()), "今天绝不能进候选，实际参数=" + params);
+    }
+
+    @Test
+    @DisplayName("过期列表：dateFrom 晚于夹紧后的上界 → 直接返空，不打 DB")
+    void expiredList_emptyWhenRangeInverted() {
+        var r = service.listExpiredUnsettled(1L, LocalDate.now().plusDays(1), null);
+
+        assertTrue(r.isEmpty());
+        verify(baseMapper, never()).selectList(any());
+    }
+
+    @Test
+    @DisplayName("过期列表：只查 submitted —— confirmed_onsite 是现金结算完成态，释放它=伪造账目")
+    void expiredList_onlySubmitted() {
+        when(baseMapper.selectList(any())).thenReturn(List.of());
+
+        service.listExpiredUnsettled(null, null, null);
+
+        ArgumentCaptor<LambdaQueryWrapper<GzRecycleAppointment>> cap = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(baseMapper).selectList(cap.capture());
+        LambdaQueryWrapper<GzRecycleAppointment> w = cap.getValue();
+        String sql = w.getSqlSegment();
+        var params = w.getParamNameValuePairs().values();
+        assertTrue(sql.contains("status"), "必须按 status 过滤，实际 SQL=" + sql);
+        assertTrue(params.contains("submitted"), "候选集必须锁死 submitted，实际参数=" + params);
+        assertTrue(!params.contains("confirmed_onsite"),
+            "confirmed_onsite 是现金结算完成态，绝不能进候选（释放它=伪造账目），实际参数=" + params);
     }
 }
