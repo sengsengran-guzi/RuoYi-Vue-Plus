@@ -6,6 +6,7 @@ import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypePriceBo;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypePrice;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatSyncResultVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypeConfigVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypePriceVO;
 import org.dromara.gz.bean.mapper.GzBeanSeatMapper;
@@ -49,12 +50,14 @@ class GzBeanSeatTypeConfigServiceImplTest {
     private org.dromara.gz.bean.mapper.GzBeanDayPassPriceMapper dayPassPriceMapper;
     @Mock
     private org.dromara.gz.bean.mapper.GzBeanSeatMapper seatMapper;
+    @Mock
+    private org.dromara.gz.bean.service.IGzBeanSeatService seatService;
 
     private GzBeanSeatTypeConfigServiceImpl service;
 
     @BeforeEach
     void setUp() {
-        service = new GzBeanSeatTypeConfigServiceImpl(baseMapper, seatTypePriceMapper, dayPassPriceMapper, seatMapper);
+        service = new GzBeanSeatTypeConfigServiceImpl(baseMapper, seatTypePriceMapper, dayPassPriceMapper, seatMapper, seatService);
     }
 
     private GzBeanSeatTypeConfigBo validBo() {
@@ -531,5 +534,100 @@ class GzBeanSeatTypeConfigServiceImplTest {
         });
 
         assertTrue(service.insertByBo(bo));
+    }
+
+    // ------------------------------ 保存即自动对齐座位（GZ-BEAN-055） ------------------------------
+
+    /**
+     * 构造「保存后自动对齐」需要的桩：当前配置行 + 当前座位数。
+     *
+     * @param currentUnits 该桌型现有座位单元数（用来判断要不要触发同步）
+     */
+    private void stubAlignContext(GzBeanSeatTypeConfig current, long currentUnits) {
+        when(baseMapper.selectById(anyLong())).thenReturn(current);
+        when(seatMapper.selectCount(any(Wrapper.class))).thenReturn(currentUnits);
+    }
+
+    private GzBeanSeatTypeConfig configRow(int quantity, int capacity, String bookMode) {
+        GzBeanSeatTypeConfig c = new GzBeanSeatTypeConfig();
+        c.setId(77L);
+        c.setStoreId(1L);
+        c.setBookMode(bookMode);
+        c.setCapacity(capacity);
+        c.setQuantity(quantity);
+        c.setEnabled(1);
+        return c;
+    }
+
+    private GzBeanSeatSyncResultVO syncResult(int expected, int after, List<String> blocked, List<String> conflict) {
+        return GzBeanSeatSyncResultVO.builder()
+            .expected(expected).before(0).after(after).created(0).pruned(0)
+            .prunedSeatNos(List.of()).blockedSeatNos(blocked).conflictSeatNos(conflict)
+            .prefix("S").disabled(0).build();
+    }
+
+    @Test
+    @DisplayName("★ 改数量保存 → 自动同步座位，店员不用再点任何按钮")
+    void updateByBo_autoAlignsSeatUnits() {
+        GzBeanSeatTypeConfigBo bo = validBo();
+        bo.setId(77L);
+        bo.setQuantity(8);
+        when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
+        when(baseMapper.updateById(any(GzBeanSeatTypeConfig.class))).thenReturn(1);
+        stubAlignContext(configRow(8, 1, "whole"), 5L);   // 配置要 8 个，实际只有 5 个 → 该同步
+        when(seatService.syncSeatUnits(77L)).thenReturn(syncResult(8, 8, List.of(), List.of()));
+
+        assertTrue(service.updateByBo(bo));
+
+        verify(seatService).syncSeatUnits(77L);
+    }
+
+    @Test
+    @DisplayName("只改价格 / 名字（数量没变）→ 不碰座位表，免得因为某个座位挂着预约连改价都保存不了")
+    void updateByBo_skipsAlignWhenCountAlreadyMatches() {
+        GzBeanSeatTypeConfigBo bo = validBo();
+        bo.setId(77L);
+        bo.setQuantity(5);
+        when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
+        when(baseMapper.updateById(any(GzBeanSeatTypeConfig.class))).thenReturn(1);
+        stubAlignContext(configRow(5, 1, "whole"), 5L);   // 配置 5 = 实际 5 → 无需同步
+
+        assertTrue(service.updateByBo(bo));
+
+        verify(seatService, never()).syncSeatUnits(anyLong());
+    }
+
+    @Test
+    @DisplayName("★★ 对不齐（多余座位挂着预约）→ 整单抛异常回滚，绝不存下「配置说 8、看板只有 6」的自相矛盾配置")
+    void updateByBo_rollsBackWhenAlignBlockedByBookings() {
+        GzBeanSeatTypeConfigBo bo = validBo();
+        bo.setId(77L);
+        bo.setQuantity(6);
+        when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
+        when(baseMapper.updateById(any(GzBeanSeatTypeConfig.class))).thenReturn(1);
+        stubAlignContext(configRow(6, 1, "whole"), 8L);
+        when(seatService.syncSeatUnits(77L)).thenReturn(syncResult(6, 7, List.of("S8"), List.of()));
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.updateByBo(bo));
+
+        assertTrue(ex.getMessage().contains("S8"), "必须点名卡在哪个座位");
+        assertTrue(ex.getMessage().contains("看板"), "必须告诉店员去哪儿处理（店内计时看板改派）");
+    }
+
+    @Test
+    @DisplayName("停用的桌型不生成座位 —— 它的座位本就不上看板，改数量不该凭空造格子")
+    void updateByBo_skipsAlignForDisabledConfig() {
+        GzBeanSeatTypeConfigBo bo = validBo();
+        bo.setId(77L);
+        bo.setQuantity(8);
+        when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
+        when(baseMapper.updateById(any(GzBeanSeatTypeConfig.class))).thenReturn(1);
+        GzBeanSeatTypeConfig disabled = configRow(8, 1, "whole");
+        disabled.setEnabled(0);
+        when(baseMapper.selectById(anyLong())).thenReturn(disabled);
+
+        assertTrue(service.updateByBo(bo));
+
+        verify(seatService, never()).syncSeatUnits(anyLong());
     }
 }

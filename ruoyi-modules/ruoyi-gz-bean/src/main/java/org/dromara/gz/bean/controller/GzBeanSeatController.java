@@ -18,7 +18,6 @@ import org.dromara.gz.bean.domain.bo.GzBeanSeatBatchGenerateBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatQueryBo;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatBatchGenerateResultVO;
-import org.dromara.gz.bean.domain.vo.GzBeanSeatSyncResultVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatVO;
 import org.dromara.gz.bean.service.IGzBeanSeatService;
 import org.springframework.validation.annotation.Validated;
@@ -134,56 +133,4 @@ public class GzBeanSeatController extends BaseController {
         return R.ok(msg, result);
     }
 
-    /**
-     * 把该桌型的座位单元对齐到配置数量（GZ-BEAN-055）——补齐缺的 + 移除多余的。
-     *
-     * <p>与 {@code /batchGenerate} 的区别：这里<b>不用填前缀</b>（后端从已有座位反推，接着往下编）
-     * 且<b>会做减法</b>。多余座位若还挂着今天及以后的活跃单则保留不删，在 msg 与 VO 里回报编号。</p>
-     *
-     * <p>沿用 {@code batchGenerate} 权限，不新增 menu：同一件事（维护座位单元目录）的两个入口。</p>
-     */
-    @SaCheckPermission("gz:bean:seat:batchGenerate")
-    @Log(title = "拼豆座位单元同步", businessType = BusinessType.UPDATE)
-    @RepeatSubmit()
-    @PostMapping("/sync/{seatTypeConfigId}")
-    public R<GzBeanSeatSyncResultVO> sync(@NotNull @PathVariable Long seatTypeConfigId) {
-        GzBeanSeatSyncResultVO result = seatService.syncSeatUnits(seatTypeConfigId);
-        return R.ok(buildSyncMsg(result), result);
-    }
-
-    /**
-     * 同步结果的人话版。
-     *
-     * <p>刻意把「删了哪几个」和「哪几个没敢删」都摊开：软删座位在店员眼里就是「凭空少了格子」，
-     * 只回一个数字他无法判断这次同步是不是他要的结果。</p>
-     */
-    private String buildSyncMsg(GzBeanSeatSyncResultVO r) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("计时格已对齐：").append(r.getBefore()).append(" → ").append(r.getAfter())
-            .append("（配置应有 ").append(r.getExpected()).append("）");
-        if (r.getCreated() > 0) {
-            sb.append("；新增 ").append(r.getCreated()).append(" 个（编号前缀 ").append(r.getPrefix()).append("）");
-        }
-        if (r.getPruned() > 0) {
-            sb.append("；移除 ").append(r.getPruned()).append(" 个（").append(String.join("、", r.getPrunedSeatNos())).append("）");
-        }
-        if (!r.getBlockedSeatNos().isEmpty()) {
-            sb.append("；").append(String.join("、", r.getBlockedSeatNos()))
-                .append(" 还挂着预约未移除，请先在看板上改派这些单");
-        }
-        if (!r.getConflictSeatNos().isEmpty()) {
-            sb.append("；").append(String.join("、", r.getConflictSeatNos()))
-                .append(" 的编号已被其它桌型占用，未能生成");
-        }
-        if (r.getDisabled() > 0) {
-            sb.append("；另有 ").append(r.getDisabled()).append(" 个座位已停用，不出现在看板上");
-        }
-        // 兜底：数量仍没对上、且上面几条都没解释原因 → 绝不能只报一句「已对齐」让人以为完事了
-        // （GZ-BEAN-055 实测踩过：复活分支失效时同步静默什么都没做，msg 却是「2 → 2」看着像成功）
-        if (!r.getAfter().equals(r.getExpected())
-            && r.getBlockedSeatNos().isEmpty() && r.getConflictSeatNos().isEmpty()) {
-            sb.append("；⚠️ 仍与配置数量不符，请到「座位单元」页检查该桌型的座位");
-        }
-        return sb.toString();
-    }
 }

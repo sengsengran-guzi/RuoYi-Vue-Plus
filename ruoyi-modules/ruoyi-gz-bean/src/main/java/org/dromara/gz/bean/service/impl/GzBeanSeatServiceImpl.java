@@ -379,8 +379,44 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
             .toList();
         String derived = keys.size() == 1 ? StrUtil.removeSuffix(keys.get(0), "1") : longestCommonPrefix(keys);
         // 前缀长度上限 8 与 batchGenerate 的入参约束一致；空/超长说明编号被手工改成了非生成器格式
-        return StrUtil.isNotBlank(derived) && derived.length() <= 8 ? derived : derivePrefix(config);
+        if (StrUtil.isNotBlank(derived) && derived.length() <= 8) {
+            return derived;
+        }
+        return resolveFreePrefix(config);
     }
+
+    /**
+     * 为「一个座位都还没有」的桌型挑一个<b>不撞号</b>的前缀（GZ-BEAN-055）。
+     *
+     * <p><b>为什么不能直接用 {@link #derivePrefix}</b>：它按 {@code seat_type} 首字母派生，
+     * 而新桌型的 code 是后端生成的 {@code st<id>} —— 每个新桌型都会得到 {@code "S"}，
+     * 必然撞上已有的 {@code S1..S8}。{@code seat_no} 全店唯一，撞了就静默生成不出来。</p>
+     *
+     * <p>做法：基础前缀不可用就依次试 {@code 基础+2}、{@code 基础+3}…（如 {@code S} → {@code S2} → {@code S3}）。
+     * 「可用」= 该前缀的<b>第一个编号</b>在本店没被占（含软删行，因为软删行仍占 {@code seat_no}）。
+     * 这样店员新建桌型时完全不用管编号，要改再去「座位单元」页改。</p>
+     */
+    private String resolveFreePrefix(GzBeanSeatTypeConfig config) {
+        String base = derivePrefix(config);
+        boolean seatMode = "seat".equals(config.getBookMode());
+        for (int attempt = 1; attempt <= MAX_PREFIX_ATTEMPTS; attempt++) {
+            String candidate = attempt == 1 ? base : base + (attempt + 1);
+            if (candidate.length() > 8) {
+                break;
+            }
+            // 生成器产出的第一个编号：按座 {prefix}1-1（桌 {prefix}1）/ 整桌 {prefix}1
+            String firstSeatNo = seatMode ? candidate + "1-1" : candidate + "1";
+            if (baseMapper.selectRawBySeatNo(config.getStoreId(), firstSeatNo) == null) {
+                return candidate;
+            }
+        }
+        // 全试满仍撞号 —— 交给 upsertSeatUnit 记进 conflictSeatNos，由调用方报给店员，不静默吞掉
+        log.warn("[gz-bean-seat] resolveFreePrefix 未找到空闲前缀 configId={} base={}", config.getId(), base);
+        return base;
+    }
+
+    /** {@link #resolveFreePrefix} 的尝试上限 —— 单店桌型是个位数量级，20 次足够且不会退化成扫全表 */
+    private static final int MAX_PREFIX_ATTEMPTS = 20;
 
     /** 最长公共前缀；空集合或无公共部分返回空串。 */
     private String longestCommonPrefix(List<String> values) {

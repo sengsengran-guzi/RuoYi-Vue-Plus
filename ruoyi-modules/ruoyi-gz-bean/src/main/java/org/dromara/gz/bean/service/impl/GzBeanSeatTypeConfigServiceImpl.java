@@ -22,11 +22,13 @@ import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypePrice;
 import org.dromara.gz.bean.domain.vo.GzBeanDayPassPriceVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypeConfigVO;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatSyncResultVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypePriceVO;
 import org.dromara.gz.bean.mapper.GzBeanDayPassPriceMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypePriceMapper;
+import org.dromara.gz.bean.service.IGzBeanSeatService;
 import org.dromara.gz.bean.service.IGzBeanSeatTypeConfigService;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -73,6 +75,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
     private final GzBeanSeatTypePriceMapper seatTypePriceMapper;
     private final GzBeanDayPassPriceMapper dayPassPriceMapper;
     private final GzBeanSeatMapper seatMapper;
+    private final IGzBeanSeatService seatService;
 
     @Override
     public TableDataInfo<GzBeanSeatTypeConfigVO> selectPageList(GzBeanSeatTypeConfigQueryBo query, PageQuery pageQuery) {
@@ -173,6 +176,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         bo.setId(add.getId());
         log.info("[gz-bean-seat-type-config] INSERT id={} storeId={} name={} bookMode={} capacity={} quantity={} priceCent={}",
             add.getId(), add.getStoreId(), add.getName(), add.getBookMode(), add.getCapacity(), add.getQuantity(), add.getPriceCent());
+        alignSeatUnits(add.getId());
         return true;
     }
 
@@ -196,8 +200,61 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
             log.info("[gz-bean-seat-type-config] UPDATE id={} name={} bookMode={} capacity={} quantity={} priceCent={} enabled={} sortNo={}",
                 update.getId(), update.getName(), update.getBookMode(), update.getCapacity(),
                 update.getQuantity(), update.getPriceCent(), update.getEnabled(), update.getSortNo());
+            alignSeatUnits(bo.getId());
         }
         return flag;
+    }
+
+    /**
+     * 保存桌型后把座位单元<b>对齐到配置的数量</b>（GZ-BEAN-055）—— 店员看不到这一步。
+     *
+     * <p><b>为什么做成自动而不是给个「同步」按钮</b>：「数量 × 每桌座位数」和看板计时格
+     * 本来就该是同一个数，让店员理解「配额」「计时格」两个概念、再手动点按钮把它们对齐，
+     * 是把系统内部的不一致外包给了使用者。实测线上 4 个桌型全部对不上，就是这个模型
+     * 手工维护不住的证据。改成保存即对齐后，店员只需要填「我店里有几张桌」。</p>
+     *
+     * <p><b>对不齐就整单回滚</b>：同步没能达到目标数量（多余座位挂着预约 / 编号被别的桌型占），
+     * 说明保存这个数量会留下一个「配置说 8、看板只有 6」的错位状态 —— 那正是本次要消灭的东西。
+     * 与其存下一个自相矛盾的配置，不如让保存失败并把原因说清楚，让人先去处理冲突。
+     * 事务同一个，抛异常即回滚，配置不会落库。</p>
+     *
+     * <p>只在数量类字段真的变了、或已有错位时才动座位 —— 改个价格 / 改个名字不该碰座位表
+     * （更不该因为某个座位挂着预约就连改价都保存不了）。</p>
+     */
+    private void alignSeatUnits(Long configId) {
+        GzBeanSeatTypeConfig current = baseMapper.selectById(configId);
+        if (current == null || !Integer.valueOf(ENABLED_ON).equals(current.getEnabled())) {
+            // 停用的桌型不生成座位：它的座位本来就不上看板，改它的数量不该凭空造格子
+            return;
+        }
+        int expected = expectedCells(current.getBookMode(), current.getQuantity(), current.getCapacity());
+        long units = seatMapper.selectCount(Wrappers.<GzBeanSeat>lambdaQuery()
+            .eq(GzBeanSeat::getSeatTypeConfigId, configId));
+        if (units == expected) {
+            return;
+        }
+        GzBeanSeatSyncResultVO r = seatService.syncSeatUnits(configId);
+        if (r.getAfter().equals(r.getExpected())) {
+            log.info("[gz-bean-seat-type-config] 座位单元已随配置自动对齐 configId={} {} → {}",
+                configId, r.getBefore(), r.getAfter());
+            return;
+        }
+        throw new ServiceException(buildAlignFailureMsg(r));
+    }
+
+    /** 自动对齐失败的报错文案 —— 必须说清「卡在哪几个座位」和「该去做什么」，否则店员只会反复点保存。 */
+    private String buildAlignFailureMsg(GzBeanSeatSyncResultVO r) {
+        StringBuilder sb = new StringBuilder("保存失败：数量改为该值需要把计时格调整到 ")
+            .append(r.getExpected()).append(" 个，但当前只能到 ").append(r.getAfter()).append(" 个。");
+        if (!r.getBlockedSeatNos().isEmpty()) {
+            sb.append(String.join("、", r.getBlockedSeatNos()))
+                .append(" 还挂着今天及以后的预约，不能撤掉 —— 请先在店内计时看板上把这些客人改派到其它座位，再改数量。");
+        }
+        if (!r.getConflictSeatNos().isEmpty()) {
+            sb.append("编号 ").append(String.join("、", r.getConflictSeatNos()))
+                .append(" 已被其它桌型占用，无法生成 —— 请到「座位单元」页调整编号后重试。");
+        }
+        return sb.toString();
     }
 
     @Override
