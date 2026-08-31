@@ -114,18 +114,28 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
     /** Redis 锁前缀：同用户提交串行化（客户 7.24 一人一单守卫，gz:recycle:lock:user_submit:{userId}） */
     private static final String LOCK_USER_SUBMIT_PREFIX = "gz:recycle:lock:user_submit:";
     /**
-     * 「一人一单」守卫的进行中态（客户 7.24）：排除 {@code paid / cancelled / no_show} 三终态（拿到钱或结束即可再约），
-     * 与 {@link #ACTIVE_HOLD_STATUSES}（含 paid，当天仍占时段档）刻意不同。
+     * 「一人一单」守卫的进行中态（客户 7.24）：口径 = <b>这单还没结束，所以不许再约</b>。
+     * 与 {@link #ACTIVE_HOLD_STATUSES}（占格集，含 paid / manual_hold）刻意不同。
      *
      * <p>⚠️ 本集用于读路径 {@link #getActiveAppointment}；写路径守卫 {@code countActiveByUserForUpdate} 的
-     * {@code @Select} SQL 内联同一四态字面量（MyBatis 注解无法引用本常量）。<b>改口径必须两处同步</b>，
-     * 否则 /active 预检与 submit 拦截口径分叉（漏拦超发 / 误拦）。</p>
+     * {@code @Select} SQL 内联同一批字面量（MyBatis 注解无法引用本常量）。<b>改口径必须两处同步</b>，
+     * 否则 /active 预检与 submit 拦截口径分叉（漏拦超发 / 误拦）。{@code GzRecycleActiveStatusConsistencyTest}
+     * 反射比对两份拷贝，是唯一的机械闸门。</p>
      *
      * <p>⚠️ ADR-0021 坑位 3：本集<b>不含</b> {@code manual_hold}——手动占用记录 {@code user_id} 恒 NULL 本就
      * 不匹配任何用户，此处显式声明口径，防止后人「顺手补齐」把顾客可约性搞坏。</p>
+     *
+     * <p><b>⚠️ 为什么不含 {@code confirmed_onsite}（GZ-RECYCLE-018 修）</b>：客户 7.15 改店内现金结算后，
+     * {@link #verifyAndPayout} 在 auto-payout 关闭时<b>核对确认即终态</b>（直接 return，不再进 paying/paid）——
+     * 顾客当场拿了现金、交易已了结。把它留在本集里会让<b>每一个成功卖过一次东西的老顾客永久约不了第二单</b>
+     * （4127），线上已实际发生。<br>
+     * auto-payout 开启时同样安全：该方法整体 {@code @Transactional(rollbackFor = Exception.class)}，
+     * 打款发起抛异常会连 {@code markConfirmedOnsite} 一起回滚（单子退回 {@code submitted}），
+     * 而 {@code markPaying} 前一句 UPDATE 已持有行锁到提交、返 0 实际不可能。<b>真正资金在途的
+     * {@code paying / payout_failed} 仍在本集内</b>，拦截能力不减。</p>
      */
     private static final List<String> USER_ACTIVE_STATUSES =
-        List.of("submitted", "confirmed_onsite", "paying", "payout_failed");
+        List.of("submitted", "paying", "payout_failed");
     /** Redis 锁 TTL（同拼豆 5s） */
     private static final Duration LOCK_TTL = Duration.ofSeconds(5);
     /**

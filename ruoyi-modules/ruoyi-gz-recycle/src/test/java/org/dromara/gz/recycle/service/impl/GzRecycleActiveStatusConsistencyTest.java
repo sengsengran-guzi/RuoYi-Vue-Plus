@@ -72,6 +72,20 @@ class GzRecycleActiveStatusConsistencyTest {
         assertTrue(!user.contains("manual_hold"), "一人一单集不含 manual_hold —— 手动占用行 user_id 恒 NULL");
     }
 
+    @Test
+    @DisplayName("★ 一人一单集不含 confirmed_onsite —— 含了 = 卖过一次的老顾客永久约不了第二单（GZ-RECYCLE-018）")
+    void userActiveStatuses_mustNotContainConfirmedOnsite() throws Exception {
+        List<String> user = readStringListConstant(GzRecycleAppointmentServiceImpl.class, "USER_ACTIVE_STATUSES");
+        assertTrue(!user.contains("confirmed_onsite"),
+            "客户 7.15 改店内现金结算后 confirmed_onsite 即终态（核对完顾客当场拿钱，不再进 paying/paid）。"
+                + "把它算作「进行中」会让每个成功卖过一次东西的老顾客永久撞 4127 —— 线上已实际发生过。"
+                + "当前集合=" + user);
+        // 资金真在途的两态必须保留，否则这个修就从「解封老顾客」变成「拆掉资金守卫」
+        assertTrue(user.contains("paying"), "paying 是钱在途，必须仍拦");
+        assertTrue(user.contains("payout_failed"), "payout_failed 是打款失败待处理，必须仍拦");
+        assertTrue(user.contains("submitted"), "submitted 是真·进行中，必须仍拦");
+    }
+
     /* ---------------- helpers ---------------- */
 
     @SuppressWarnings("unchecked")

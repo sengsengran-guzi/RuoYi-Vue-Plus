@@ -116,16 +116,21 @@ public interface GzRecycleAppointmentMapper extends BaseMapperPlus<GzRecycleAppo
     /**
      * 同一用户当前进行中的回收预约数（客户 7.24「一人一单」守卫，FOR UPDATE）。
      *
-     * <p>「进行中」= {@code submitted / confirmed_onsite / paying / payout_failed}
-     * （{@code paid 已到账 / cancelled 已取消 / no_show 已过期} 三终态释放，可再预约）。
+     * <p>「进行中」= {@code submitted / paying / payout_failed}
+     * （{@code confirmed_onsite 店员已确认 / paid 已到账 / cancelled 已取消 / no_show 已过期} 均为终态，可再预约）。
      * <b>注意与 {@link #countActiveCoveringHourForUpdate} 活跃集不同</b>：那个含 {@code paid}（当天仍占小时格），
      * 本守卫排除 {@code paid}（拿到钱即结清，可再约）。</p>
+     *
+     * <p><b>⚠️ 不含 {@code confirmed_onsite}（GZ-RECYCLE-018 修）</b>：客户 7.15 改店内现金结算后，核对确认即终态
+     * （顾客当场拿现金，不再进 paying/paid）。留着它会让每个成功卖过一次的老顾客永久约不了第二单（4127）。
+     * 真正资金在途的 {@code paying / payout_failed} 仍在集内。详见 {@code USER_ACTIVE_STATUSES} 的 javadoc。</p>
      *
      * <p>并发：service 上层先抢 {@code gz:recycle:lock:user_submit:{userId}} Redis 锁串行化同用户提交（防连点两单都过），
      * {@code FOR UPDATE} + REPEATABLE_READ 间隙锁做 DB 层双保险。tenant_id 显式传（mp JWT 无 tenant，同 submit 口径）。</p>
      *
      * <p>⚠️ 状态集须与 {@code GzRecycleAppointmentServiceImpl.USER_ACTIVE_STATUSES} 保持一致（MyBatis @Select
-     * 无法引用 Java 常量，故此处内联字面量）；改「进行中」口径需两处同步，否则守卫（拦下单）与 /active 预检口径分叉。</p>
+     * 无法引用 Java 常量，故此处内联字面量）；改「进行中」口径需两处同步，否则守卫（拦下单）与 /active 预检口径分叉。
+     * {@code GzRecycleActiveStatusConsistencyTest} 反射比对两份拷贝。</p>
      *
      * @param tenantId 租户 id（显式传）
      * @param userId   提交用户 id
@@ -133,7 +138,7 @@ public interface GzRecycleAppointmentMapper extends BaseMapperPlus<GzRecycleAppo
      */
     @Select("SELECT COUNT(*) FROM gz_recycle_appointment " +
         "WHERE tenant_id = #{tenantId} AND user_id = #{userId} " +
-        "  AND status IN ('submitted', 'confirmed_onsite', 'paying', 'payout_failed') AND del_flag = '0' " +
+        "  AND status IN ('submitted', 'paying', 'payout_failed') AND del_flag = '0' " +
         "FOR UPDATE")
     long countActiveByUserForUpdate(@Param("tenantId") String tenantId, @Param("userId") Long userId);
 
