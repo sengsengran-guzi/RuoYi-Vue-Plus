@@ -6,6 +6,7 @@ import org.dromara.gz.bean.domain.bo.GzBeanSeatBatchGenerateBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatQueryBo;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatBatchGenerateResultVO;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatSyncResultVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatVO;
 
 import java.util.Collection;
@@ -63,6 +64,25 @@ public interface IGzBeanSeatService {
      * @return 实际新建 + 复活的座位单元数量
      */
     GzBeanSeatBatchGenerateResultVO batchGenerate(GzBeanSeatBatchGenerateBo bo);
+
+    /**
+     * 把该桌型的座位单元<b>对齐到配置的数量</b>（GZ-BEAN-055）——补齐缺的 + 移除多余的。
+     *
+     * <p><b>为什么要有它</b>：{@code quantity × capacity} 是小程序售卖配额分母，
+     * {@code gz_bean_seat} 行数是看板计时格与核销可分座池，两者只在手点「批量生成」那一刻对齐过。
+     * 改数量不动座位表、批量生成只增不减 → 两个数会朝两个方向漂：
+     * <b>配额多</b>=卖得出但核销时没座可分，<b>座位多</b>=看板格子线上永远卖不掉。</p>
+     *
+     * <p>与 {@link #batchGenerate} 的区别：批量生成只做加法且要店员自己填前缀；
+     * 同步<b>自己反推前缀</b>（接着已有编号往下编）并且<b>会做减法</b>。</p>
+     *
+     * <p><b>减法的安全边界</b>：多余座位若还挂着今天及以后的活跃单，<b>不删</b>，只在结果里回报编号。
+     * 删了会让那笔已付款单从看板上彻底消失（看板遍历座位、孤儿单被静默丢弃），店员再也看不见客人。</p>
+     *
+     * @param seatTypeConfigId 桌型配置 id
+     * @return 补了几个 / 删了几个 / 哪些因挂单没删 / 用的哪个前缀
+     */
+    GzBeanSeatSyncResultVO syncSeatUnits(Long seatTypeConfigId);
 
     /** 座位号唯一性校验（true=唯一可用 / false=已存在；忽略软删，对齐 DB UNIQUE 仅在未删行生效语义） */
     boolean checkSeatNoUnique(GzBeanSeatBo bo);

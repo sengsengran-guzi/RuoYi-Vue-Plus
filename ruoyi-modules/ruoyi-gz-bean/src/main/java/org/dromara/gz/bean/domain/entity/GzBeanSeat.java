@@ -85,7 +85,7 @@ public class GzBeanSeat extends TenantEntity {
     /** 看板备注所属日期（GZ-BEAN-052 每天自动清理）：读看板发现非当天 → 清空 remark。remark 为空时同为 NULL */
     private LocalDate remarkDate;
 
-    /** 软删标志（'0'=正常 / '2'=删除，对齐 ruoyi 全局 @TableLogic logicDeleteValue=2） */
+    /** 软删标志（'0'=正常 / '1'=删除，对齐全局 mybatis-plus logicDeleteValue=1 / logicNotDeleteValue=0） */
     @TableLogic
     private String delFlag;
 }

@@ -1,5 +1,6 @@
 package org.dromara.gz.bean.service.impl;
 
+import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.ObjectUtil;
 import cn.hutool.core.util.RandomUtil;
 import cn.hutool.core.util.StrUtil;
@@ -16,12 +17,14 @@ import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypePriceBo;
 import org.dromara.gz.bean.domain.entity.GzBeanDayPassPrice;
+import org.dromara.gz.bean.domain.entity.GzBeanSeat;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypePrice;
 import org.dromara.gz.bean.domain.vo.GzBeanDayPassPriceVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypeConfigVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypePriceVO;
 import org.dromara.gz.bean.mapper.GzBeanDayPassPriceMapper;
+import org.dromara.gz.bean.mapper.GzBeanSeatMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypePriceMapper;
 import org.dromara.gz.bean.service.IGzBeanSeatTypeConfigService;
@@ -35,7 +38,9 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * gz_bean_seat_type_config 服务实现（GZ-BEAN-013 → GZ-BEAN-018 升级）。
@@ -67,12 +72,14 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
     private final GzBeanSeatTypeConfigMapper baseMapper;
     private final GzBeanSeatTypePriceMapper seatTypePriceMapper;
     private final GzBeanDayPassPriceMapper dayPassPriceMapper;
+    private final GzBeanSeatMapper seatMapper;
 
     @Override
     public TableDataInfo<GzBeanSeatTypeConfigVO> selectPageList(GzBeanSeatTypeConfigQueryBo query, PageQuery pageQuery) {
         LambdaQueryWrapper<GzBeanSeatTypeConfig> lqw = buildWrapper(query);
         Page<GzBeanSeatTypeConfigVO> result = baseMapper.selectVoPage(pageQuery.build(), lqw);
         result.getRecords().forEach(this::fillDerived);
+        fillSeatUnitCounts(result.getRecords());
         return TableDataInfo.build(result);
     }
 
@@ -80,6 +87,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
     public List<GzBeanSeatTypeConfigVO> selectList(GzBeanSeatTypeConfigQueryBo query) {
         List<GzBeanSeatTypeConfigVO> list = baseMapper.selectVoList(buildWrapper(query));
         list.forEach(this::fillDerived);
+        fillSeatUnitCounts(list);
         return list;
     }
 
@@ -90,7 +98,51 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         }
         GzBeanSeatTypeConfigVO vo = baseMapper.selectVoById(id);
         fillDerived(vo);
+        if (vo != null) {
+            fillSeatUnitCounts(List.of(vo));
+        }
         return vo;
+    }
+
+    /**
+     * 批量回填「应有 / 实际 / 已停用」计时格数（GZ-BEAN-055）—— 一次 group by，不逐行查。
+     *
+     * <p>没有任何座位单元的桌型也要回填 0（不是 null）：前端要能把「一个格子都没生成」
+     * 和「字段没返回」区分开，前者是需要红字提示的真实错配。</p>
+     */
+    private void fillSeatUnitCounts(List<GzBeanSeatTypeConfigVO> list) {
+        if (CollUtil.isEmpty(list)) {
+            return;
+        }
+        List<Long> ids = list.stream().map(GzBeanSeatTypeConfigVO::getId).filter(ObjectUtil::isNotNull).toList();
+        if (ids.isEmpty()) {
+            return;
+        }
+        Map<Long, GzBeanSeatMapper.SeatUnitCount> counts = seatMapper.countUnitsByConfigIds(ids).stream()
+            .collect(Collectors.toMap(GzBeanSeatMapper.SeatUnitCount::getSeatTypeConfigId, c -> c, (a, b) -> a));
+        for (GzBeanSeatTypeConfigVO vo : list) {
+            GzBeanSeatMapper.SeatUnitCount c = counts.get(vo.getId());
+            int cells = c == null || c.getCells() == null ? 0 : c.getCells();
+            int units = c == null || c.getUnits() == null ? 0 : c.getUnits();
+            vo.setBoardCells(cells);
+            vo.setDisabledCells(units - cells);
+            vo.setExpectedCells(expectedCells(vo.getBookMode(), vo.getQuantity(), vo.getCapacity()));
+        }
+    }
+
+    /**
+     * 按配置推导应有计时格数 —— 与 {@code GzBeanBookingServiceImpl.slotCapacity}
+     * 及 {@code GzBeanSeatServiceImpl.expectedSeatUnits} 同一口径（ADR-0014 §2 / ADR-0016 取舍 C）。
+     *
+     * <p>⚠️ 这个公式在项目里有 3 份物理拷贝（分属三个 service，无共享基类）。改一处必须三处一起改，
+     * 否则「后台显示应有几格」「同步生成几个」「小程序卖几个」会互相打架。</p>
+     */
+    private Integer expectedCells(String bookMode, Integer quantity, Integer capacity) {
+        int qty = quantity == null ? 0 : Math.max(0, quantity);
+        if (!"seat".equals(bookMode)) {
+            return qty;
+        }
+        return qty * (capacity == null || capacity < 1 ? 1 : capacity);
     }
 
     @Override
@@ -131,6 +183,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
             throw new ServiceException("配置 ID 不能为空");
         }
         validateBookMode(bo.getBookMode());
+        validateBookModeChange(bo);
         validateDayPass(bo);
         validateMpVisible(bo);
         if (!checkNameUnique(bo)) {
@@ -355,6 +408,30 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
     private void validateBookMode(String bookMode) {
         if (StrUtil.isBlank(bookMode) || !VALID_BOOK_MODES.contains(bookMode)) {
             throw new ServiceException("订法无效（应为 whole 整桌 / seat 按座 之一）：" + bookMode);
+        }
+    }
+
+    /**
+     * 已生成座位单元的桌型<b>禁止改订法</b>（GZ-BEAN-055）。
+     *
+     * <p><b>为什么必须拦</b>：订法决定编号规则 —— 整桌是 {@code S1}（一桌一个单元），
+     * 按座是 {@code Q1-1}（桌号下挂座号）。改了订法，已有座位<b>全部</b>不再符合新规则，
+     * 于是「同步计时格」会把它们整批判成多余、逐个尝试移除；挂着预约的还会卡在那里删不掉，
+     * 桌型就永久停在一个既不是整桌也不是按座的半残状态。</p>
+     *
+     * <p>出路是先清空该桌型的座位单元再改订法 —— 报错文案直接把这条路说出来。</p>
+     */
+    private void validateBookModeChange(GzBeanSeatTypeConfigBo bo) {
+        GzBeanSeatTypeConfig current = baseMapper.selectById(bo.getId());
+        if (current == null || StrUtil.isBlank(current.getBookMode())
+            || current.getBookMode().equals(bo.getBookMode())) {
+            return;
+        }
+        long units = seatMapper.selectCount(Wrappers.<GzBeanSeat>lambdaQuery()
+            .eq(GzBeanSeat::getSeatTypeConfigId, bo.getId()));
+        if (units > 0) {
+            throw new ServiceException("该桌型已生成 " + units + " 个座位单元，不能再改订法"
+                + "（整桌与按座的编号规则不同）。请先到「座位单元」删除这些座位，再改订法。");
         }
     }
 

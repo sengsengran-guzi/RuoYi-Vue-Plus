@@ -10,6 +10,7 @@ import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.util.Collection;
 import java.util.List;
 
 /**
@@ -632,4 +633,33 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
         @Param("start") LocalDate start,
         @Param("end") LocalDate end,
         @Param("granularity") String granularity);
+
+    /**
+     * 这批座位里，哪些还挂着<b>今天及以后</b>的活跃单（GZ-BEAN-055 座位移除守卫）。
+     *
+     * <p><b>为什么必须有这道闸</b>：看板 {@code selectBoard} 的结构是「遍历座位 → 取该座的单」，
+     * <b>挂在已删/已停用座位上的单会被静默丢弃</b>；而②待分座区只收 {@code seat_id IS NULL} 的单。
+     * 所以移除一个还挂着活跃单的座位 = 那笔已付款单<b>从看板上彻底消失</b>——①区没有那个座位、
+     * ②区不收它，店员完全看不见，客人钱已付、人可能已在店里。删除/停用/同步缩减都必须先过这道闸。</p>
+     *
+     * <p>活跃口径与 {@link #selectActiveBookingsForBoard} 逐字一致
+     * （{@code status IN ('pending','used')} × {@code pay_status IN ('paying','paid')}）——
+     * 两处口径漂移会让守卫放过看板真会显示的单。<b>额外带 {@code sess_date >= #{fromDate}}</b>：
+     * 昨天以前的历史单不再上看板，拦着它们会让座位永远删不掉。</p>
+     *
+     * @param tenantId 租户
+     * @param seatIds  待检查的座位 id（非空）
+     * @param fromDate 起始服务日（含）——传今天
+     * @return 仍挂活跃单的座位 id（空 = 这批座位都能安全移除）
+     */
+    @Select("<script>" +
+        "SELECT DISTINCT seat_id FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND del_flag = '0' " +
+        "  AND seat_id IN <foreach collection='seatIds' item='sid' open='(' separator=',' close=')'>#{sid}</foreach> " +
+        "  AND sess_date &gt;= #{fromDate} " +
+        "  AND status IN ('pending','used') AND pay_status IN ('paying','paid')" +
+        "</script>")
+    List<Long> selectSeatIdsWithActiveBookings(@Param("tenantId") String tenantId,
+                                               @Param("seatIds") Collection<Long> seatIds,
+                                               @Param("fromDate") LocalDate fromDate);
 }

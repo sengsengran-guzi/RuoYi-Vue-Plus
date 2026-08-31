@@ -6,6 +6,7 @@ import org.dromara.gz.bean.domain.bo.GzBeanSeatBatchGenerateBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatBo;
 import org.dromara.gz.bean.domain.entity.GzBeanSeat;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
+import org.dromara.gz.bean.mapper.GzBeanBookingMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -55,12 +56,14 @@ class GzBeanSeatServiceImplTest {
     private GzBeanSeatMapper baseMapper;
     @Mock
     private GzBeanSeatTypeConfigMapper configMapper;
+    @Mock
+    private GzBeanBookingMapper bookingMapper;
 
     private GzBeanSeatServiceImpl service;
 
     @BeforeEach
     void setUp() {
-        service = new GzBeanSeatServiceImpl(baseMapper, configMapper);
+        service = new GzBeanSeatServiceImpl(baseMapper, configMapper, bookingMapper);
     }
 
     private GzBeanSeatTypeConfig config(Long id, Long storeId, String seatType, String name,

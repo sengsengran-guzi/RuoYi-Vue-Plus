@@ -17,15 +17,19 @@ import org.dromara.gz.bean.domain.bo.GzBeanSeatQueryBo;
 import org.dromara.gz.bean.domain.entity.GzBeanSeat;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatBatchGenerateResultVO;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatSyncResultVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatVO;
+import org.dromara.gz.bean.mapper.GzBeanBookingMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper;
 import org.dromara.gz.bean.service.IGzBeanSeatService;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -55,10 +59,23 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
 
     private static final int ENABLED_ON = 1;
     private static final int ENABLED_OFF = 0;
-    private static final String DEL_FLAG_DELETED = "2";
+    /**
+     * 未软删标志 —— 对齐全局 {@code mybatis-plus.global-config.dbConfig.logicNotDeleteValue: 0}。
+     *
+     * <p><b>为什么判「不等于 0」而不是「等于某个删除值」</b>：这里原本硬编码了
+     * {@code DEL_FLAG_DELETED = "2"}，但全局 {@code logicDeleteValue} 其实是 <b>1</b> ——
+     * 于是「命中软删座 → 复活」这条分支<b>从来没有触发过</b>：软删行的 {@code del_flag='1'} 永远
+     * 不等于 {@code "2"}，代码把它当成"正常座已存在"幂等跳过，而 {@code uk_tenant_store_seat_no}
+     * 不含 {@code del_flag}，那个编号就被永久占住 —— 删过的座位<b>再也生成不回来</b>，
+     * 界面还显示"生成 0 个"不报错。（GZ-BEAN-055 实测复现）</p>
+     *
+     * <p>改判「非未删值即已删」后，无论全局删除值配成 1 / 2 / 别的，复活分支都成立。</p>
+     */
+    private static final String DEL_FLAG_NORMAL = "0";
 
     private final GzBeanSeatMapper baseMapper;
     private final GzBeanSeatTypeConfigMapper configMapper;
+    private final GzBeanBookingMapper bookingMapper;
 
     @Override
     public TableDataInfo<GzBeanSeatVO> selectPageList(GzBeanSeatQueryBo query, PageQuery pageQuery) {
@@ -163,9 +180,58 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
         if (CollUtil.isEmpty(ids)) {
             return false;
         }
+        assertSeatsRemovable(ids, "删除座位");
         int affected = baseMapper.deleteByIds(ids);
         log.info("[gz-bean-seat] DELETE ids={} affected={}", ids, affected);
         return affected > 0;
+    }
+
+    /**
+     * 移除座位前的活跃预约闸（GZ-BEAN-055）——删除 / 停用 / 同步缩减三条路径共用。
+     *
+     * <p><b>为什么这道闸是必须的</b>：看板 {@code selectBoard} 遍历的是座位，
+     * 挂在已删/已停用座位上的单会被静默丢弃；②待分座区又只收 {@code seat_id IS NULL} 的单。
+     * 于是移除一个还挂着单的座位 = <b>那笔已付款单从看板上彻底消失</b>，店员看不见、客人已付钱。
+     * 没有任何页面能发现这种孤儿单，只有客人到店才暴露。</p>
+     *
+     * <p>拒绝而不是静默跳过：店员的意图（删掉这个座）没达成就必须让他知道，
+     * 并告诉他出路（改派到别的座）。</p>
+     *
+     * @param ids    待移除的座位 id
+     * @param action 动作名，拼进报错文案（如「删除座位」/「停用座位」）
+     * @throws ServiceException 任一座位仍挂今天及以后的活跃单
+     */
+    private void assertSeatsRemovable(Collection<Long> ids, String action) {
+        List<GzBeanSeat> seats = baseMapper.selectByIds(ids);
+        if (CollUtil.isEmpty(seats)) {
+            return;
+        }
+        Set<Long> blocked = Set.copyOf(findSeatIdsWithActiveBookings(seats));
+        if (blocked.isEmpty()) {
+            return;
+        }
+        String seatNos = seats.stream()
+            .filter(s -> blocked.contains(s.getId()))
+            .map(GzBeanSeat::getSeatNo)
+            .collect(Collectors.joining("、"));
+        throw new ServiceException(action + "失败：" + seatNos
+            + " 还挂着今天及以后的预约。请先在看板上把这些单改派到其它座位，或等预约结束后再操作。");
+    }
+
+    /**
+     * 这批座位里仍挂今天及以后活跃单的座位 id。
+     *
+     * <p>按 tenant 分组查：座位理论上同店同租户，但守卫不做这个假设——
+     * 一旦跨租户混入，用错 tenantId 查出来的是"没有活跃单"，闸会静默放行。</p>
+     */
+    private List<Long> findSeatIdsWithActiveBookings(List<GzBeanSeat> seats) {
+        LocalDate today = LocalDate.now();
+        return seats.stream()
+            .collect(Collectors.groupingBy(GzBeanSeat::getTenantId,
+                Collectors.mapping(GzBeanSeat::getId, Collectors.toList())))
+            .entrySet().stream()
+            .flatMap(e -> bookingMapper.selectSeatIdsWithActiveBookings(e.getKey(), e.getValue(), today).stream())
+            .toList();
     }
 
     @Override
@@ -176,6 +242,10 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
         }
         if (enabled == null || (enabled != ENABLED_ON && enabled != ENABLED_OFF)) {
             throw new ServiceException("enabled 取值仅 0/1");
+        }
+        if (enabled == ENABLED_OFF) {
+            // 停用与删除对看板等价：座位从 selectBoard 消失，挂它的活跃单一并消失（同 assertSeatsRemovable 注释）
+            assertSeatsRemovable(List.of(id), "停用座位");
         }
         GzBeanSeat update = new GzBeanSeat();
         update.setId(id);
@@ -206,6 +276,129 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
             .conflictSeatNos(List.copyOf(tally.conflictSeatNos))
             .hasConflict(!tally.conflictSeatNos.isEmpty())
             .build();
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public GzBeanSeatSyncResultVO syncSeatUnits(Long seatTypeConfigId) {
+        GzBeanSeatTypeConfig config = requireConfig(seatTypeConfigId);
+        int expected = expectedSeatUnits(config);
+        List<GzBeanSeat> before = listActiveUnits(config.getId());
+
+        // ① 补齐 —— 前缀从已有座位反推（绝不能用「第 N 个临时桌」这类计数默认值：
+        //    已有 T11-* 却按 T2 生成会造出一组跟原来凑不成桌的孤立编号，界面还显示「生成成功」）
+        String prefix = resolveSyncPrefix(config, before);
+        GenerateTally tally = new GenerateTally();
+        generateForConfig(config, prefix, tally);
+
+        // ② 缩减 —— 按 (sortNo, seatNo) 取尾部多余的。用排序而非编号匹配来挑：
+        //    店员手工改过编号时，编号匹配会把改过名的座位全判成多余，排序不会。
+        List<GzBeanSeat> current = listActiveUnits(config.getId());
+        List<String> prunedNos = new ArrayList<>();
+        List<String> blockedNos = new ArrayList<>();
+        if (current.size() > expected) {
+            List<GzBeanSeat> surplus = current.subList(expected, current.size());
+            Set<Long> booked = Set.copyOf(findSeatIdsWithActiveBookings(surplus));
+            List<Long> removable = new ArrayList<>();
+            for (GzBeanSeat s : surplus) {
+                if (booked.contains(s.getId())) {
+                    // 挂着今天及以后的活跃单 —— 删了那笔已付款单会从看板上彻底消失（见 assertSeatsRemovable）。
+                    // 宁可留一个多余格子，也不让店员失去对客人的可见性。
+                    blockedNos.add(s.getSeatNo());
+                } else {
+                    removable.add(s.getId());
+                    prunedNos.add(s.getSeatNo());
+                }
+            }
+            if (!removable.isEmpty()) {
+                baseMapper.deleteByIds(removable);
+            }
+        }
+
+        List<GzBeanSeat> after = listActiveUnits(config.getId());
+        int disabled = (int) after.stream().filter(s -> !Integer.valueOf(ENABLED_ON).equals(s.getEnabled())).count();
+        log.info("[gz-bean-seat] sync configId={} prefix={} expected={} before={} after={} created={} pruned={} blocked={} conflicts={}",
+            config.getId(), prefix, expected, before.size(), after.size(), tally.created, prunedNos.size(), blockedNos, tally.conflictSeatNos);
+        return GzBeanSeatSyncResultVO.builder()
+            .expected(expected)
+            .before(before.size())
+            .after(after.size())
+            .created(tally.created)
+            .pruned(prunedNos.size())
+            .prunedSeatNos(List.copyOf(prunedNos))
+            .blockedSeatNos(List.copyOf(blockedNos))
+            .conflictSeatNos(List.copyOf(tally.conflictSeatNos))
+            .prefix(prefix)
+            .disabled(disabled)
+            .build();
+    }
+
+    /**
+     * 该桌型<b>应有</b>的座位单元数 —— 与 {@code GzBeanBookingServiceImpl.slotCapacity} 同一口径
+     * （ADR-0014 §2 / ADR-0016 取舍 C：配额分母必须 = 可分物理座位数）。
+     *
+     * <p>⚠️ 两处是同一个公式的两份物理拷贝（跨 service，无法共享私有方法）。
+     * 改任一处必须同步改另一处，否则同步出来的座位数和小程序卖出去的数量又会对不上。</p>
+     */
+    private int expectedSeatUnits(GzBeanSeatTypeConfig config) {
+        int quantity = config.getQuantity() == null ? 0 : Math.max(0, config.getQuantity());
+        if (!"seat".equals(config.getBookMode())) {
+            return quantity;
+        }
+        int capacity = config.getCapacity() == null || config.getCapacity() < 1 ? 1 : config.getCapacity();
+        return quantity * capacity;
+    }
+
+    /** 该桌型当前存活（未软删）的座位单元，按看板同款顺序（sortNo → seatNo）。含已停用的：它们占着编号。 */
+    private List<GzBeanSeat> listActiveUnits(Long configId) {
+        return baseMapper.selectList(Wrappers.<GzBeanSeat>lambdaQuery()
+            .eq(GzBeanSeat::getSeatTypeConfigId, configId)
+            .orderByAsc(GzBeanSeat::getSortNo)
+            .orderByAsc(GzBeanSeat::getSeatNo));
+    }
+
+    /**
+     * 反推该桌型已在用的编号前缀，让「补齐」接着原来那批往下编，而不是另起一组。
+     *
+     * <p><b>推导依据</b>：生成器产出的永远是 {@code {prefix}1 … {prefix}n}（t 从 1 起）。所以</p>
+     * <ul>
+     *   <li>已有 <b>≥2</b> 个单位 → 它们的<b>最长公共前缀</b>就是 prefix
+     *       （{@code {Q1,Q2}}→{@code Q}；{@code {T11,T12}}→{@code T1}；{@code {Q1..Q9,Q10}}→{@code Q}）；</li>
+     *   <li>只有 <b>1</b> 个 → 它必然是 {@code prefix + "1"}，去掉末尾那个 {@code 1}
+     *       （{@code T11}→{@code T1}；{@code Q1}→{@code Q}）；</li>
+     *   <li>一个都没有 / 推不出合法前缀 → 回退 {@link #derivePrefix}。</li>
+     * </ul>
+     * <p>按座模式用 {@code table_no}（桌号带前缀），整桌模式用 {@code seat_no}。</p>
+     */
+    private String resolveSyncPrefix(GzBeanSeatTypeConfig config, List<GzBeanSeat> existing) {
+        boolean seatMode = "seat".equals(config.getBookMode());
+        List<String> keys = existing.stream()
+            .map(s -> seatMode ? s.getTableNo() : s.getSeatNo())
+            .filter(StrUtil::isNotBlank)
+            .distinct()
+            .toList();
+        String derived = keys.size() == 1 ? StrUtil.removeSuffix(keys.get(0), "1") : longestCommonPrefix(keys);
+        // 前缀长度上限 8 与 batchGenerate 的入参约束一致；空/超长说明编号被手工改成了非生成器格式
+        return StrUtil.isNotBlank(derived) && derived.length() <= 8 ? derived : derivePrefix(config);
+    }
+
+    /** 最长公共前缀；空集合或无公共部分返回空串。 */
+    private String longestCommonPrefix(List<String> values) {
+        if (CollUtil.isEmpty(values)) {
+            return "";
+        }
+        String prefix = values.get(0);
+        for (String v : values) {
+            int i = 0;
+            while (i < prefix.length() && i < v.length() && prefix.charAt(i) == v.charAt(i)) {
+                i++;
+            }
+            prefix = prefix.substring(0, i);
+            if (prefix.isEmpty()) {
+                return "";
+            }
+        }
+        return prefix;
     }
 
     /**
@@ -320,7 +513,9 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
                                 GenerateTally tally) {
         GzBeanSeat existing = baseMapper.selectRawBySeatNo(config.getStoreId(), seatNo);
         if (existing != null) {
-            if (DEL_FLAG_DELETED.equals(existing.getDelFlag())) {
+            // 空值按「存活」处理（保守）：复活会把该行改判到本桌型名下，
+            // 拿不准状态时抢一个可能还活着的座位，比少复活一个要糟得多
+            if (StrUtil.isNotBlank(existing.getDelFlag()) && !DEL_FLAG_NORMAL.equals(existing.getDelFlag())) {
                 baseMapper.reviveSoftDeleted(existing.getId(), config.getId(), tableNo, null, null, null, sortNo);
                 log.info("[gz-bean-seat] revive softDeleted id={} seatNo={} configId={}",
                     existing.getId(), seatNo, config.getId());

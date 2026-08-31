@@ -8,6 +8,7 @@ import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypePrice;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypeConfigVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatTypePriceVO;
+import org.dromara.gz.bean.mapper.GzBeanSeatMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper;
 import org.dromara.gz.bean.mapper.GzBeanSeatTypePriceMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -46,12 +47,14 @@ class GzBeanSeatTypeConfigServiceImplTest {
     private GzBeanSeatTypePriceMapper seatTypePriceMapper;
     @Mock
     private org.dromara.gz.bean.mapper.GzBeanDayPassPriceMapper dayPassPriceMapper;
+    @Mock
+    private org.dromara.gz.bean.mapper.GzBeanSeatMapper seatMapper;
 
     private GzBeanSeatTypeConfigServiceImpl service;
 
     @BeforeEach
     void setUp() {
-        service = new GzBeanSeatTypeConfigServiceImpl(baseMapper, seatTypePriceMapper, dayPassPriceMapper);
+        service = new GzBeanSeatTypeConfigServiceImpl(baseMapper, seatTypePriceMapper, dayPassPriceMapper, seatMapper);
     }
 
     private GzBeanSeatTypeConfigBo validBo() {
