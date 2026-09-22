@@ -1,9 +1,14 @@
 package org.dromara.gz.bean.service.impl;
 
+import com.baomidou.mybatisplus.core.MybatisConfiguration;
+import com.baomidou.mybatisplus.core.MybatisMapperBuilderAssistant;
 import com.baomidou.mybatisplus.core.conditions.Wrapper;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import org.dromara.common.core.exception.ServiceException;
+import org.springframework.dao.DuplicateKeyException;
 import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.bean.domain.bo.GzBeanStoreBo;
@@ -13,6 +18,7 @@ import org.dromara.gz.bean.domain.vo.GzBeanStoreVO;
 import org.dromara.gz.bean.mapper.GzBeanStoreMapper;
 import org.dromara.gz.common.domain.vo.GzFileObjectVO;
 import org.dromara.gz.common.service.IGzFileService;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -48,6 +54,14 @@ import static org.mockito.Mockito.*;
 @Tag("dev")
 @ExtendWith(MockitoExtension.class)
 class GzBeanStoreServiceImplTest {
+
+    /** getSqlSegment() 解析 lambda 列名需要 MP TableInfo 缓存；纯 Mockito 单测无 Spring 容器，手动 init（幂等）。 */
+    @BeforeAll
+    static void initLambdaCache() {
+        TableInfoHelper.initTableInfo(
+            new MybatisMapperBuilderAssistant(new MybatisConfiguration(), ""), GzBeanStore.class);
+    }
+
 
     @Mock
     private GzBeanStoreMapper baseMapper;
@@ -197,7 +211,7 @@ class GzBeanStoreServiceImplTest {
         vo.setStatus("open");
         when(baseMapper.selectVoList(any(Wrapper.class))).thenReturn(List.of(vo));
 
-        List<GzBeanStoreVO> result = service.selectMpList();
+        List<GzBeanStoreVO> result = service.selectMpList("pindou");
 
         assertEquals(1, result.size());
         assertEquals("CD001", result.get(0).getStoreNo());
@@ -220,7 +234,7 @@ class GzBeanStoreServiceImplTest {
         file.setUrl("https://oss/signed/store.png?sign=x");
         when(fileService.getPresignedUrl(900L)).thenReturn(file);
 
-        List<GzBeanStoreVO> result = service.selectMpList();
+        List<GzBeanStoreVO> result = service.selectMpList("pindou");
 
         assertEquals("https://oss/signed/store.png?sign=x", result.get(0).getImageUrl());
         assertNull(result.get(1).getImageUrl());
@@ -238,7 +252,7 @@ class GzBeanStoreServiceImplTest {
         when(baseMapper.selectVoList(any(Wrapper.class))).thenReturn(List.of(vo));
         when(fileService.getPresignedUrl(901L)).thenThrow(new RuntimeException("oss down"));
 
-        List<GzBeanStoreVO> result = service.selectMpList();
+        List<GzBeanStoreVO> result = service.selectMpList("pindou");
 
         assertEquals(1, result.size());
         assertNull(result.get(0).getImageUrl());
@@ -250,7 +264,7 @@ class GzBeanStoreServiceImplTest {
     @DisplayName("selectOptions 调用 mapper.selectVoList — admin 账号下拉数据")
     void selectOptions_callsMapper() {
         when(baseMapper.selectVoList(any(Wrapper.class))).thenReturn(List.of());
-        assertNotNull(service.selectOptions());
+        assertNotNull(service.selectOptions(null));
         verify(baseMapper).selectVoList(any(Wrapper.class));
     }
 
@@ -312,5 +326,166 @@ class GzBeanStoreServiceImplTest {
         when(baseMapper.deleteByIds(any())).thenReturn(2);
         assertTrue(service.deleteByIds(List.of(1L, 2L)));
         verify(baseMapper).deleteByIds(any());
+    }
+
+    // ------------------------------ biz_scope 业务线（GZ-BEAN-053） ------------------------------
+
+    @SuppressWarnings("unchecked")
+    private LambdaQueryWrapper<GzBeanStore> captureVoListWrapper() {
+        ArgumentCaptor<Wrapper> cap = ArgumentCaptor.forClass(Wrapper.class);
+        verify(baseMapper).selectVoList(cap.capture());
+        return (LambdaQueryWrapper<GzBeanStore>) cap.getValue();
+    }
+
+    @Test
+    @DisplayName("★ selectMpList(recycle) → FIND_IN_SET 过滤 + 值走预编译参数（回收端不再拿到拼豆店地址）")
+    void selectMpList_recycleScope_appliesFindInSet() {
+        when(baseMapper.selectVoList(any(Wrapper.class))).thenReturn(List.of());
+
+        service.selectMpList("recycle");
+
+        LambdaQueryWrapper<GzBeanStore> w = captureVoListWrapper();
+        String sql = w.getSqlSegment();
+        assertTrue(sql.contains("FIND_IN_SET"), "必须按 biz_scope 集合过滤，实际 SQL=" + sql);
+        assertFalse(sql.contains("'recycle'"), "scope 值不得字面拼进 SQL（注入面），实际 SQL=" + sql);
+        assertTrue(w.getParamNameValuePairs().containsValue("recycle"), "scope 必须作为预编译参数传入");
+    }
+
+    @Test
+    @DisplayName("★ 非法 scope（含注入串）→ 不拼任何片段，只保留基础过滤")
+    void selectMpList_illegalScope_ignored() {
+        when(baseMapper.selectVoList(any(Wrapper.class))).thenReturn(List.of());
+
+        service.selectMpList("recycle') OR 1=1 -- ");
+
+        String sql = captureVoListWrapper().getSqlSegment();
+        assertFalse(sql.contains("FIND_IN_SET"), "非白名单 scope 一律不筛，实际 SQL=" + sql);
+        assertFalse(sql.contains("OR 1=1"), "注入串绝不能进 SQL，实际 SQL=" + sql);
+    }
+
+    @Test
+    @DisplayName("selectOptions(null) → 不按业务线筛（账号绑定下拉要看全集）")
+    void selectOptions_nullScope_noFilter() {
+        when(baseMapper.selectVoList(any(Wrapper.class))).thenReturn(List.of());
+
+        service.selectOptions(null);
+
+        assertFalse(captureVoListWrapper().getSqlSegment().contains("FIND_IN_SET"));
+    }
+
+    @Test
+    @DisplayName("★ 新建门店不选业务线 → 兜底只开拼豆（不是双开，否则每建一家店都又混在一起）")
+    void insertByBo_defaultsBizScopeToPindouOnly() {
+        GzBeanStoreBo bo = new GzBeanStoreBo();
+        bo.setStoreNo("XA001");
+        bo.setName("西安店");
+        bo.setAddress("西安");
+        when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
+        when(baseMapper.insert(any(GzBeanStore.class))).thenReturn(1);
+
+        service.insertByBo(bo);
+
+        ArgumentCaptor<GzBeanStore> captor = ArgumentCaptor.forClass(GzBeanStore.class);
+        verify(baseMapper).insert(captor.capture());
+        assertEquals("pindou", captor.getValue().getBizScope());
+    }
+
+    @Test
+    @DisplayName("新建门店显式选 recycle → 原样保留（西安回收店场景）")
+    void insertByBo_preservesExplicitRecycleScope() {
+        GzBeanStoreBo bo = new GzBeanStoreBo();
+        bo.setStoreNo("XA001");
+        bo.setName("西安回收店");
+        bo.setAddress("西安");
+        bo.setBizScope("recycle");
+        when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
+        when(baseMapper.insert(any(GzBeanStore.class))).thenReturn(1);
+
+        service.insertByBo(bo);
+
+        ArgumentCaptor<GzBeanStore> captor = ArgumentCaptor.forClass(GzBeanStore.class);
+        verify(baseMapper).insert(captor.capture());
+        assertEquals("recycle", captor.getValue().getBizScope());
+    }
+
+    // ------------------------------ 自动业务码 / 去 type 过滤（GZ-BEAN-054） ------------------------------
+
+    private GzBeanStoreBo boWithoutStoreNo() {
+        GzBeanStoreBo bo = new GzBeanStoreBo();
+        bo.setName("西安回收店");
+        bo.setAddress("西安");
+        bo.setBizScope("recycle");
+        return bo;
+    }
+
+    @Test
+    @DisplayName("★ 新增不传业务码 → 自动生成 MD + 3 位流水（取现有最大号 + 1），并回填到 bo")
+    void insertByBo_autoGeneratesStoreNo() {
+        when(baseMapper.selectMaxAutoStoreSeq()).thenReturn(2L);
+        when(baseMapper.insert(any(GzBeanStore.class))).thenReturn(1);
+        GzBeanStoreBo bo = boWithoutStoreNo();
+
+        assertTrue(service.insertByBo(bo));
+
+        ArgumentCaptor<GzBeanStore> captor = ArgumentCaptor.forClass(GzBeanStore.class);
+        verify(baseMapper).insert(captor.capture());
+        assertEquals("MD003", captor.getValue().getStoreNo());
+        assertEquals("MD003", bo.getStoreNo(), "生成的业务码要回填给调用方");
+        verify(baseMapper, never()).exists(any(Wrapper.class)); // 自动生成不走「手填唯一性」校验
+    }
+
+    @Test
+    @DisplayName("一家 MD 门店都没有 → 从 MD001 开始")
+    void insertByBo_autoStoreNo_startsFromOne() {
+        when(baseMapper.selectMaxAutoStoreSeq()).thenReturn(0L);
+        when(baseMapper.insert(any(GzBeanStore.class))).thenReturn(1);
+
+        service.insertByBo(boWithoutStoreNo());
+
+        ArgumentCaptor<GzBeanStore> captor = ArgumentCaptor.forClass(GzBeanStore.class);
+        verify(baseMapper).insert(captor.capture());
+        assertEquals("MD001", captor.getValue().getStoreNo());
+    }
+
+    @Test
+    @DisplayName("★ 并发新增撞唯一键 → 重新取号重试成功（不抛裸 500）")
+    void insertByBo_autoStoreNo_retriesOnDuplicate() {
+        when(baseMapper.selectMaxAutoStoreSeq()).thenReturn(2L, 3L);
+        when(baseMapper.insert(any(GzBeanStore.class)))
+            .thenThrow(new DuplicateKeyException("uk_tenant_store_no"))
+            .thenReturn(1);
+        GzBeanStoreBo bo = boWithoutStoreNo();
+
+        assertTrue(service.insertByBo(bo));
+        assertEquals("MD004", bo.getStoreNo());
+        verify(baseMapper, times(2)).insert(any(GzBeanStore.class));
+    }
+
+    @Test
+    @DisplayName("重试耗尽 → 可读业务异常")
+    void insertByBo_autoStoreNo_givesUpAfterRetries() {
+        when(baseMapper.selectMaxAutoStoreSeq()).thenReturn(2L);
+        when(baseMapper.insert(any(GzBeanStore.class))).thenThrow(new DuplicateKeyException("uk_tenant_store_no"));
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.insertByBo(boWithoutStoreNo()));
+        assertTrue(ex.getMessage().contains("业务码生成冲突"));
+    }
+
+    @Test
+    @DisplayName("★ mp 门店列表 / admin 下拉不再按 type 过滤 —— 误设成「谷子店」的回收店不会在端上无声消失")
+    void storeLists_noLongerFilterByType() {
+        when(baseMapper.selectVoList(any(Wrapper.class))).thenReturn(List.of());
+
+        service.selectMpList("recycle");
+        service.selectOptions("recycle");
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Wrapper> cap = ArgumentCaptor.forClass(Wrapper.class);
+        verify(baseMapper, times(2)).selectVoList(cap.capture());
+        for (Wrapper w : cap.getAllValues()) {
+            String sql = ((LambdaQueryWrapper<?>) w).getSqlSegment();
+            assertFalse(sql.contains("type ="), "不应再按 type 过滤，实际 SQL=" + sql);
+            assertTrue(sql.contains("FIND_IN_SET"), "业务线过滤仍须在，实际 SQL=" + sql);
+        }
     }
 }

@@ -689,4 +689,50 @@ class GzRecycleAppointmentServiceImplTest {
         assertTrue(!params.contains("confirmed_onsite"),
             "confirmed_onsite 是现金结算完成态，绝不能进候选（释放它=伪造账目），实际参数=" + params);
     }
+
+    /* ---------------- 一人一单：过期 submitted 单惰性排除（客户 2026-09-21） ---------------- */
+
+    @Test
+    @DisplayName("★ /active 预检排除过期 submitted 单 —— 口径必须与 submit 写路径一致，否则「预检拦、提交放」死界面")
+    void activePrecheck_excludesExpiredSubmitted() {
+        when(baseMapper.selectList(any())).thenReturn(List.of());
+
+        service.getActiveAppointment(1001L);
+
+        ArgumentCaptor<LambdaQueryWrapper<GzRecycleAppointment>> cap = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(baseMapper).selectList(cap.capture());
+        LambdaQueryWrapper<GzRecycleAppointment> w = cap.getValue();
+        String sql = w.getSqlSegment();
+        var params = w.getParamNameValuePairs().values();
+        // NOT (status='submitted' AND appt_date < 今天)：既要有 NOT 段，也要把「今天」作为界传下去
+        assertTrue(sql.contains("NOT"), "必须带过期排除的 NOT 段，实际 SQL=" + sql);
+        assertTrue(sql.contains("appt_date"), "过期排除按 appt_date 判定，实际 SQL=" + sql);
+        assertTrue(params.contains(LocalDate.now()),
+            "过期界必须是今天（appt_date < today 才算过期，当天单仍可到店核对），实际参数=" + params);
+    }
+
+    @Test
+    @DisplayName("★ submit 的一人一单守卫把「今天」传给 DB —— 不传等于过期排除失效、老顾客继续被 4127 钉死")
+    void submitGuard_passesTodayAsExpiryBound() {
+        GzRecycleAppointmentServiceImpl spy = spyOk();
+        when(gzUserMapper.selectById(anyLong())).thenReturn(user("openid_x", "13800000000"));
+        when(qtyRangeService.getEnabledByCode(anyString())).thenReturn(bucket("pts-1-50", "1-50 点", 60, 0));
+        // 有一张进行中的单 → 守卫必须抛 4127（这里只关心传参，用抛错省掉后续下单链路的桩）
+        when(baseMapper.countActiveByUserForUpdate(anyString(), anyLong(), any())).thenReturn(1L);
+
+        GzRecycleAppointmentSubmitBo bo = new GzRecycleAppointmentSubmitBo();
+        GzRecycleAppointmentSubmitBo.ProductBo p = new GzRecycleAppointmentSubmitBo.ProductBo();
+        p.setQtyBucketCode("pts-1-50");
+        bo.setProduct(p);
+        bo.setStoreId(1L);
+        bo.setApptDate(LocalDate.now().plusDays(1));
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> spy.submit(bo, 1001L));
+        assertEquals(GzRecycleErrorCode.ONE_ACTIVE_APPOINTMENT, ex.getCode());
+
+        ArgumentCaptor<LocalDate> today = ArgumentCaptor.forClass(LocalDate.class);
+        verify(baseMapper).countActiveByUserForUpdate(anyString(), anyLong(), today.capture());
+        assertEquals(LocalDate.now(), today.getValue(),
+            "守卫必须拿今天当过期界 —— 传 null / 传别的日期都会让过期单继续算「进行中」");
+    }
 }

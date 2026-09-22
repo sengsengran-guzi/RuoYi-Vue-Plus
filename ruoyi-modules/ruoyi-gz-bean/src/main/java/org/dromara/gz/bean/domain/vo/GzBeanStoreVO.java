@@ -7,7 +7,7 @@ import org.dromara.gz.bean.domain.entity.GzBeanStore;
 import java.io.Serial;
 import java.io.Serializable;
 import java.math.BigDecimal;
-import java.time.LocalDateTime;
+import java.util.Date;
 
 /**
  * gz_bean_store 视图对象（admin / mp 共用）。
@@ -15,7 +15,7 @@ import java.time.LocalDateTime;
  * <p>字段权威：doc/11 §3.1。</p>
  *
  * <p>admin 端：列表 / 详情完整返回；
- * mp 端：{@code GET /app/gz/bean/store/list} 仅返回 type='pindou' + status='open' 的子集。</p>
+ * mp 端：{@code GET /app/gz/bean/store/list?scope=} 仅返回 status='open' 且开通该业务线的子集。</p>
  *
  * @author kevin-coder (sensenran-guzi · GZ-BEAN-001)
  */
@@ -37,6 +37,9 @@ public class GzBeanStoreVO implements Serializable {
 
     /** 类型 pindou / guzi */
     private String type;
+
+    /** 适用业务（逗号分隔集合，GZ-BEAN-053）：pindou=拼豆预约 / recycle=回收预约 */
+    private String bizScope;
 
     /** 完整地址 */
     private String address;
@@ -72,8 +75,15 @@ public class GzBeanStoreVO implements Serializable {
     /** 计时看板临近结束提前提醒分钟数（ADR-0016 §6，默认 30） */
     private Integer nearEndMinutes;
 
-    /** 创建时间（公共字段） */
-    private LocalDateTime createTime;
+    /**
+     * 创建时间（公共字段）。
+     *
+     * <p><b>必须是 {@code Date}，不能是 {@code LocalDateTime}</b>：实体侧 {@code BaseEntity.createTime} 是 {@code Date}，
+     * 实体 → VO 走 MapStruct，而 MapStruct 内置的 {@code Date → LocalDateTime} 转换固定按 <b>UTC</b> 换算，
+     * 结果比库里的北京时间少 8 小时（门店管理「创建时间」列自上线起一直显示成前一天 23 点等，2026-09-22 发现）。
+     * 与回收预约 VO 一致用 {@code Date}，由 Jackson 按全局时区格式化即正确。</p>
+     */
+    private Date createTime;
 
     /** 备注 */
     private String remark;

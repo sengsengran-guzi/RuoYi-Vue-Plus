@@ -26,6 +26,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
@@ -67,14 +68,15 @@ public class GzBeanStoreController extends BaseController {
     }
 
     /**
-     * 全量列表（admin 账号管理下拉用 — 不分页，type='pindou' 全集）。
+     * 全量列表（admin 下拉用 — 不分页，type='pindou' 全集）。
      *
-     * <p>专给 ADMIN-002 staff 账号绑定 store_id 下拉用（替换硬编码占位）。</p>
+     * <p>ADMIN-002 staff 账号绑定 store_id 下拉用。{@code ?scope=pindou|recycle} 收敛到某条业务线
+     * （GZ-BEAN-053：回收页门店下拉不该列出纯拼豆店）；不传 = 全部门店（账号绑定场景要看全集）。</p>
      */
     @SaCheckPermission("gz:bean:store:list")
     @GetMapping("/options")
-    public R<List<GzBeanStoreVO>> options() {
-        return R.ok(storeService.selectOptions());
+    public R<List<GzBeanStoreVO>> options(@RequestParam(required = false) String scope) {
+        return R.ok(storeService.selectOptions(scope));
     }
 
     /**

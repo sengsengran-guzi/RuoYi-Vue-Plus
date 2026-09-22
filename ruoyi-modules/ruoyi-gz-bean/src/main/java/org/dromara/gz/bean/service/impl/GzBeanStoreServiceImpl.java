@@ -17,6 +17,7 @@ import org.dromara.gz.bean.domain.vo.GzBeanStoreVO;
 import org.dromara.gz.bean.mapper.GzBeanStoreMapper;
 import org.dromara.gz.bean.service.IGzBeanStoreService;
 import org.dromara.gz.common.service.IGzFileService;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -36,7 +37,8 @@ import java.util.List;
  *   <li>编辑时禁止改 storeNo（业务码不可变，doc/11 §3.1 业务码语义稳定）</li>
  *   <li>软删后 storeNo 唯一性由「软删过滤 + UNIQUE(tenant_id, store_no)」保证 — 同一 storeNo 软删后可重建 ✘（受 UNIQUE 约束限制）；
  *       若有此需求需扩 dedup_token 方案，V1.0 仅 1 门店不触发该场景 — 留 BEAN-002 / 后续 ticket 评估</li>
- *   <li>mp 端 list 只返回 type='pindou' + status='open'（doc/10 §3 业务规则）</li>
+ *   <li>mp 端 list 返回 status='open' 且开通了请求业务线（biz_scope）的门店；不再按 type 过滤（GZ-BEAN-053/054）</li>
+ *   <li>新增门店不传业务码 → 自动生成 MD + 3 位流水（GZ-BEAN-054）</li>
  * </ul>
  *
  * @author kevin-coder (sensenran-guzi · GZ-BEAN-001)
@@ -49,6 +51,23 @@ public class GzBeanStoreServiceImpl implements IGzBeanStoreService {
     private static final String DEFAULT_TYPE = "pindou";
     private static final String DEFAULT_STATUS = "open";
     private static final int DEFAULT_MAX_ADVANCE_DAYS = 14;
+
+    /** 业务线标识（GZ-BEAN-053，biz_scope 集合里的合法项） */
+    public static final String SCOPE_PINDOU = "pindou";
+    public static final String SCOPE_RECYCLE = "recycle";
+    /**
+     * 新建门店未选「适用业务」时的兜底 = 只开拼豆。
+     *
+     * <p>刻意不兜成 'pindou,recycle'：存量两店回填成双业务是为了不破坏线上（见迁移 GZ-BEAN-053），
+     * 而<b>新建</b>门店默认就该是单业务 —— 甲方要的就是「回收和拼豆不是一个门店」，
+     * 默认双开等于每建一家店都要记得去取消勾选，漏一次就又混在一起了。</p>
+     */
+    private static final String DEFAULT_BIZ_SCOPE = SCOPE_PINDOU;
+
+    /** 自动业务码前缀（GZ-BEAN-054）：MD = 门店；存量 CD001/CD002 等人工编码保持不变 */
+    private static final String AUTO_STORE_NO_PREFIX = "MD";
+    /** 并发新增撞唯一键时的重试次数（门店新增极低频，3 次足够） */
+    private static final int STORE_NO_RETRY = 3;
 
     private final GzBeanStoreMapper baseMapper;
     /** 门店图片 file id → 1h 预签名 URL（mp 端 selectMpList 解析用） */
@@ -77,7 +96,9 @@ public class GzBeanStoreServiceImpl implements IGzBeanStoreService {
     @Override
     @Transactional(rollbackFor = Exception.class)
     public boolean insertByBo(GzBeanStoreBo bo) {
-        if (!checkStoreNoUnique(bo)) {
+        // 业务码：admin 页面不再手填（GZ-BEAN-054）→ 后端生成；显式传入（迁移 / 接口）仍走唯一性校验
+        boolean autoStoreNo = StrUtil.isBlank(bo.getStoreNo());
+        if (!autoStoreNo && !checkStoreNoUnique(bo)) {
             throw new ServiceException("门店业务码已存在：" + bo.getStoreNo());
         }
         // 不用 MapstructUtils（依赖 Spring context，单测时 mockStatic 报"Cannot instrument class"
@@ -93,11 +114,15 @@ public class GzBeanStoreServiceImpl implements IGzBeanStoreService {
         if (add.getMaxAdvanceDays() == null) {
             add.setMaxAdvanceDays(DEFAULT_MAX_ADVANCE_DAYS);
         }
-        boolean flag = baseMapper.insert(add) > 0;
+        if (StrUtil.isBlank(add.getBizScope())) {
+            add.setBizScope(DEFAULT_BIZ_SCOPE);
+        }
+        boolean flag = autoStoreNo ? insertWithAutoStoreNo(add) : baseMapper.insert(add) > 0;
         if (flag) {
             bo.setId(add.getId());
-            log.info("[gz-bean-store] INSERT id={} storeNo={} name={} type={}",
-                add.getId(), add.getStoreNo(), add.getName(), add.getType());
+            bo.setStoreNo(add.getStoreNo());
+            log.info("[gz-bean-store] INSERT id={} storeNo={} name={} type={} bizScope={}",
+                add.getId(), add.getStoreNo(), add.getName(), add.getType(), add.getBizScope());
         }
         return flag;
     }
@@ -119,6 +144,25 @@ public class GzBeanStoreServiceImpl implements IGzBeanStoreService {
     }
 
     /**
+     * 自动生成业务码并插入（GZ-BEAN-054）：{@code MD} + 3 位流水（超 999 自然变 4 位）。
+     *
+     * <p>取号 = 现有 {@code MD*} 最大流水 + 1（含软删行，见 mapper javadoc）。两个管理员同时新增会撞
+     * {@code uk_tenant_store_no} → 捕获后重新取号重试；重试耗尽才抛，给出可读提示而不是裸 500。</p>
+     */
+    private boolean insertWithAutoStoreNo(GzBeanStore add) {
+        for (int attempt = 1; attempt <= STORE_NO_RETRY; attempt++) {
+            long next = baseMapper.selectMaxAutoStoreSeq() + 1;
+            add.setStoreNo(String.format("%s%03d", AUTO_STORE_NO_PREFIX, next));
+            try {
+                return baseMapper.insert(add) > 0;
+            } catch (DuplicateKeyException ex) {
+                log.warn("[gz-bean-store] auto storeNo={} 撞唯一键（并发新增），第 {} 次重试", add.getStoreNo(), attempt);
+            }
+        }
+        throw new ServiceException("门店业务码生成冲突，请稍后重试");
+    }
+
+    /**
      * BO → Entity 手写拷贝。
      *
      * @param bo           源 BO
@@ -132,6 +176,7 @@ public class GzBeanStoreServiceImpl implements IGzBeanStoreService {
         }
         e.setName(bo.getName());
         e.setType(bo.getType());
+        e.setBizScope(bo.getBizScope());
         e.setAddress(bo.getAddress());
         e.setLongitude(bo.getLongitude());
         e.setLatitude(bo.getLatitude());
@@ -158,12 +203,14 @@ public class GzBeanStoreServiceImpl implements IGzBeanStoreService {
     }
 
     @Override
-    public List<GzBeanStoreVO> selectMpList() {
-        // mp 端 list：仅 type='pindou' + status='open'，按 storeNo 排序保证稳定
+    public List<GzBeanStoreVO> selectMpList(String scope) {
+        // mp 端 list：status='open' + 该店开通了 scope 这条业务线，按 storeNo 排序保证稳定
+        // 不再按 type='pindou' 过滤（GZ-BEAN-054）：业务线已由 biz_scope 表达，type 是 v2 预留的「谷子店」业态占位，
+        // admin 已隐藏该字段。继续按 type 筛的话，一家被误设成 guzi 的回收店会在 mp 上无声消失。
         LambdaQueryWrapper<GzBeanStore> lqw = Wrappers.<GzBeanStore>lambdaQuery()
-            .eq(GzBeanStore::getType, DEFAULT_TYPE)
-            .eq(GzBeanStore::getStatus, DEFAULT_STATUS)
-            .orderByAsc(GzBeanStore::getStoreNo);
+            .eq(GzBeanStore::getStatus, DEFAULT_STATUS);
+        applyScopeFilter(lqw, scope);
+        lqw.orderByAsc(GzBeanStore::getStoreNo);
         List<GzBeanStoreVO> list = baseMapper.selectVoList(lqw);
         // 门店图片：image_id → 1h 预签名 URL（私有桶，不存裸串）。无图 / 解析失败 → imageUrl 留 null，mp 不显示（不回退占位）。
         for (GzBeanStoreVO vo : list) {
@@ -187,12 +234,33 @@ public class GzBeanStoreServiceImpl implements IGzBeanStoreService {
     }
 
     @Override
-    public List<GzBeanStoreVO> selectOptions() {
-        // admin 账号管理下拉：所有 type='pindou'（含 closed / maintenance — 历史关联也要显示）
-        LambdaQueryWrapper<GzBeanStore> lqw = Wrappers.<GzBeanStore>lambdaQuery()
-            .eq(GzBeanStore::getType, DEFAULT_TYPE)
-            .orderByAsc(GzBeanStore::getStoreNo);
+    public List<GzBeanStoreVO> selectOptions(String scope) {
+        // admin 下拉：全部门店（含 closed / maintenance — 历史关联也要显示）；
+        // scope 非空时再收敛到该业务线（回收看板的门店下拉不该列出纯拼豆店，反之亦然）。不按 type 筛，理由同 selectMpList
+        LambdaQueryWrapper<GzBeanStore> lqw = Wrappers.lambdaQuery();
+        applyScopeFilter(lqw, scope);
+        lqw.orderByAsc(GzBeanStore::getStoreNo);
         return baseMapper.selectVoList(lqw);
+    }
+
+    /**
+     * 给 wrapper 追加「该店开通了 scope 这条业务线」的过滤（GZ-BEAN-053）。
+     *
+     * <p>{@code biz_scope} 是逗号分隔集合，判「包含」只能用 {@code FIND_IN_SET}，MP 的 lambda 表达不了，
+     * 故走 {@code apply} 拼原生片段。</p>
+     *
+     * <p><b>入参必须走白名单</b>：{@code apply} 是 SQL 片段拼接口，scope 来自 HTTP query 参数，
+     * 直接拼进去就是注入面。这里只认 {@code pindou} / {@code recycle} 两个常量，
+     * 其余一律当「不筛」处理（宁可多返也不执行未知片段）。值本身用 {@code {0}} 占位交给 MyBatis 预编译，
+     * 白名单是第二道保险。</p>
+     *
+     * @param scope 业务线；null / 空 / 非法值 → 不加任何过滤
+     */
+    private void applyScopeFilter(LambdaQueryWrapper<GzBeanStore> lqw, String scope) {
+        if (!SCOPE_PINDOU.equals(scope) && !SCOPE_RECYCLE.equals(scope)) {
+            return;
+        }
+        lqw.apply("FIND_IN_SET({0}, biz_scope)", scope);
     }
 
     @Override
@@ -219,6 +287,7 @@ public class GzBeanStoreServiceImpl implements IGzBeanStoreService {
         lqw.like(StrUtil.isNotBlank(q.getName()), GzBeanStore::getName, q.getName());
         lqw.eq(StrUtil.isNotBlank(q.getType()), GzBeanStore::getType, q.getType());
         lqw.eq(StrUtil.isNotBlank(q.getStatus()), GzBeanStore::getStatus, q.getStatus());
+        applyScopeFilter(lqw, q.getBizScope());
         lqw.orderByAsc(GzBeanStore::getStoreNo);
         return lqw;
     }

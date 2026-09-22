@@ -86,6 +86,16 @@ class GzRecycleActiveStatusConsistencyTest {
         assertTrue(user.contains("submitted"), "submitted 是真·进行中，必须仍拦");
     }
 
+    @Test
+    @DisplayName("★ 一人一单守卫排除过期 submitted 单 —— 去掉了 = 爽约/没核销的老顾客永久约不了第二单")
+    void userActiveGuard_excludesExpiredSubmitted() {
+        String sql = readSelectSql("countActiveByUserForUpdate").replaceAll("\\s+", " ");
+        assertTrue(sql.contains("NOT (status = 'submitted' AND appt_date < #{today})"),
+            "prod 没部署 SnailJob，no_show 兜底 cron 从来没跑过 —— 到店日已过仍 submitted 的单如果still算"
+                + "「进行中」，这个用户就被 4127 永久钉死（客户 2026-09-21 反馈的线上故障）。"
+                + "这条惰性排除是唯一的解封手段，不得移除。当前 SQL=" + sql);
+    }
+
     /* ---------------- helpers ---------------- */
 
     @SuppressWarnings("unchecked")

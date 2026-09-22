@@ -185,6 +185,12 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
      */
     private static final String KEY_AUTO_PAYOUT = "gz.recycle.auto_payout.enabled";
 
+    /**
+     * 到店注意事项文案（sys_config {@code gz.recycle.notice}，多行纯文本，客户 2026-09-21）。
+     * 刻意走配置而非 mp i18n：不收品类黑名单是会变的运营口径，写死等于每改一个字重发小程序版本。
+     */
+    private static final String KEY_NOTICE = "gz.recycle.notice";
+
     @Override
     @Transactional(rollbackFor = Exception.class, isolation = Isolation.REPEATABLE_READ)
     public GzRecycleAppointmentVO submit(GzRecycleAppointmentSubmitBo bo, Long userId) {
@@ -228,7 +234,9 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             throw new ServiceException(GzRecycleErrorCode.SLOT_LOCK_BUSY_MSG, GzRecycleErrorCode.SLOT_LOCK_BUSY);
         }
         registerLockReleaseOnTxEnd(userLockKey);
-        if (baseMapper.countActiveByUserForUpdate(tenantId, userId) > 0) {
+        //     过期 submitted 单不计活跃（客户 2026-09-21）：prod 没部署 SnailJob，no_show 兜底 cron 从没跑过，
+        //     不排除的话「来过没核销 / 爽约」的单会把用户永久钉死在 4127。详见 mapper 方法 javadoc。
+        if (baseMapper.countActiveByUserForUpdate(tenantId, userId, LocalDate.now()) > 0) {
             throw new ServiceException(GzRecycleErrorCode.ONE_ACTIVE_APPOINTMENT_MSG, GzRecycleErrorCode.ONE_ACTIVE_APPOINTMENT);
         }
 
@@ -389,12 +397,30 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             return null;
         }
         // 进行中单（排除 paid/cancelled/no_show）取最新一条；一人一单守卫下常态 ≤ 1，历史脏数据兜底 LIMIT 1。
+        // 过期 submitted 单惰性排除（客户 2026-09-21）：必须与写路径 countActiveByUserForUpdate 的
+        // `AND NOT (status='submitted' AND appt_date < today)` 逐字同口径 —— 分叉了就会出现
+        // 「mp 预检提示『您已有进行中的预约』但 submit 其实会放行」这种用户根本没法自救的死界面。
+        LocalDate today = LocalDate.now();
         List<GzRecycleAppointment> list = baseMapper.selectList(Wrappers.<GzRecycleAppointment>lambdaQuery()
             .eq(GzRecycleAppointment::getUserId, userId)
             .in(GzRecycleAppointment::getStatus, USER_ACTIVE_STATUSES)
+            .not(w -> w.eq(GzRecycleAppointment::getStatus, STATUS_SUBMITTED)
+                .lt(GzRecycleAppointment::getApptDate, today))
             .orderByDesc(GzRecycleAppointment::getId)
             .last("LIMIT 1"));
         return list.isEmpty() ? null : toVO(list.get(0));
+    }
+
+    @Override
+    public List<String> getNoticeLines() {
+        String raw = configService.getConfigValue(KEY_NOTICE);
+        if (StrUtil.isBlank(raw)) {
+            return List.of();
+        }
+        return Arrays.stream(raw.split("\\R"))
+            .map(String::trim)
+            .filter(StrUtil::isNotBlank)
+            .toList();
     }
 
     /** 在本店 enabled 时段有序列表中定位 timeSlotId 的下标（未命中返 -1）。 */
@@ -692,7 +718,9 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
         validateFinalAmount(bo.getFinalAmountCent());
 
         // ③ submitted→confirmed_onsite + 核对留痕（verify_image_ids 逗号分隔不存裸 url；final_amount/verified_by/verify_time）
-        String verifyImageIdsStr = StrUtil.join(",", bo.getVerifyImageIds());
+        //    核对照客户 2026-09-21 起改选填 → 不传时写 NULL（不是空串，免得后续 split 出一个空元素）。
+        List<Long> verifyImageIds = bo.getVerifyImageIds() == null ? List.of() : bo.getVerifyImageIds();
+        String verifyImageIdsStr = verifyImageIds.isEmpty() ? null : StrUtil.join(",", verifyImageIds);
         LocalDateTime now = LocalDateTime.now();
         int confirmed = baseMapper.markConfirmedOnsite(
             appt.getId(), appt.getVersion(), verifyImageIdsStr, bo.getFinalAmountCent(), verifiedBy, now,
@@ -702,7 +730,7 @@ public class GzRecycleAppointmentServiceImpl implements IGzRecycleAppointmentSer
             throw new ServiceException(GzRecycleErrorCode.NOT_VERIFIABLE_MSG, GzRecycleErrorCode.NOT_VERIFIABLE);
         }
         log.info("[gz-recycle] verify confirmed appointment_no={} finalAmountCent={} verifiedBy={} verifyImages={}",
-            appt.getAppointmentNo(), bo.getFinalAmountCent(), verifiedBy, bo.getVerifyImageIds().size());
+            appt.getAppointmentNo(), bo.getFinalAmountCent(), verifiedBy, verifyImageIds.size());
 
         // ④ 自动打款开关（客户 7.15）：默认关闭 → 店员核对确认即终态（confirmed_onsite），不触发反向打款、不进 paying，
         //    货款店内现金结算。sys_config gz.recycle.auto_payout.enabled 置 true 即恢复下方 ⑤/⑥ 反向微信转账（代码保留）。

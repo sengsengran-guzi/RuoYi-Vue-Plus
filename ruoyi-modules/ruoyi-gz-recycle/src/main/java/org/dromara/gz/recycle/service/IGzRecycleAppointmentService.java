@@ -108,13 +108,32 @@ public interface IGzRecycleAppointmentService {
     /**
      * 我当前进行中的回收预约（客户 7.24「一人一单」：回收表单进入前预检）。
      *
-     * <p>「进行中」= {@code submitted / confirmed_onsite / paying / payout_failed}（已到账/已取消/已过期释放，可再约）。
-     * 有进行中单 → 前端提示 + 禁止再预约；无 → null（可新预约）。取最新一条（create_time desc）。</p>
+     * <p>「进行中」= {@code submitted / paying / payout_failed}（{@code confirmed_onsite} 现金结算即终态、
+     * 已到账 / 已取消 / 已过期释放，均可再约）。<b>且到店日已过的 {@code submitted} 单不算</b>
+     * （客户 2026-09-21，prod 无 SnailJob 故 no_show cron 从不跑，详见
+     * {@code GzRecycleAppointmentMapper#countActiveByUserForUpdate} javadoc）。</p>
+     *
+     * <p>有进行中单 → 前端提示 + 禁止再预约；无 → null（可新预约）。取最新一条。
+     * 口径必须与写路径 {@code countActiveByUserForUpdate} 完全一致，否则出现「预检拦、提交放」的分叉死界面。</p>
      *
      * @param userId 当前登录用户 id
      * @return 进行中的预约 VO；无 → null
      */
     GzRecycleAppointmentVO getActiveAppointment(Long userId);
+
+    /**
+     * 到店注意事项文案，已按行拆好（客户 2026-09-21：预约成功后贴一份须知）。
+     *
+     * <p>真源 {@code sys_config} 键 {@code gz.recycle.notice}（多行纯文本，甲方在 admin『参数设置』自改）；
+     * 各门店统一，不按 storeId 分。未配置 / 配空 → 返回空列表（前端整块不渲染）。</p>
+     *
+     * <p><b>为什么返 List 而不是裸 String</b>：{@code R.ok(String)} 会命中「设置提示消息」那个重载
+     * （比 {@code R.ok(T data)} 更具体），文案会跑进 {@code msg} 而 {@code data} 恒为 null ——
+     * 本地真库 curl 实测踩到过。返集合类型从类型上就规避了这个重载陷阱，顺带把分行收在后端一处。</p>
+     *
+     * @return 注意事项行列表（已 trim、已滤空行）；未配置返回空列表（不返 null）
+     */
+    List<String> getNoticeLines();
 
     /* ===================== GZ-RECYCLE-003 店员核对 + admin 管理 ===================== */
 

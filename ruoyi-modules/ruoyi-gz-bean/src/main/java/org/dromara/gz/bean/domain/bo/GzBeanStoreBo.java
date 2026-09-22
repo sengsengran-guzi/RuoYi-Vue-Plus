@@ -43,8 +43,10 @@ public class GzBeanStoreBo extends BaseEntity {
     @NotNull(message = "门店 ID 不能为空", groups = EditGroup.class)
     private Long id;
 
-    /** 业务码（如 CD001） — 新增必填，编辑不可改 */
-    @NotBlank(message = "业务码不能为空", groups = AddGroup.class)
+    /**
+     * 业务码 — 新增时<b>不传则后端自动生成</b>（{@code MD} + 3 位流水，GZ-BEAN-054），编辑不可改。
+     * 仍接受显式传入（走唯一性校验），供数据迁移 / 接口调用场景使用；admin 页面不再让人手填。
+     */
     @Size(max = 32, message = "业务码长度不能超过 32", groups = {AddGroup.class, EditGroup.class})
     private String storeNo;
 
@@ -57,6 +59,17 @@ public class GzBeanStoreBo extends BaseEntity {
     @Pattern(regexp = "^(pindou|guzi)$", message = "门店类型仅支持 pindou / guzi",
         groups = {AddGroup.class, EditGroup.class})
     private String type;
+
+    /**
+     * 适用业务（逗号分隔集合，GZ-BEAN-053）：pindou / recycle，可组合，不填默认 'pindou'。
+     *
+     * <p>正则限定「1-2 个合法项、逗号分隔、无空格」——不校验就会混进 'pindou, recycle'（带空格）
+     * 或 'pindou,pindou' 这类脏值，而 FIND_IN_SET 对带空格的项匹配不上，门店会在端上凭空消失。</p>
+     */
+    @Pattern(regexp = "^(pindou(,recycle)?|recycle(,pindou)?)$",
+        message = "适用业务仅支持 pindou / recycle，多选用英文逗号分隔且不能重复",
+        groups = {AddGroup.class, EditGroup.class})
+    private String bizScope;
 
     /** 完整地址 */
     @NotBlank(message = "地址不能为空", groups = {AddGroup.class, EditGroup.class})

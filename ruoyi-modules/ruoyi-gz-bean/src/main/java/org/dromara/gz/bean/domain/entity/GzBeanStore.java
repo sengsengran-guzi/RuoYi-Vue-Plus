@@ -55,6 +55,16 @@ public class GzBeanStore extends TenantEntity {
     /** 类型 pindou=拼豆店（V1.0 唯一） / guzi=谷子店（v2 预留） */
     private String type;
 
+    /**
+     * 适用业务（逗号分隔集合，GZ-BEAN-053）：{@code pindou}=拼豆预约 / {@code recycle}=回收预约，可组合。
+     *
+     * <p>客户 2026-09-21「回收和拼豆不是一个门店」：两条业务线是不同的物理门店（地址不同），
+     * 各端只该看到本业务线开通的门店。查询一律走 {@code FIND_IN_SET(<scope>, biz_scope)}。</p>
+     *
+     * <p>与 {@link #type} 正交：{@code type} 是门店业态（拼豆店 / 谷子店），本字段是这家店开哪几条预约业务线。</p>
+     */
+    private String bizScope;
+
     /** 完整地址 */
     private String address;
 

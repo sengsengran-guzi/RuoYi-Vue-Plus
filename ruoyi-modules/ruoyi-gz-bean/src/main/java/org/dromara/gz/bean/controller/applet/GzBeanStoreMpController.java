@@ -6,8 +6,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.dromara.common.core.domain.R;
 import org.dromara.gz.bean.domain.vo.GzBeanStoreVO;
 import org.dromara.gz.bean.service.IGzBeanStoreService;
+import org.dromara.gz.bean.service.impl.GzBeanStoreServiceImpl;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
@@ -61,9 +63,26 @@ public class GzBeanStoreMpController {
      *   ]
      * }
      * </pre>
+     *
+     * <p><b>{@code ?scope=} 按业务线取门店</b>（GZ-BEAN-053，客户 2026-09-21「回收和拼豆不是一个门店」）：
+     * {@code pindou}=拼豆可预约门店 / {@code recycle}=回收可预约门店。两条线是不同的物理门店（地址不同），
+     * 各端必须带上自己的 scope，否则会把对方的门店（和地址）显示给用户 —— 甲方反馈的
+     * 「回收的地址是错的」就是这么来的。</p>
+     *
+     * <p><b>缺省为 {@code pindou}</b>：本端点历史上就是拼豆专用（回收当年是借用它才踩的坑），
+     * 保持缺省语义不变，老版本小程序在灰度期照常工作；回收端显式传 {@code ?scope=recycle}。</p>
+     *
+     * <p><b>非法值归一成 {@code pindou}</b>：service 对非白名单 scope 是「不筛」（admin 下拉需要这个语义），
+     * 但 mp 端点若照搬，乱传一个参数就会把两条线的门店混着返回 —— 正是本次要消灭的现象。</p>
+     *
+     * @param scope 业务线，缺省 / 非法 → {@code pindou}
      */
     @GetMapping("/list")
-    public R<List<GzBeanStoreVO>> list() {
-        return R.ok(storeService.selectMpList());
+    public R<List<GzBeanStoreVO>> list(
+        @RequestParam(required = false, defaultValue = "pindou") String scope) {
+        String normalized = GzBeanStoreServiceImpl.SCOPE_RECYCLE.equals(scope)
+            ? GzBeanStoreServiceImpl.SCOPE_RECYCLE
+            : GzBeanStoreServiceImpl.SCOPE_PINDOU;
+        return R.ok(storeService.selectMpList(normalized));
     }
 }

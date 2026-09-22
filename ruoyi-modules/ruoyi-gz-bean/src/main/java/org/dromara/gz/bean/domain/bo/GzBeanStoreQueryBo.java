@@ -30,4 +30,10 @@ public class GzBeanStoreQueryBo implements Serializable {
 
     /** 状态 open / closed / maintenance */
     private String status;
+
+    /**
+     * 适用业务筛选（GZ-BEAN-053）：传 {@code pindou} / {@code recycle} 之一，
+     * 匹配 {@code FIND_IN_SET(bizScope, biz_scope)}（即「这家店开了这条业务线」，两条都开的店两边都查得到）。
+     */
+    private String bizScope;
 }

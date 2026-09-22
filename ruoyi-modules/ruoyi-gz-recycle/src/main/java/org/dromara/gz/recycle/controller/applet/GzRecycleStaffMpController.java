@@ -109,6 +109,10 @@ public class GzRecycleStaffMpController {
         if (userId == null) {
             return R.fail(401, "未登录");
         }
+        // mp 店员端 id 走 body（admin 端走路径），必填检查放这里而不是 BO 注解 —— 见 GzRecycleVerifyBo#appointmentId
+        if (bo.getAppointmentId() == null) {
+            return R.fail("预约单 id 不能为空");
+        }
         // 核对人留痕：取绑定 sys_user 显示名（ADR-0004），无则回退 mp 用户名
         String verifiedBy = resolveStaffName(userId);
         log.info("[recycle-staff] verify appointmentId={} finalAmountCent={} verifiedBy={} verifyImages={}",

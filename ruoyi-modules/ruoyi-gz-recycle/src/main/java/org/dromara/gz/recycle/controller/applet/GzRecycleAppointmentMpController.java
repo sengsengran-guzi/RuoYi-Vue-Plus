@@ -87,6 +87,32 @@ public class GzRecycleAppointmentMpController {
     }
 
     /**
+     * 到店注意事项文案（客户 2026-09-21：预约成功后要贴一份须知）。
+     *
+     * <pre>
+     * GET /app/gz/recycle/appointment/notice
+     * 200 OK { "code":200, "data": ["预约成功后请注意：", "1. 请带上要出的谷子...", "2. 请准时到店..."] }
+     * </pre>
+     *
+     * <p>真源 = {@code sys_config} 键 {@code gz.recycle.notice}（多行纯文本，甲方在 admin『参数设置』自改）。
+     * <b>刻意不写死在 mp i18n 里</b>：不收品类的黑名单是会变的运营口径（客户给的首版就列了 10 类），
+     * 写死意味着每改一个字都要重新发版审核小程序。各门店文案统一（客户已确认「各店一样」），
+     * 故只有一个全局键、不按 storeId 分。</p>
+     *
+     * <p><b>返回按行拆好的数组、不返裸 String</b>：{@code R.ok(String)} 命中的是「设置提示消息」那个重载
+     * （比 {@code R.ok(T data)} 更具体），文案会跑进 {@code msg} 而 {@code data} 恒 null，前端永远读不到 ——
+     * 本地真库 curl 实测踩到过，单测照不出。</p>
+     *
+     * <p>未配置 / 配空 → 返回空数组，前端据此整块不渲染（不显示空壳卡片）。
+     * 匿名可读（{@link SaIgnore}，browse-first）：游客在填单页就该看到「哪些不收」，避免白跑一趟。</p>
+     */
+    @SaIgnore
+    @GetMapping("/notice")
+    public R<List<String>> notice() {
+        return R.ok(appointmentService.getNoticeLines());
+    }
+
+    /**
      * 某门店启用到店时段列表（mp 填单单选源，GZ-RECYCLE-006，按门店可配，取代写死的上午/下午两档）。
      *
      * <pre>

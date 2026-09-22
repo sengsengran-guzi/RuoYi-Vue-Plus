@@ -132,15 +132,27 @@ public interface GzRecycleAppointmentMapper extends BaseMapperPlus<GzRecycleAppo
      * 无法引用 Java 常量，故此处内联字面量）；改「进行中」口径需两处同步，否则守卫（拦下单）与 /active 预检口径分叉。
      * {@code GzRecycleActiveStatusConsistencyTest} 反射比对两份拷贝。</p>
      *
+     * <p><b>⚠️ 过期 submitted 单不计入（客户 2026-09-21 修）</b>：到店日已过仍 {@code submitted} 的单
+     * 本该由 {@code GzRecycleNoShowJob} 凌晨兜底翻成 {@code no_show} 释放，但<b>该 job 是 SnailJob 执行器，
+     * prod 根本没部署 SnailJob，这个 cron 一次都没跑过</b>（memory snailjob-not-deployed-in-prod）。
+     * 于是「来过但店员没核销」/「爽约」的单永远停在 {@code submitted}，把这个用户永久钉死在 4127 ——
+     * 线上实际发生：甲方反馈「来过的老师核销不了，然后就预约不了下一次」。
+     * 这里按 {@code appt_date < #{today}} <b>读时惰性排除</b>（不改库、不依赖任何定时任务），
+     * 与 {@code selectExpiredSubmittedIds} / {@code listExpiredUnsettled} 的过期口径逐字一致。
+     * 真正资金在途的 {@code paying / payout_failed} <b>不看日期一律仍拦</b>（钱没结清不能再约）。</p>
+     *
      * @param tenantId 租户 id（显式传）
      * @param userId   提交用户 id
+     * @param today    今日（北京时间）；{@code appt_date} 早于此值的 submitted 单视为已过期、不计活跃
      * @return 该用户当前进行中的回收预约数（≥ 1 即不可再约）
      */
     @Select("SELECT COUNT(*) FROM gz_recycle_appointment " +
         "WHERE tenant_id = #{tenantId} AND user_id = #{userId} " +
         "  AND status IN ('submitted', 'paying', 'payout_failed') AND del_flag = '0' " +
+        "  AND NOT (status = 'submitted' AND appt_date < #{today}) " +
         "FOR UPDATE")
-    long countActiveByUserForUpdate(@Param("tenantId") String tenantId, @Param("userId") Long userId);
+    long countActiveByUserForUpdate(@Param("tenantId") String tenantId, @Param("userId") Long userId,
+                                    @Param("today") LocalDate today);
 
     /**
      * 店员核对确认：submitted → confirmed_onsite（GZ-RECYCLE-003 AC1，doc/10 §13.N8）。
