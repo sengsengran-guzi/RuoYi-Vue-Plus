@@ -1,6 +1,8 @@
 package org.dromara.gz.bean.controller;
 
 import cn.dev33.satoken.annotation.SaCheckPermission;
+import cn.dev33.satoken.exception.NotPermissionException;
+import cn.dev33.satoken.stp.StpUtil;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 import lombok.RequiredArgsConstructor;
@@ -29,7 +31,9 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.Collection;
 import java.util.List;
+import java.util.function.Predicate;
 
 /**
  * GZ-BEAN-001 拼豆门店管理（admin 端）。
@@ -56,6 +60,8 @@ import java.util.List;
 @RequestMapping("/system/gz/bean/store")
 public class GzBeanStoreController extends BaseController {
 
+    private static final String STORE_LIST_PERM = "gz:bean:store:list";
+
     private final IGzBeanStoreService storeService;
 
     /**
@@ -68,15 +74,39 @@ public class GzBeanStoreController extends BaseController {
     }
 
     /**
-     * 全量列表（admin 下拉用 — 不分页，type='pindou' 全集）。
+     * 全量列表（admin 下拉用 — 不分页）。
      *
-     * <p>ADMIN-002 staff 账号绑定 store_id 下拉用。{@code ?scope=pindou|recycle} 收敛到某条业务线
-     * （GZ-BEAN-053：回收页门店下拉不该列出纯拼豆店）；不传 = 全部门店（账号绑定场景要看全集）。</p>
+     * <p>{@code ?scope=pindou|recycle} 收敛到某条业务线（GZ-BEAN-053：回收页门店下拉不该列出纯拼豆店）；
+     * 不传 = 全部门店（ADMIN-002 账号绑定门店场景要看全集）。</p>
+     *
+     * <p><b>权限按 scope 放行，不再只认「门店管理」权限</b>（2026-09-23 prod 事故）：回收 / 拼豆各业务页打开时第一件事
+     * 就是拉门店下拉，原先一律要求 {@code gz:bean:store:list}。这条权限是挂在「门店管理」菜单下的按钮节点，
+     * 只要有人在角色管理里取消「门店管理 / 拼豆业务」那棵树，就会被连带取消 —— 回收店员 huishou 的看板因此
+     * 报「当前操作没有权限」、门店下拉为空、看板整块空白，且报错完全看不出和门店有关。
+     * 现在：持有该业务线任意权限（{@code gz:recycle:*} / {@code gz:bean:*}）即可读该业务线的门店下拉；
+     * 不带 scope 的全集仍只给门店管理权限。只返回门店 id / 名称 / 地址等展示字段，门店的增删改权限不变。</p>
      */
-    @SaCheckPermission("gz:bean:store:list")
     @GetMapping("/options")
     public R<List<GzBeanStoreVO>> options(@RequestParam(required = false) String scope) {
+        if (!canReadStoreOptions(scope, StpUtil::hasPermission, StpUtil.getPermissionList())) {
+            throw new NotPermissionException(STORE_LIST_PERM);
+        }
         return R.ok(storeService.selectOptions(scope));
+    }
+
+    /**
+     * 门店下拉的读权限判定（纯函数，便于单测）。
+     *
+     * @param scope    业务线 pindou / recycle；其它值（含 null）视为「全集」
+     * @param hasPerm  判定是否持有某权限（生产传 {@code StpUtil::hasPermission}，已处理超管通配）
+     * @param perms    当前用户的权限列表
+     */
+    static boolean canReadStoreOptions(String scope, Predicate<String> hasPerm, Collection<String> perms) {
+        if (hasPerm.test(STORE_LIST_PERM)) {
+            return true;
+        }
+        String prefix = "recycle".equals(scope) ? "gz:recycle:" : "pindou".equals(scope) ? "gz:bean:" : null;
+        return prefix != null && perms != null && perms.stream().anyMatch(p -> p != null && p.startsWith(prefix));
     }
 
     /**

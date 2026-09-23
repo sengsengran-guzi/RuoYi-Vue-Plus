@@ -1,6 +1,7 @@
 package org.dromara.gz.bean.controller;
 
 import cn.dev33.satoken.annotation.SaCheckPermission;
+import cn.dev33.satoken.annotation.SaMode;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 import lombok.RequiredArgsConstructor;
@@ -67,7 +68,9 @@ public class GzBeanSeatTypeConfigController extends BaseController {
     }
 
     /** 全量（按 store_id，不分页 — admin 配置页一个门店几行类型配额） */
-    @SaCheckPermission("gz:bean:seatTypeConfig:list")
+    // 「或」权限（2026-09-23）：拼豆预约管理页的桌型下拉走这里，持有预约查看权限即可读（原先只认桌型配置菜单下的按钮权限，
+    // 角色管理里取消「桌型配置」那棵树就会连带失效）；桌型的增删改权限不变。
+    @SaCheckPermission(value = {"gz:bean:seatTypeConfig:list", "gz:bean:booking:list"}, mode = SaMode.OR)
     @GetMapping("/listByStore/{storeId}")
     public R<List<GzBeanSeatTypeConfigVO>> listByStore(@NotNull @PathVariable Long storeId) {
         GzBeanSeatTypeConfigQueryBo q = new GzBeanSeatTypeConfigQueryBo();

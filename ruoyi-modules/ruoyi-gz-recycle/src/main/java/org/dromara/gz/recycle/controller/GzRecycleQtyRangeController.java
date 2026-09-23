@@ -1,6 +1,7 @@
 package org.dromara.gz.recycle.controller;
 
 import cn.dev33.satoken.annotation.SaCheckPermission;
+import cn.dev33.satoken.annotation.SaMode;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 import lombok.RequiredArgsConstructor;
@@ -57,8 +58,13 @@ public class GzRecycleQtyRangeController extends BaseController {
 
     private final IGzRecycleQtyRangeService qtyRangeService;
 
-    /** 分页查询桶列表（全状态 + 按 code 模糊 / 启用筛选）。 */
-    @SaCheckPermission("gz:recycle:qtyRange:list")
+    /**
+     * 分页查询桶列表（全状态 + 按 code 模糊 / 启用筛选）。
+     *
+     * <p>「或」权限（2026-09-23）：回收看板的「点数档」筛选下拉也走这里，持有回收看板查看权限即可读
+     * （原先只认「回收配置」下的按钮权限，角色管理里取消那棵树就会连带失效）；点数档的增删改权限不变。</p>
+     */
+    @SaCheckPermission(value = {"gz:recycle:qtyRange:list", "gz:recycle:appointment:list"}, mode = SaMode.OR)
     @GetMapping("/list")
     public TableDataInfo<GzRecycleQtyRangeVO> list(GzRecycleQtyRangeQueryBo query, PageQuery pageQuery) {
         return qtyRangeService.selectPage(query, pageQuery);
