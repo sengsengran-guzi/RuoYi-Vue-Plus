@@ -43,7 +43,7 @@ import java.util.stream.Collectors;
  *
  * <p><b>关键决策</b>：</p>
  * <ul>
- *   <li>CRUD 用手写 toEntity（同模块其他 service）；编辑禁改 storeId / seatNo（业务码 / 归属稳定）</li>
+ *   <li>CRUD 用手写 toEntity（同模块其他 service）；编辑禁改 storeId，seatNo 仅加座座位（整桌临时桌）可改</li>
  *   <li>VO 回填 typeName / bookMode：列表 / 详情按 seatTypeConfigId 批量 join config（避免 N+1）</li>
  *   <li>批量生成按 book_mode 派生编号（whole=quantity 个桌单元 / seat=quantity×capacity 个座单元），
  *       与迁移 seed（doc/11 §3.3）编号规则一致：默认前缀按 seat_type 首字母大写（single→S/double→D/quad→Q）</li>
@@ -141,14 +141,54 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
         if (bo.getSeatTypeConfigId() != null) {
             requireConfig(bo.getSeatTypeConfigId());
         }
-        // storeId / seatNo 不可改：编辑路径 skipImmutable=true
+        // storeId 不可改；seatNo 只有加座座位可改（见 resolveSeatNoRename），其余编辑路径 skipImmutable=true 忽略
         GzBeanSeat update = toEntity(bo, true);
+        update.setSeatNo(resolveSeatNoRename(bo));
         boolean flag = baseMapper.updateById(update) > 0;
         if (flag) {
-            log.info("[gz-bean-seat] UPDATE id={} configId={} enabled={} sortNo={}",
-                update.getId(), update.getSeatTypeConfigId(), update.getEnabled(), update.getSortNo());
+            log.info("[gz-bean-seat] UPDATE id={} configId={} seatNo={} enabled={} sortNo={}",
+                update.getId(), update.getSeatTypeConfigId(), update.getSeatNo(), update.getEnabled(), update.getSortNo());
         }
         return flag;
+    }
+
+    /**
+     * 编辑时的座位号改名：只放开「整桌 + 仅后台临时桌」（{@code book_mode=whole, mp_visible=0}）的座位，即加座座位。
+     *
+     * <p><b>为什么要放开</b>：加座座位由系统自动编号（S31…），店员对不上它在哪张桌；改成桌号编号
+     * （Q1-5 / Q1-6）后看板、代客提示、预约记录都用同一个号。</p>
+     *
+     * <p><b>为什么只放开这一类</b>：正式桌的座位号是按桌型自动编排的（按座 {@code Q1-1} 挂在桌号下），
+     * 改了会和「保存桌型自动对齐座位」的编号规则打架；整桌临时座一座一桌、不进小程序，改名只影响显示，
+     * 其补齐走 {@link #topUpWholeUnits} 按个数补，不会被改过的名字带偏。</p>
+     *
+     * <p><b>挂着今天及以后的活跃单不许改</b>：那些单的 {@code seat_no_snapshot} 是旧号，改了看板和订单就对不上。</p>
+     *
+     * @return 需要写入的新座位号；不改名返回 null（updateById 忽略 null 字段）
+     */
+    private String resolveSeatNoRename(GzBeanSeatBo bo) {
+        String newSeatNo = StrUtil.trim(bo.getSeatNo());
+        if (StrUtil.isBlank(newSeatNo)) {
+            return null;
+        }
+        GzBeanSeat current = baseMapper.selectById(bo.getId());
+        if (current == null || newSeatNo.equals(current.getSeatNo())) {
+            return null;
+        }
+        Long configId = bo.getSeatTypeConfigId() != null ? bo.getSeatTypeConfigId() : current.getSeatTypeConfigId();
+        GzBeanSeatTypeConfig config = requireConfig(configId);
+        if (!Integer.valueOf(0).equals(config.getMpVisible()) || !"whole".equals(config.getBookMode())) {
+            throw new ServiceException("只有加座座位（订法整桌、渠道「仅后台临时桌」）可以改座位号；正式桌的座位号由系统按桌型编排");
+        }
+        GzBeanSeatBo probe = new GzBeanSeatBo();
+        probe.setId(current.getId());
+        probe.setStoreId(current.getStoreId());
+        probe.setSeatNo(newSeatNo);
+        if (!checkSeatNoUnique(probe)) {
+            throw new ServiceException("座位号已存在：" + newSeatNo);
+        }
+        assertSeatsRemovable(List.of(current.getId()), "改座位号");
+        return newSeatNo;
     }
 
     /**
@@ -289,7 +329,11 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
         //    已有 T11-* 却按 T2 生成会造出一组跟原来凑不成桌的孤立编号，界面还显示「生成成功」）
         String prefix = resolveSyncPrefix(config, before);
         GenerateTally tally = new GenerateTally();
-        generateForConfig(config, prefix, tally);
+        if ("seat".equals(config.getBookMode())) {
+            generateForConfig(config, prefix, tally);
+        } else {
+            topUpWholeUnits(config, prefix, expected - before.size(), before.size(), tally);
+        }
 
         // ② 缩减 —— 按 (sortNo, seatNo) 取尾部多余的。用排序而非编号匹配来挑：
         //    店员手工改过编号时，编号匹配会把改过名的座位全判成多余，排序不会。
@@ -379,10 +423,16 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
             .toList();
         String derived = keys.size() == 1 ? StrUtil.removeSuffix(keys.get(0), "1") : longestCommonPrefix(keys);
         // 前缀长度上限 8 与 batchGenerate 的入参约束一致；空/超长说明编号被手工改成了非生成器格式
-        if (StrUtil.isNotBlank(derived) && derived.length() <= 8) {
-            return derived;
+        if (StrUtil.isBlank(derived) || derived.length() > 8) {
+            return resolveFreePrefix(config);
         }
-        return resolveFreePrefix(config);
+        // 整桌：已有编号不全是 {prefix}{数字} = 被改过名（加座改成 Q1-5 / Q2-5 → 公共前缀 "Q"），
+        // 接着用 "Q" 会补出 Q1、Q2 这种看着像桌号的座位 —— 另挑一个空闲前缀
+        if (!seatMode && !keys.stream().allMatch(k -> k.length() > derived.length()
+            && k.startsWith(derived) && StrUtil.isNumeric(k.substring(derived.length())))) {
+            return resolveFreePrefix(config);
+        }
+        return derived;
     }
 
     /**
@@ -508,6 +558,28 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
         }
         log.info("[gz-bean-seat] generateForConfig configId={} bookMode={} prefix={} quantity={} generated={}",
             config.getId(), config.getBookMode(), prefix, quantity, tally.created - before);
+    }
+
+    /**
+     * 整桌补齐：只补缺的 {@code missing} 个，从 {@code {prefix}1} 起跳过本店已被占的编号。
+     *
+     * <p>不能像按座那样按编号全量重放（{@link #generateForConfig}）：加座座位允许改名成 Q1-5 这类桌号编号
+     * （{@link #resolveSeatNoRename}），全量重放会按 {@code {prefix}1..n} 再造一整批、随后按排序删掉多余的，
+     * 把改过名的座位一起删掉。对未改过名的标准编号（已有 S1、S2 → 补 S3）结果与全量重放一致。</p>
+     */
+    private void topUpWholeUnits(GzBeanSeatTypeConfig config, String prefix, int missing, int existingCount,
+                                 GenerateTally tally) {
+        if (missing <= 0) {
+            return;
+        }
+        int target = tally.created + missing;
+        // 上界：最坏情况每个已占编号都要跳过一次，再留 MAX_PREFIX_ATTEMPTS 的余量给别的桌型占掉的号
+        int limit = missing + existingCount + MAX_PREFIX_ATTEMPTS;
+        for (int n = 1; tally.created < target && n <= limit; n++) {
+            upsertSeatUnit(config, prefix + n, null, n, tally);
+        }
+        log.info("[gz-bean-seat] topUpWholeUnits configId={} prefix={} missing={} created={}",
+            config.getId(), prefix, missing, tally.created - (target - missing));
     }
 
     /**

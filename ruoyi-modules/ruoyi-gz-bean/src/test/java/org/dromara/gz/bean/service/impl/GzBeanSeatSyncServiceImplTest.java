@@ -238,6 +238,46 @@ class GzBeanSeatSyncServiceImplTest {
         assertEquals("S", service.syncSeatUnits(7L).getPrefix(), "seat_type=st7 → 首字母 S");
     }
 
+    @Test
+    @DisplayName("整桌加座改过名（Q1-5/Q1-6/Q2-5）后数量 3→4：不拿公共前缀 Q 补出「Q1」，另挑空闲前缀只补 1 个，改过名的座不删")
+    void sync_wholeTopUp_renamedSeats_onlyAddsMissingWithFreePrefix() {
+        List<GzBeanSeat> renamed = new ArrayList<>(List.of(
+            seat(1L, "Q1-5", "Q1", 1), seat(2L, "Q1-6", "Q1", 2), seat(3L, "Q2-5", "Q2", 3)));
+        when(configMapper.selectById(7L)).thenReturn(config("whole", 1, 4));
+        stubUnitSnapshots(renamed, renamed, renamed);
+        stubSeatNoLookup(renamed);
+        when(baseMapper.insert(any(GzBeanSeat.class))).thenReturn(1);
+
+        GzBeanSeatSyncResultVO r = service.syncSeatUnits(7L);
+
+        assertEquals("S", r.getPrefix(), "公共前缀 Q 不是生成器格式（Q1-5 不是 Q+数字）→ 回退空闲前缀");
+        ArgumentCaptor<GzBeanSeat> cap = ArgumentCaptor.forClass(GzBeanSeat.class);
+        verify(baseMapper, times(1)).insert(cap.capture());
+        assertEquals("S1", cap.getValue().getSeatNo());
+        verify(baseMapper, never()).deleteByIds(anyCollection());
+    }
+
+    @Test
+    @DisplayName("整桌补齐遇到被别的桌型占掉的编号 → 跳过接着往后找，补够个数")
+    void sync_wholeTopUp_skipsNumbersTakenByOtherTypes() {
+        List<GzBeanSeat> own = new ArrayList<>(List.of(seat(1L, "S1", null, 1), seat(2L, "S2", null, 2)));
+        GzBeanSeat foreign = seat(99L, "S3", null, 3);
+        foreign.setSeatTypeConfigId(8L);
+        List<GzBeanSeat> taken = new ArrayList<>(own);
+        taken.add(foreign);
+        when(configMapper.selectById(7L)).thenReturn(config("whole", 1, 3));
+        stubUnitSnapshots(own, own, own);
+        stubSeatNoLookup(taken);
+        when(baseMapper.insert(any(GzBeanSeat.class))).thenReturn(1);
+
+        GzBeanSeatSyncResultVO r = service.syncSeatUnits(7L);
+
+        ArgumentCaptor<GzBeanSeat> cap = ArgumentCaptor.forClass(GzBeanSeat.class);
+        verify(baseMapper, times(1)).insert(cap.capture());
+        assertEquals("S4", cap.getValue().getSeatNo());
+        assertEquals(1, r.getCreated());
+    }
+
     // ============ 同步：缩减（症状②「数量 2 却有 12 格」） ============
 
     @Test

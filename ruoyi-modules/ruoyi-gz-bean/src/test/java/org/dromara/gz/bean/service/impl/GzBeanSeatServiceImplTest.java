@@ -18,6 +18,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -195,6 +196,125 @@ class GzBeanSeatServiceImplTest {
         GzBeanSeatBo bo = new GzBeanSeatBo();
         bo.setStoreId(1L);
         assertThrows(ServiceException.class, () -> service.updateByBo(bo));
+    }
+
+    // ------------------------------ updateByBo 改座位号（仅加座座位） ------------------------------
+
+    /** 加座桌型：整桌 × 每桌 1 座 + 渠道「仅后台临时桌」 */
+    private GzBeanSeatTypeConfig extraConfig() {
+        GzBeanSeatTypeConfig c = config(9L, 1L, "st9", "四人桌加座", "whole", 1, 8);
+        c.setMpVisible(0);
+        return c;
+    }
+
+    private GzBeanSeat existingSeat(Long id, String seatNo, Long configId) {
+        GzBeanSeat s = new GzBeanSeat();
+        s.setId(id);
+        s.setTenantId("1001");
+        s.setStoreId(1L);
+        s.setSeatTypeConfigId(configId);
+        s.setSeatNo(seatNo);
+        s.setDelFlag("0");
+        return s;
+    }
+
+    /** 编辑表单提交体：总会带上 seatNo / seatTypeConfigId */
+    private GzBeanSeatBo editBo(Long configId, String seatNo) {
+        GzBeanSeatBo bo = new GzBeanSeatBo();
+        bo.setId(5L);
+        bo.setSeatTypeConfigId(configId);
+        bo.setSeatNo(seatNo);
+        bo.setTableNo("Q1");
+        return bo;
+    }
+
+    @Test
+    @DisplayName("加座座位（整桌 + 仅后台临时桌）可改座位号 S31 → Q1-5，店员一眼对上桌子")
+    void updateByBo_renameExtraSeat_writesNewSeatNo() {
+        GzBeanSeat current = existingSeat(5L, "S31", 9L);
+        when(baseMapper.selectById(5L)).thenReturn(current);
+        when(configMapper.selectById(9L)).thenReturn(extraConfig());
+        when(baseMapper.selectRawBySeatNo(1L, "Q1-5")).thenReturn(null);
+        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(current));
+        when(bookingMapper.selectSeatIdsWithActiveBookings(eq("1001"), anyCollection(), any(LocalDate.class)))
+            .thenReturn(List.of());
+        when(baseMapper.updateById(any(GzBeanSeat.class))).thenReturn(1);
+
+        assertTrue(service.updateByBo(editBo(9L, "Q1-5")));
+
+        ArgumentCaptor<GzBeanSeat> cap = ArgumentCaptor.forClass(GzBeanSeat.class);
+        verify(baseMapper).updateById(cap.capture());
+        assertEquals("Q1-5", cap.getValue().getSeatNo());
+        assertNull(cap.getValue().getStoreId(), "storeId 仍不可改");
+    }
+
+    @Test
+    @DisplayName("正式桌座位改座位号 → 拒绝（正式桌编号由系统按桌型编排，改了会和保存桌型自动对齐打架）")
+    void updateByBo_renameRegularSeat_throws() {
+        when(baseMapper.selectById(5L)).thenReturn(existingSeat(5L, "Q1-1", 3L));
+        when(configMapper.selectById(3L)).thenReturn(config(3L, 1L, "quad", "四人桌", "seat", 4, 3));
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.updateByBo(editBo(3L, "Q1-9")));
+
+        assertTrue(ex.getMessage().contains("加座"));
+        verify(baseMapper, never()).updateById(any(GzBeanSeat.class));
+    }
+
+    @Test
+    @DisplayName("按座的临时桌也不许改号（按座编号挂在桌号下，补齐按编号重放）—— 只放开整桌")
+    void updateByBo_renameSeatModeTempTable_throws() {
+        GzBeanSeatTypeConfig tempTable = config(10L, 1L, "st10", "临时四人桌", "seat", 4, 1);
+        tempTable.setMpVisible(0);
+        when(baseMapper.selectById(5L)).thenReturn(existingSeat(5L, "T1-1", 10L));
+        when(configMapper.selectById(10L)).thenReturn(tempTable);
+
+        assertThrows(ServiceException.class, () -> service.updateByBo(editBo(10L, "Q4-1")));
+        verify(baseMapper, never()).updateById(any(GzBeanSeat.class));
+    }
+
+    @Test
+    @DisplayName("改成本店已被占用的座位号（含软删行）→ 拒绝并点名编号")
+    void updateByBo_renameToTakenSeatNo_throws() {
+        when(baseMapper.selectById(5L)).thenReturn(existingSeat(5L, "S31", 9L));
+        when(configMapper.selectById(9L)).thenReturn(extraConfig());
+        when(baseMapper.selectRawBySeatNo(1L, "Q1-1")).thenReturn(existingSeat(11L, "Q1-1", 3L));
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.updateByBo(editBo(9L, "Q1-1")));
+
+        assertTrue(ex.getMessage().contains("Q1-1"));
+        verify(baseMapper, never()).updateById(any(GzBeanSeat.class));
+    }
+
+    @Test
+    @DisplayName("座位挂着今天及以后的活跃单 → 不许改号（那些单的座位号快照是旧号，改了看板和订单对不上）")
+    void updateByBo_renameSeatWithActiveBooking_throws() {
+        GzBeanSeat current = existingSeat(5L, "S31", 9L);
+        when(baseMapper.selectById(5L)).thenReturn(current);
+        when(configMapper.selectById(9L)).thenReturn(extraConfig());
+        when(baseMapper.selectRawBySeatNo(1L, "Q1-5")).thenReturn(null);
+        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(current));
+        when(bookingMapper.selectSeatIdsWithActiveBookings(eq("1001"), anyCollection(), any(LocalDate.class)))
+            .thenReturn(List.of(5L));
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.updateByBo(editBo(9L, "Q1-5")));
+
+        assertTrue(ex.getMessage().contains("改座位号") && ex.getMessage().contains("S31"));
+        verify(baseMapper, never()).updateById(any(GzBeanSeat.class));
+    }
+
+    @Test
+    @DisplayName("座位号没变（编辑表单总会带上原号）→ 不走改名校验，正式桌照常编辑其它字段")
+    void updateByBo_unchangedSeatNo_skipsRename() {
+        when(baseMapper.selectById(5L)).thenReturn(existingSeat(5L, "Q1-1", 3L));
+        when(configMapper.selectById(3L)).thenReturn(config(3L, 1L, "quad", "四人桌", "seat", 4, 3));
+        when(baseMapper.updateById(any(GzBeanSeat.class))).thenReturn(1);
+
+        assertTrue(service.updateByBo(editBo(3L, "Q1-1")));
+
+        ArgumentCaptor<GzBeanSeat> cap = ArgumentCaptor.forClass(GzBeanSeat.class);
+        verify(baseMapper).updateById(cap.capture());
+        assertNull(cap.getValue().getSeatNo());
+        verify(bookingMapper, never()).selectSeatIdsWithActiveBookings(anyString(), anyCollection(), any());
     }
 
     // ------------------------------ toggleEnabled ------------------------------
