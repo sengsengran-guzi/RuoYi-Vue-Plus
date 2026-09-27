@@ -117,7 +117,8 @@ class GzBeanBookingServiceImplTest {
         qrCodeSigner = new QrCodeSigner(props);
         service = new GzBeanBookingServiceImpl(
             bookingMapper, bookingGroupMapper, bookingLogMapper, storeMapper, gzUserMapper, qrCodeSigner,
-            seatTypeConfigMapper, seatMapper, seatTypePriceMapper, dayPassPriceMapper, timeSlotTemplateMapper, freePromoService,
+            seatTypeConfigMapper, seatMapper, seatTypePriceMapper, dayPassPriceMapper,
+            new org.dromara.gz.bean.service.internal.GzBeanHourSlotResolver(timeSlotTemplateMapper), freePromoService,
             seatClosureService, slotQuotaCloseService, payServiceProvider, couponServiceProvider,
             payRefundServiceProvider, configService
         );
@@ -129,8 +130,8 @@ class GzBeanBookingServiceImplTest {
         // 座位关闭（GZ-BEAN-036）：默认无关闭规则（空集）→ 不拦分座 / seat-map closed=false；关闭用例自行覆盖 stub。
         lenient().when(seatClosureService.findClosedSeatIds(anyString(), anyLong(), any(), any(), any()))
             .thenReturn(java.util.List.of());
-        // 按桌型配额关闭（客户 0702 反馈 #4a）：默认无关闭（getQuotaClose=0）→ effectiveCap 不受影响；关闭用例自行覆盖 stub。
-        lenient().when(slotQuotaCloseService.getQuotaClose(anyString(), anyLong(), anyLong(), any(), any()))
+        // 按桌型配额关闭（客户 0702 反馈 #4a）：默认无关闭（getQuotaCloseOrNull=null）→ 生效关闭数沿用长期默认（默认 0）；关闭用例自行覆盖 stub。
+        lenient().when(slotQuotaCloseService.getQuotaCloseOrNull(anyString(), anyLong(), anyLong(), any(), any()))
             .thenReturn(0);
         // 前 N 名免费：默认不命中（promoFree=false 走正常计价）；促销用例自行覆盖 stub。releaseBucket 默认 no-op。
         lenient().when(freePromoService.evaluateAndLockBucket(anyLong(), anyString(), any()))
@@ -648,7 +649,7 @@ class GzBeanBookingServiceImplTest {
     /** 测试座位单元：id=200L，属店 1L，启用，挂桌型 config id=10L（newConfig / newSeatConfig）。 */
     private org.dromara.gz.bean.domain.entity.GzBeanSeat newSeat() {
         return org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-            .id(200L).storeId(1L).seatTypeConfigId(10L).seatNo("Q1-1").tableNo("Q1").enabled(1).build();
+            .id(200L).storeId(1L).seatTypeConfigId(10L).seatNo("Q1-1").tableNo("Q1").build();
     }
 
     private GzUser newPaidUser(Long id) {
@@ -662,20 +663,20 @@ class GzBeanBookingServiceImplTest {
     private org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig newConfig(String seatType, int quantity, long priceCent) {
         return org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
             .id(10L).storeId(1L).seatType("st10").name(seatType).bookMode("whole").capacity(1)
-            .quantity(quantity).priceCent(priceCent).enabled(1).build();
+            .quantity(quantity).priceCent(priceCent).build();
     }
 
     /** 按座(seat)类型，slotCapacity=quantity*capacity（ADR-0014 §2）。 */
     private org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig newSeatConfig(int quantity, int capacity, long priceCent) {
         return org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
             .id(10L).storeId(1L).seatType("st10").name("四人共享桌").bookMode("seat").capacity(capacity)
-            .quantity(quantity).priceCent(priceCent).enabled(1).build();
+            .quantity(quantity).priceCent(priceCent).build();
     }
 
     private GzBeanTimeSlotTemplate newWindow(LocalTime start, LocalTime end) {
         return GzBeanTimeSlotTemplate.builder()
             .id(1L).storeId(1L).startTime(start).endTime(end)
-            .weekdays("1,2,3,4,5,6,7").enabled(1).build();
+            .weekdays("1,2,3,4,5,6,7").build();
     }
 
     /**
@@ -712,6 +713,28 @@ class GzBeanBookingServiceImplTest {
         assertEquals(GzBeanErrorCode.QUOTA_FULL, ex.getCode());
         verify(bookingMapper, never()).insert(any(GzBeanBooking.class));
         verify(payServiceProvider, never()).getObject();
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-057 · submitPaid 防超卖必须含长期关闭：quantity=2 长期关 1 → 已有 1 单即 QUOTA_FULL")
+    void submitPaid_longCloseCountsIntoQuota() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        stubBusinessWindow();
+        when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
+        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
+        // whole quantity=2（名义容量 2），长期关闭 1 → 有效可订 1
+        when(seatTypeConfigMapper.selectById(10L)).thenReturn(
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+                .id(10L).storeId(1L).seatType("single").name("单人").bookMode("whole")
+                .capacity(1).quantity(2).priceCent(1500L).mpVisible(1).mpLongCloseCount(1).build());
+        // 该格已有 1 个活跃单：按名义容量 2 会放行（1 < 2），按有效可订 1 必须拒
+        when(bookingMapper.countActiveCoveringSlotForUpdate(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(1L);
+        // 今天没设 → null → 生效关闭数沿用长期默认 1 → 有效可订 = 2 − 1 = 1（GZ-BEAN-057 覆盖制）
+        when(slotQuotaCloseService.getQuotaCloseOrNull(anyString(), anyLong(), anyLong(), any(), any())).thenReturn(null);
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("single"), 1L));
+        assertEquals(GzBeanErrorCode.QUOTA_FULL, ex.getCode(), "长期关闭吃掉的档位不能被卖出去");
+        verify(bookingMapper, never()).insert(any(GzBeanBooking.class));
     }
 
     @Test
@@ -980,20 +1003,6 @@ class GzBeanBookingServiceImplTest {
         assertEquals(GzBeanErrorCode.SEAT_TYPE_NOT_CONFIGURED, ex2.getCode());
     }
 
-    @Test
-    @DisplayName("submitPaid · 桌型档停用 → SEAT_TYPE_DISABLED（ADR-0016 §1）")
-    void submitPaid_seatTypeDisabled() {
-        GzBeanBookingServiceImpl spy = spyWithRedisOk();
-        when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
-        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
-        org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig disabled = newConfig("single", 8, 1500);
-        disabled.setEnabled(0);
-        when(seatTypeConfigMapper.selectById(10L)).thenReturn(disabled);
-
-        ServiceException ex = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("single"), 1L));
-        assertEquals(GzBeanErrorCode.SEAT_TYPE_DISABLED, ex.getCode());
-    }
-
     // ------------------------------ GZ-BEAN-054 临时桌型（ADR-0023） ------------------------------
 
     @Test
@@ -1056,12 +1065,12 @@ class GzBeanBookingServiceImplTest {
         org.dromara.gz.bean.domain.entity.GzBeanSeat tempSeat =
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
                 .id(560L).storeId(1L).seatTypeConfigId(30L)
-                .seatNo("T1-1").tableNo("T1").enabled(1).build();
+                .seatNo("T1-1").tableNo("T1").build();
         when(seatMapper.selectById(560L)).thenReturn(tempSeat);
         when(seatTypeConfigMapper.selectById(30L)).thenReturn(
             org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
                 .id(30L).storeId(1L).seatType("st30").name("临时四人桌").bookMode("seat")
-                .capacity(4).quantity(1).enabled(1).mpVisible(0).build());
+                .capacity(4).quantity(1).mpVisible(0).build());
         when(seatClosureService.findClosedSeatIds(eq("1001"), eq(1L), any(), any(), any()))
             .thenReturn(new java.util.ArrayList<>());
         when(bookingMapper.selectSeatOccupiedNowForUpdate(eq("1001"), eq(1L), eq(560L), any(), any()))
@@ -1090,7 +1099,7 @@ class GzBeanBookingServiceImplTest {
         // 本店临时桌 configId=30
         when(seatTypeConfigMapper.selectList(any())).thenReturn(java.util.List.of(
             org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
-                .id(30L).storeId(1L).enabled(1).mpVisible(0).build()));
+                .id(30L).storeId(1L).mpVisible(0).build()));
         // mapper 返回顺序里临时桌在中间，验证 service 会把它排到最后
         org.dromara.gz.bean.domain.vo.GzBeanSeatVO temp = assignableSeatVo(310L, "T1-1");
         temp.setSeatTypeConfigId(30L);
@@ -1111,6 +1120,36 @@ class GzBeanBookingServiceImplTest {
         assertTrue(seats.get(2).getTemp(), "临时桌打 temp 标供前端标注");
         assertFalse(seats.get(0).getTemp());
         assertFalse(seats.get(1).getTemp());
+    }
+
+    @Test
+    @DisplayName("★ADR-0024 回归 · mp_visible=0 桌型：selectBoard 仍列其座位（启用开关不再影响看板），submitPaid 仍被 SEAT_TYPE_DISABLED 拒")
+    void adr0024_mpInvisible_keptOnBoardButRejectedOnSubmit() {
+        GzBeanBookingServiceImpl spy = spyWithRedisOk();
+        // ① mp 面：mp_visible=0（“对小程序不开放”）→ submitPaid 必须仍被拒，复用 4013
+        when(gzUserMapper.selectById(1L)).thenReturn(newPaidUser(1L));
+        when(storeMapper.selectById(1L)).thenReturn(newOpenStore(1L));
+        org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig mpHidden = newConfig("single", 8, 1500);
+        mpHidden.setMpVisible(0);
+        when(seatTypeConfigMapper.selectById(10L)).thenReturn(mpHidden);
+        ServiceException ex = assertThrows(ServiceException.class, () -> spy.submitPaid(newPaidBo("single"), 1L));
+        assertEquals(GzBeanErrorCode.SEAT_TYPE_DISABLED, ex.getCode());
+        verify(bookingMapper, never()).insert(any(GzBeanBooking.class));
+
+        // ② 看板面：同一 mp_visible=0 桌型的座位必须照常出现（看板不受任何“关闭”影响）
+        LocalDate date = LocalDate.of(2099, 1, 5);
+        GzBeanStore boardStore = newOpenStore(1L);
+        boardStore.setTenantId("1001");
+        when(storeMapper.selectById(1L)).thenReturn(boardStore);
+        when(seatMapper.selectList(any())).thenReturn(java.util.List.of(boardSeat(330L, "T1-1")));
+        when(seatTypeConfigMapper.selectByIds(any())).thenReturn(java.util.List.of(mpHidden));
+        when(bookingMapper.selectActiveBookingsForBoard("1001", 1L, date)).thenReturn(java.util.List.of());
+        when(configService.getConfigInt("gz.bean.board.near_end_minutes")).thenReturn(15);
+
+        java.util.List<org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO> rows = service.selectBoard(1L, date);
+
+        assertEquals(1, rows.size(), "★ 看板必须仍列出该桌型的座位 —— 看板 / 分座不受桌型可用性开关影响");
+        assertEquals(330L, rows.get(0).getSeatId());
     }
 
     @Test
@@ -1556,11 +1595,11 @@ class GzBeanBookingServiceImplTest {
         org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig cfgSingle =
             org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
                 .id(10L).storeId(1L).seatType("st10").name("单人").bookMode("whole").capacity(1)
-                .quantity(8).priceCent(1500L).enabled(1).build();
+                .quantity(8).priceCent(1500L).build();
         org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig cfgDouble =
             org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
                 .id(20L).storeId(1L).seatType("st20").name("双人").bookMode("whole").capacity(2)
-                .quantity(2).priceCent(3000L).enabled(1).build();
+                .quantity(2).priceCent(3000L).build();
         when(seatTypeConfigMapper.selectList(any())).thenReturn(java.util.List.of(cfgSingle, cfgDouble));
         // 午休断窗：10-12 + 14-15（13:00 / 12:00-14:00 不生成）→ 切出 [10:00, 11:00, 14:00] 三格
         when(timeSlotTemplateMapper.selectList(any())).thenReturn(java.util.List.of(
@@ -1606,7 +1645,7 @@ class GzBeanBookingServiceImplTest {
         org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig cfgSingle =
             org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
                 .id(10L).storeId(1L).seatType("st10").name("单人").bookMode("whole").capacity(1)
-                .quantity(8).priceCent(1500L).enabled(1).build();
+                .quantity(8).priceCent(1500L).build();
         when(seatTypeConfigMapper.selectList(any())).thenReturn(java.util.List.of(cfgSingle));
         // 单窗口 10-11 → 一格 [10:00]
         when(timeSlotTemplateMapper.selectList(any())).thenReturn(java.util.List.of(
@@ -1614,7 +1653,7 @@ class GzBeanBookingServiceImplTest {
         // booked=5
         when(bookingMapper.countActiveCoveringSlot(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(5L);
         // 配额关闭 quotaClose=1（seat_closure 已退休，detail 不再查 countClosedSeatsCoveringSlot）
-        when(slotQuotaCloseService.getQuotaClose(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(1);
+        when(slotQuotaCloseService.getQuotaCloseOrNull(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(1);
 
         java.util.List<org.dromara.gz.bean.domain.vo.GzBeanSlotAvailabilityDetailVO> list =
             service.selectTypeSlotAvailabilityDetail(1L, LocalDate.of(2099, 1, 5));
@@ -1633,6 +1672,64 @@ class GzBeanBookingServiceImplTest {
     }
 
     @Test
+    @DisplayName("★GZ-BEAN-057 · 今天没设 → 生效关闭数**沿用**长期默认（覆盖制，不是相加）：opened=8 长期 2 → remaining 6")
+    void selectTypeSlotAvailabilityDetail_inheritsLongCloseWhenUnset() {
+        GzBeanStore store = newOpenStore(1L);
+        store.setTenantId("1001");
+        when(storeMapper.selectById(1L)).thenReturn(store);
+        org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig cfg =
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+                .id(10L).storeId(1L).seatType("st10").name("单人").bookMode("whole").capacity(1)
+                .quantity(8).priceCent(1500L).mpLongCloseCount(2).build();
+        when(seatTypeConfigMapper.selectList(any())).thenReturn(java.util.List.of(cfg));
+        when(timeSlotTemplateMapper.selectList(any())).thenReturn(java.util.List.of(
+            newWindow(LocalTime.of(10, 0), LocalTime.of(11, 0))));
+        when(bookingMapper.countActiveCoveringSlot(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(0L);
+        // 今天没设过 → mapper 未命中 → null
+        when(slotQuotaCloseService.getQuotaCloseOrNull(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(null);
+
+        org.dromara.gz.bean.domain.vo.GzBeanSlotAvailabilityDetailVO row =
+            service.selectTypeSlotAvailabilityDetail(1L, LocalDate.of(2099, 1, 5)).get(0);
+
+        assertEquals(8L, row.getOpened(), "opened 是名义容量");
+        assertEquals(2L, row.getLongClose(), "长期关闭单独下发，店员才知道默认值是多少");
+        assertEquals(2L, row.getQuotaClose(), "今天没设 → 生效关闭数 = 长期默认 2");
+        assertEquals(Boolean.TRUE, row.getCloseInherited(), "标记为「沿用长期」，前端才能说清这个 2 是哪来的");
+        assertEquals(6L, row.getRemaining(), "remaining = 8 − 2（沿用）− 0");
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-057 · 今天设了就**顶掉**长期默认：长期 2 但今天设 0 → 全开 8；设 3 → 5")
+    void selectTypeSlotAvailabilityDetail_overridesLongClose() {
+        GzBeanStore store = newOpenStore(1L);
+        store.setTenantId("1001");
+        when(storeMapper.selectById(1L)).thenReturn(store);
+        org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig cfg =
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+                .id(10L).storeId(1L).seatType("st10").name("单人").bookMode("whole").capacity(1)
+                .quantity(8).priceCent(1500L).mpLongCloseCount(2).build();
+        when(seatTypeConfigMapper.selectList(any())).thenReturn(java.util.List.of(cfg));
+        when(timeSlotTemplateMapper.selectList(any())).thenReturn(java.util.List.of(
+            newWindow(LocalTime.of(10, 0), LocalTime.of(11, 0))));
+        when(bookingMapper.countActiveCoveringSlot(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(0L);
+
+        // 今天显式设 0 → 全开（把长期那 2 个也放开）
+        when(slotQuotaCloseService.getQuotaCloseOrNull(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(0);
+        org.dromara.gz.bean.domain.vo.GzBeanSlotAvailabilityDetailVO zero =
+            service.selectTypeSlotAvailabilityDetail(1L, LocalDate.of(2099, 1, 5)).get(0);
+        assertEquals(0L, zero.getQuotaClose());
+        assertEquals(Boolean.FALSE, zero.getCloseInherited());
+        assertEquals(8L, zero.getRemaining(), "显式 0 = 今天全开（不是 8−2−0=6）");
+
+        // 今天改成 3 → 只算今天这一次
+        when(slotQuotaCloseService.getQuotaCloseOrNull(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(3);
+        org.dromara.gz.bean.domain.vo.GzBeanSlotAvailabilityDetailVO three =
+            service.selectTypeSlotAvailabilityDetail(1L, LocalDate.of(2099, 1, 5)).get(0);
+        assertEquals(3L, three.getQuotaClose());
+        assertEquals(5L, three.getRemaining(), "显式 3 = 今天关 3（不是 8−2−3=3）");
+    }
+
+    @Test
     @DisplayName("selectTypeSlotAvailabilityDetail · 关闭超过剩余时 remaining 下限 0（不出负数，客户 0702 反馈 #4a）")
     void selectTypeSlotAvailabilityDetail_remainingFloorsAtZero() {
         GzBeanStore store = newOpenStore(1L);
@@ -1641,13 +1738,13 @@ class GzBeanBookingServiceImplTest {
         org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig cfg =
             org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
                 .id(10L).storeId(1L).seatType("st10").name("单人").bookMode("whole").capacity(1)
-                .quantity(4).priceCent(1500L).enabled(1).build();
+                .quantity(4).priceCent(1500L).build();
         when(seatTypeConfigMapper.selectList(any())).thenReturn(java.util.List.of(cfg));
         when(timeSlotTemplateMapper.selectList(any())).thenReturn(java.util.List.of(
             newWindow(LocalTime.of(10, 0), LocalTime.of(11, 0))));
         // opened=4 / booked=2 / quotaClose=10（远超）→ remaining 应下限 0，不为负（ADR-0018 §3）
         when(bookingMapper.countActiveCoveringSlot(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(2L);
-        when(slotQuotaCloseService.getQuotaClose(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(10);
+        when(slotQuotaCloseService.getQuotaCloseOrNull(eq("1001"), eq(1L), eq(10L), any(), any())).thenReturn(10);
 
         java.util.List<org.dromara.gz.bean.domain.vo.GzBeanSlotAvailabilityDetailVO> list =
             service.selectTypeSlotAvailabilityDetail(1L, LocalDate.of(2099, 1, 5));
@@ -1664,9 +1761,9 @@ class GzBeanBookingServiceImplTest {
         when(storeMapper.selectById(1L)).thenReturn(store);
         // 两座挂同桌型 config id=10：seat A=200（可订）/ seat B=201（区间内被占）
         org.dromara.gz.bean.domain.entity.GzBeanSeat seatA = org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-            .id(200L).storeId(1L).seatTypeConfigId(10L).seatNo("Q1-1").tableNo("Q1").enabled(1).build();
+            .id(200L).storeId(1L).seatTypeConfigId(10L).seatNo("Q1-1").tableNo("Q1").build();
         org.dromara.gz.bean.domain.entity.GzBeanSeat seatB = org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-            .id(201L).storeId(1L).seatTypeConfigId(10L).seatNo("Q1-2").tableNo("Q1").enabled(1).build();
+            .id(201L).storeId(1L).seatTypeConfigId(10L).seatNo("Q1-2").tableNo("Q1").build();
         when(seatMapper.selectList(any())).thenReturn(java.util.List.of(seatA, seatB));
         when(seatTypeConfigMapper.selectByIds(any())).thenReturn(java.util.List.of(newConfig("四人共享桌", 8, 1500)));
         stubBusinessWindow(); // 10:00-22:00 → validateAndExpandInterval 通过
@@ -1701,7 +1798,7 @@ class GzBeanBookingServiceImplTest {
         store.setTenantId("1001");
         when(storeMapper.selectById(1L)).thenReturn(store);
         org.dromara.gz.bean.domain.entity.GzBeanSeat seatA = org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-            .id(200L).storeId(1L).seatTypeConfigId(10L).seatNo("Q1-1").tableNo("Q1").enabled(1).build();
+            .id(200L).storeId(1L).seatTypeConfigId(10L).seatNo("Q1-1").tableNo("Q1").build();
         when(seatMapper.selectList(any())).thenReturn(java.util.List.of(seatA));
         when(seatTypeConfigMapper.selectByIds(any())).thenReturn(java.util.List.of(newConfig("四人共享桌", 8, 1500)));
 
@@ -1816,14 +1913,14 @@ class GzBeanBookingServiceImplTest {
     /** 看板测试座位：id=300L，挂启用桌型 config id=10L。 */
     private org.dromara.gz.bean.domain.entity.GzBeanSeat boardSeat(Long id, String seatNo) {
         return org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-            .id(id).storeId(1L).seatTypeConfigId(10L).seatNo(seatNo).tableNo("Q1").zone("大厅").enabled(1).build();
+            .id(id).storeId(1L).seatTypeConfigId(10L).seatNo(seatNo).tableNo("Q1").zone("大厅").build();
     }
 
     /** 看板测试桌型：id=10L 启用。 */
     private org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig boardConfig() {
         return org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
             .id(10L).storeId(1L).seatType("st10").name("四人共享桌").bookMode("seat").capacity(4)
-            .quantity(1).priceCent(1500L).enabled(1).build();
+            .quantity(1).priceCent(1500L).build();
     }
 
     /** 看板测试活跃单（挂座 300L）。 */
@@ -2002,6 +2099,29 @@ class GzBeanBookingServiceImplTest {
     }
 
     @Test
+    @DisplayName("ceilToHour · 末格不回绕：23:xx 返 LocalTime.MAX（回绕成 00:00 会让 clamp 判反）")
+    void ceilToHour_neverWrapsAtLastHour() {
+        // 常规：整点本身不进位；非整点进下一整点
+        assertEquals(LocalTime.of(14, 0), service.ceilToHour(LocalTime.of(14, 0)));
+        assertEquals(LocalTime.of(15, 0), service.ceilToHour(LocalTime.of(14, 23)));
+        assertEquals(LocalTime.of(15, 0), service.ceilToHour(LocalTime.of(14, 0, 30)));
+        assertEquals(LocalTime.of(1, 0), service.ceilToHour(LocalTime.of(0, 30)));
+        // 22:xx 不是末格，仍正常进位到 23:00
+        assertEquals(LocalTime.of(23, 0), service.ceilToHour(LocalTime.of(22, 59, 59)));
+        // 23:00 整点本身不进位 → 返自身（无需进位，不存在回绕）
+        assertEquals(LocalTime.of(23, 0), service.ceilToHour(LocalTime.of(23, 0)));
+        // 23:xx 要进位 → 当日无下一格 → MAX，绝不回绕成 00:00
+        assertEquals(LocalTime.MAX, service.ceilToHour(LocalTime.of(23, 0, 0, 1)));
+        assertEquals(LocalTime.MAX, service.ceilToHour(LocalTime.of(23, 1)));
+        assertEquals(LocalTime.MAX, service.ceilToHour(LocalTime.of(23, 59, 59)));
+        // 不变式（回绕会打破它）：结果永不小于入参
+        for (int h = 0; h < 24; h++) {
+            LocalTime t = LocalTime.of(h, 30);
+            assertFalse(service.ceilToHour(t).isBefore(t), "ceilToHour(" + t + ") 不得小于入参");
+        }
+    }
+
+    @Test
     @DisplayName("releaseSeatEarly · 非 used（pending）→ BOARD_OP_INVALID_STATUS，不写库")
     void releaseSeatEarly_notUsed() {
         GzBeanBooking booking = boardBooking(501L, 300L, "pending",
@@ -2091,6 +2211,37 @@ class GzBeanBookingServiceImplTest {
     }
 
     @Test
+    @DisplayName("extendBooking · 晚间跨末格（22:33 延 30min → 23:03）撞占窗口不塌成午夜，仍按当日到底校验")
+    void extendBooking_lateEvening_overlapWindowDoesNotWrapToMidnight() {
+        // 旧实现 ceil(23:03) 回绕成 00:00 → 区间 [22:33, 00:00) 反向为空 → 撞占校验静默放行 = 超卖。
+        // 真实数据可达：库里 slot_end 最大值即 22:33，延时 +30min 就跨进末格。
+        LocalTime oldSlotEnd = LocalTime.of(22, 33);
+        LocalTime newSlotEnd = LocalTime.of(23, 3);
+        GzBeanBooking booking = boardBooking(610L, 300L, "used",
+            LocalDate.now(), LocalTime.of(20, 0), oldSlotEnd);
+        booking.setVerifyTime(java.time.LocalDateTime.now());
+        when(bookingMapper.selectById(610L)).thenReturn(booking);
+        org.mockito.ArgumentCaptor<LocalTime> reqEndCap = org.mockito.ArgumentCaptor.forClass(LocalTime.class);
+        when(bookingMapper.selectActiveSeatOverlapExcludingForUpdate(
+            eq("1001"), eq(1L), eq(300L), any(), eq(610L), eq(oldSlotEnd), reqEndCap.capture()))
+            .thenReturn(java.util.List.of());
+        when(bookingMapper.extendSlotEnd(eq(610L), eq(oldSlotEnd), eq(newSlotEnd))).thenReturn(1);
+        when(seatMapper.selectById(300L)).thenReturn(boardSeat(300L, "Q1-1"));
+        when(seatTypeConfigMapper.selectById(10L)).thenReturn(boardConfig());
+        when(configService.getConfigInt("gz.bean.board.near_end_minutes")).thenReturn(15);
+
+        service.extendBooking(610L, 30, "staff1");
+
+        LocalTime reqEnd = reqEndCap.getValue();
+        // 撞占窗口上界必须覆盖到新 slot_end 之后（当日到底），不能回绕成 00:00
+        assertFalse(reqEnd.isBefore(newSlotEnd),
+            "撞占窗口上界(" + reqEnd + ") 必须覆盖新 slot_end(" + newSlotEnd + ")，否则区间反向为空、冲突静默放行");
+        assertEquals(LocalTime.MAX, reqEnd);
+        // 落库的 slot_end 仍写精确分钟值，不是 ceil 后的值
+        verify(bookingMapper).extendSlotEnd(eq(610L), eq(oldSlotEnd), eq(newSlotEnd));
+    }
+
+    @Test
     @DisplayName("extendBooking · 新增格被别人占 → EXTEND_CONFLICT（E4b），不 UPDATE")
     void extendBooking_conflict() {
         GzBeanBooking booking = boardBooking(601L, 300L, "used",
@@ -2159,7 +2310,7 @@ class GzBeanBookingServiceImplTest {
         // 新座 777L 属本店、启用、桌型匹配（10L）
         when(seatMapper.selectById(777L)).thenReturn(
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-                .id(777L).storeId(1L).seatTypeConfigId(10L).seatNo("Q2-1").tableNo("Q2").enabled(1).build());
+                .id(777L).storeId(1L).seatTypeConfigId(10L).seatNo("Q2-1").tableNo("Q2").build());
         // GZ-BEAN-043：改派也判「当下物理占用」（新座此刻无人在坐 → 放行）
         when(bookingMapper.selectSeatOccupiedNowForUpdate(eq("1001"), eq(1L), eq(777L), any(), any()))
             .thenReturn(new java.util.ArrayList<>());
@@ -2220,7 +2371,7 @@ class GzBeanBookingServiceImplTest {
         // 新座 777L 启用、桌型匹配 10L
         when(seatMapper.selectById(777L)).thenReturn(
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-                .id(777L).storeId(1L).seatTypeConfigId(10L).seatNo("S5").enabled(1).build());
+                .id(777L).storeId(1L).seatTypeConfigId(10L).seatNo("S5").build());
         when(bookingMapper.selectSeatOccupiedNowForUpdate(eq("1001"), eq(1L), eq(777L), any(), any()))
             .thenReturn(new java.util.ArrayList<>());
         when(bookingMapper.updateById(any(GzBeanBooking.class))).thenReturn(1);
@@ -2270,7 +2421,6 @@ class GzBeanBookingServiceImplTest {
         v.setSeatNo(seatNo);
         v.setStoreId(1L);
         v.setSeatTypeConfigId(10L);
-        v.setEnabled(1);
         return v;
     }
 
@@ -2376,7 +2526,7 @@ class GzBeanBookingServiceImplTest {
         // 待分配物理座位：id=555L，属本店（storeId=1L），启用，挂桌型 10L（桌型匹配）
         org.dromara.gz.bean.domain.entity.GzBeanSeat assignSeat =
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-                .id(555L).storeId(1L).seatTypeConfigId(10L).seatNo("Q2-1").tableNo("Q2").enabled(1).build();
+                .id(555L).storeId(1L).seatTypeConfigId(10L).seatNo("Q2-1").tableNo("Q2").build();
         when(seatMapper.selectById(555L)).thenReturn(assignSeat);
         // 该座当下无人在坐（GZ-BEAN-043 present-moment：Redis seat 锁 + DB 均通过）；tenantId = booking.getTenantId() = "1001"
         // 注意：必须用 new ArrayList<>() 而非 List.of()，主代码会对结果调 removeIf → 不可变列表会 UOE
@@ -2445,7 +2595,7 @@ class GzBeanBookingServiceImplTest {
         org.dromara.gz.bean.domain.entity.GzBeanSeat wrongTypeSeat =
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
                 .id(556L).storeId(1L).seatTypeConfigId(20L) // 桌型不匹配
-                .seatNo("R1-1").tableNo("R1").enabled(1).build();
+                .seatNo("R1-1").tableNo("R1").build();
         when(seatMapper.selectById(556L)).thenReturn(wrongTypeSeat);
 
         ServiceException ex = assertThrows(ServiceException.class,
@@ -2475,7 +2625,7 @@ class GzBeanBookingServiceImplTest {
 
         org.dromara.gz.bean.domain.entity.GzBeanSeat seat =
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-                .id(557L).storeId(1L).seatTypeConfigId(10L).seatNo("Q3-1").tableNo("Q3").enabled(1).build();
+                .id(557L).storeId(1L).seatTypeConfigId(10L).seatNo("Q3-1").tableNo("Q3").build();
         when(seatMapper.selectById(557L)).thenReturn(seat);
         // 座位当下有人在坐（tenantId="1001" 为 booking.getTenantId()）→ SEAT_TAKEN
         // 注意：List.of() 不可变，主代码 removeIf 会抛 UnsupportedOperationException → 用 new ArrayList
@@ -2513,7 +2663,7 @@ class GzBeanBookingServiceImplTest {
 
         org.dromara.gz.bean.domain.entity.GzBeanSeat seat =
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-                .id(558L).storeId(1L).seatTypeConfigId(10L).seatNo("Q4-1").tableNo("Q4").enabled(1).build();
+                .id(558L).storeId(1L).seatTypeConfigId(10L).seatNo("Q4-1").tableNo("Q4").build();
         when(seatMapper.selectById(558L)).thenReturn(seat);
         // 该座当下无人在坐（早场即便被用过/放过座，present-moment 查询也返回空）→ 应放行
         when(bookingMapper.selectSeatOccupiedNowForUpdate(
@@ -2558,7 +2708,7 @@ class GzBeanBookingServiceImplTest {
 
         org.dromara.gz.bean.domain.entity.GzBeanSeat seat =
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-                .id(559L).storeId(1L).seatTypeConfigId(10L).seatNo("D5").tableNo("D5").enabled(1).build();
+                .id(559L).storeId(1L).seatTypeConfigId(10L).seatNo("D5").tableNo("D5").build();
         when(seatMapper.selectById(559L)).thenReturn(seat);
 
         // 前序单：同用户 9132、D5、当下在座；slot 15:00-17:00 与本单 17:00-19:00 back-to-back 不重叠
@@ -2607,7 +2757,7 @@ class GzBeanBookingServiceImplTest {
 
         org.dromara.gz.bean.domain.entity.GzBeanSeat seat =
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-                .id(560L).storeId(1L).seatTypeConfigId(10L).seatNo("D6").tableNo("D6").enabled(1).build();
+                .id(560L).storeId(1L).seatTypeConfigId(10L).seatNo("D6").tableNo("D6").build();
         when(seatMapper.selectById(560L)).thenReturn(seat);
 
         GzBeanBooking otherGuest = new GzBeanBooking();
@@ -2649,7 +2799,7 @@ class GzBeanBookingServiceImplTest {
 
         org.dromara.gz.bean.domain.entity.GzBeanSeat seat =
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-                .id(561L).storeId(1L).seatTypeConfigId(10L).seatNo("D7").tableNo("D7").enabled(1).build();
+                .id(561L).storeId(1L).seatTypeConfigId(10L).seatNo("D7").tableNo("D7").build();
         when(seatMapper.selectById(561L)).thenReturn(seat);
 
         GzBeanBooking predecessor = new GzBeanBooking();
@@ -2694,7 +2844,7 @@ class GzBeanBookingServiceImplTest {
 
         org.dromara.gz.bean.domain.entity.GzBeanSeat seat =
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-                .id(558L).storeId(1L).seatTypeConfigId(10L).seatNo("Q4-1").tableNo("Q4").enabled(1).build();
+                .id(558L).storeId(1L).seatTypeConfigId(10L).seatNo("Q4-1").tableNo("Q4").build();
         when(seatMapper.selectById(558L)).thenReturn(seat);
         // 该座该日 weekday 该区间被关闭 → findClosedSeatIds 命中 558L
         when(seatClosureService.findClosedSeatIds(eq("1001"), eq(1L), any(), any(), any()))
@@ -2756,10 +2906,10 @@ class GzBeanBookingServiceImplTest {
         // 两座：910L 正常 / 911L 被关闭。均属店 1L、桌型 10L、启用。
         org.dromara.gz.bean.domain.entity.GzBeanSeat seatA =
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-                .id(910L).storeId(1L).seatTypeConfigId(10L).seatNo("Q5-1").tableNo("Q5").enabled(1).build();
+                .id(910L).storeId(1L).seatTypeConfigId(10L).seatNo("Q5-1").tableNo("Q5").build();
         org.dromara.gz.bean.domain.entity.GzBeanSeat seatB =
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-                .id(911L).storeId(1L).seatTypeConfigId(10L).seatNo("Q5-2").tableNo("Q5").enabled(1).build();
+                .id(911L).storeId(1L).seatTypeConfigId(10L).seatNo("Q5-2").tableNo("Q5").build();
         when(seatMapper.selectList(any())).thenReturn(java.util.List.of(seatA, seatB));
         when(seatTypeConfigMapper.selectByIds(any())).thenReturn(java.util.List.of(newConfig("单人桌", 1, 1500)));
         // 无预约占座 → full=false；关闭规则命中 911L → 仅 911L closed=true
@@ -2814,7 +2964,7 @@ class GzBeanBookingServiceImplTest {
         // 待分配物理座位
         org.dromara.gz.bean.domain.entity.GzBeanSeat assignSeat =
             org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
-                .id(555L).storeId(1L).seatTypeConfigId(10L).seatNo("Q2-1").tableNo("Q2").enabled(1).build();
+                .id(555L).storeId(1L).seatTypeConfigId(10L).seatNo("Q2-1").tableNo("Q2").build();
         when(seatMapper.selectById(555L)).thenReturn(assignSeat);
         // 必须用 new ArrayList<>() 而非 List.of()：主代码 removeIf 对不可变列表会抛 UOE（即使空列表）
         when(bookingMapper.selectSeatOccupiedNowForUpdate(
@@ -3069,18 +3219,18 @@ class GzBeanBookingServiceImplTest {
         // 座位 A：昨天写的备注（过期）；座位 B：今天写的备注（保留）
         org.dromara.gz.bean.domain.entity.GzBeanSeat stale = new org.dromara.gz.bean.domain.entity.GzBeanSeat();
         stale.setId(11L); stale.setStoreId(storeId); stale.setSeatTypeConfigId(100L);
-        stale.setSeatNo("S1"); stale.setEnabled(1);
+        stale.setSeatNo("S1");
         stale.setRemark("昨天的备注"); stale.setRemarkDate(today.minusDays(1));
 
         org.dromara.gz.bean.domain.entity.GzBeanSeat fresh = new org.dromara.gz.bean.domain.entity.GzBeanSeat();
         fresh.setId(12L); fresh.setStoreId(storeId); fresh.setSeatTypeConfigId(100L);
-        fresh.setSeatNo("S2"); fresh.setEnabled(1);
+        fresh.setSeatNo("S2");
         fresh.setRemark("今天的备注"); fresh.setRemarkDate(today);
 
         when(seatMapper.selectList(any())).thenReturn(new java.util.ArrayList<>(java.util.List.of(stale, fresh)));
 
         org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig cfg = new org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig();
-        cfg.setId(100L); cfg.setStoreId(storeId); cfg.setEnabled(1);
+        cfg.setId(100L); cfg.setStoreId(storeId);
         cfg.setBookMode("whole"); cfg.setName("四人桌"); cfg.setSeatType("four");
         when(seatTypeConfigMapper.selectByIds(any())).thenReturn(java.util.List.of(cfg));
 
@@ -3115,6 +3265,103 @@ class GzBeanBookingServiceImplTest {
         verify(seatMapper).update(any(), cap.capture());
         String sqlSet = cap.getValue().getSqlSet();
         assertTrue(sqlSet.contains("remark_date"), "写备注必须同时 set remark_date：" + sqlSet);
+    }
+
+    // ============================================================
+    //  ADR-0024 §3 看板「今日可售」（甲方 2026-09-26 红框位）
+    // ============================================================
+
+    /**
+     * 「今日可售」用例共用桩：1 门店（tenant 1001）+ 1 个对小程序开放桌型（seat 模式 2×3 → cap=6）
+     * + 10-12 两个 1h 格 + 3 个座位（101 空 / 102 当天有活跃单 / 103 属别的桌型）。
+     */
+    private void stubDaySellable(LocalDate sessDate, int close10, int close11) {
+        GzBeanStore store = new GzBeanStore();
+        store.setId(1L);
+        store.setTenantId("1001");
+        when(storeMapper.selectById(1L)).thenReturn(store);
+
+        when(seatTypeConfigMapper.selectList(any())).thenReturn(java.util.List.of(
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+                .id(10L).storeId(1L).name("双人桌").seatType("double")
+                .bookMode("seat").quantity(2).capacity(3).mpVisible(1).build()));
+        when(timeSlotTemplateMapper.selectList(any())).thenReturn(java.util.List.of(
+            newWindow(LocalTime.of(10, 0), LocalTime.of(12, 0))));
+        when(seatMapper.selectList(any())).thenReturn(java.util.List.of(
+            org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
+                .id(101L).storeId(1L).seatTypeConfigId(10L).seatNo("D1-1").tableNo("D1").build(),
+            org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
+                .id(102L).storeId(1L).seatTypeConfigId(10L).seatNo("D1-2").tableNo("D1").build(),
+            org.dromara.gz.bean.domain.entity.GzBeanSeat.builder()
+                .id(103L).storeId(1L).seatTypeConfigId(20L).seatNo("Q1-1").tableNo("Q1").build()));
+        // 当天有活跃单并且已绑座的只有 102 —— 桩打在 selectActiveBookingsForBoard 上（与 selectBoard 同一条 SQL）
+        when(bookingMapper.selectActiveBookingsForBoard("1001", 1L, sessDate))
+            .thenReturn(java.util.List.of(GzBeanBooking.builder()
+                .id(9001L).seatTypeConfigId(10L).seatId(102L).status("used").payStatus("paid").build()));
+        when(slotQuotaCloseService.getQuotaCloseOrNull("1001", 1L, 10L, sessDate, LocalTime.of(10, 0)))
+            .thenReturn(close10);
+        when(slotQuotaCloseService.getQuotaCloseOrNull("1001", 1L, 10L, sessDate, LocalTime.of(11, 0)))
+            .thenReturn(close11);
+        // 逐格已订数：10:00 那格有 1 单、11:00 那格 0 单 —— 逐时段明细的 booked 走这条 SQL（与 mp 余量同一条）
+        when(bookingMapper.countActiveCoveringSlot("1001", 1L, 10L, sessDate, LocalTime.of(10, 0))).thenReturn(1L);
+        when(bookingMapper.countActiveCoveringSlot("1001", 1L, 10L, sessDate, LocalTime.of(11, 0))).thenReturn(0L);
+    }
+
+    @Test
+    @DisplayName("「今日可售」· freeSeats 排除当天有活跃单的座位（活跃口径 = selectActiveBookingsForBoard，与看板逐字一致）")
+    void selectDaySellable_freeSeatsExcludesOccupied() {
+        LocalDate sessDate = LocalDate.of(2026, 9, 28);
+        stubDaySellable(sessDate, 1, 1);
+
+        java.util.List<org.dromara.gz.bean.domain.vo.GzBeanDaySellableVO> list =
+            service.selectDaySellable(1L, sessDate);
+
+        assertEquals(1, list.size(), "只含对小程序开放的桌型");
+        org.dromara.gz.bean.domain.vo.GzBeanDaySellableVO vo = list.get(0);
+        assertEquals(6L, vo.getCapPerSlot(), "capPerSlot = quantity×capacity = 2×3");
+        assertEquals(2, vo.getSlotCount());
+        // ★ 本次修复的回归点：当天只有 1 张活跃单，但它横跨 10:00/11:00 两格。
+        //   旧实现逐格求和（2 格 × 1 单）= 2，店员会看到「已订 2」而实际只有 1 单；新实现按 config 去重 = 1。
+        assertEquals(1L, vo.getActiveBookings(), "当日活跃单按 config 去重计数（跨格单只算 1），不是逐格求和");
+        java.util.List<Long> freeSeatIds = vo.getFreeSeats().stream()
+            .map(org.dromara.gz.bean.domain.vo.GzBeanDaySellableVO.FreeSeat::getSeatId).toList();
+        assertEquals(java.util.List.of(101L), freeSeatIds,
+            "102 当天有活跃单必须排除；103 属别的桌型不进本行");
+        assertEquals("D1", vo.getFreeSeats().get(0).getTableNo());
+    }
+
+    @Test
+    @DisplayName("「今日可售」· 逐时段明细逐格独立：剩余 = max(0, cap − 该格关闭 − 该格已订)，不是全天一个值")
+    void selectDaySellable_perSlotDetail() {
+        LocalDate sessDate = LocalDate.of(2026, 9, 28);
+        stubDaySellable(sessDate, 1, 3);
+
+        org.dromara.gz.bean.domain.vo.GzBeanDaySellableVO vo =
+            service.selectDaySellable(1L, sessDate).get(0);
+
+        java.util.List<org.dromara.gz.bean.domain.vo.GzBeanDaySellableVO.SlotRow> slots = vo.getSlots();
+        assertEquals(2, slots.size(), "两个营业格 → 两行明细");
+        // ★ 回归点：旧实现把「各格关闭数」压成单值（不一致就置 null），抽屉没法逐时段显示 / 逐时段调。
+        //   新实现逐格独立：10:00 booked=1 close=1 → 6−1−1=4；11:00 booked=0 close=3 → 6−3−0=3。
+        assertEquals(1L, slots.get(0).getCloseCount());
+        assertEquals(1L, slots.get(0).getBooked());
+        assertEquals(4L, slots.get(0).getRemaining(), "逐格剩余必须自己算，不能拿全天值糊");
+        assertEquals(3L, slots.get(1).getCloseCount());
+        assertEquals(0L, slots.get(1).getBooked());
+        assertEquals(3L, slots.get(1).getRemaining());
+        assertEquals("10:00", slots.get(0).getSlotStart().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm")));
+    }
+
+    @Test
+    @DisplayName("「今日可售」· 关闭数超过该格配额 → 剩余夹到 0（不下发负数，前端 stepper 才不会显示负值）")
+    void selectDaySellable_remainingClampedAtZero() {
+        LocalDate sessDate = LocalDate.of(2026, 9, 28);
+        stubDaySellable(sessDate, 99, 0);
+
+        org.dromara.gz.bean.domain.vo.GzBeanDaySellableVO vo =
+            service.selectDaySellable(1L, sessDate).get(0);
+
+        assertEquals(0L, vo.getSlots().get(0).getRemaining(), "close 远超 cap → 剩余下限 0");
     }
 
 }

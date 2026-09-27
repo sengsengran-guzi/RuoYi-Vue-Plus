@@ -38,7 +38,7 @@ public interface GzBeanSeatMapper extends BaseMapperPlus<GzBeanSeat, GzBeanSeatV
      */
     @Update("""
         UPDATE gz_bean_seat
-           SET del_flag = '0', enabled = 1,
+           SET del_flag = '0',
                seat_type_config_id = #{seatTypeConfigId},
                table_no = #{tableNo}, zone = #{zone},
                row_label = #{rowLabel}, col_index = #{colIndex}, sort_no = #{sortNo}
@@ -53,20 +53,18 @@ public interface GzBeanSeatMapper extends BaseMapperPlus<GzBeanSeat, GzBeanSeatV
                           @Param("sortNo") Integer sortNo);
 
     /**
-     * 按桌型统计座位单元数（GZ-BEAN-055），一次查完整批，避免逐行 N+1。
+     * 按桌型统计看板计时格数（GZ-BEAN-055）—— 一次查完整批，避免逐行 N+1。
      *
-     * <p>{@code cells} = <b>启用</b>且未删的数量 —— 与 {@code selectBoard} 的取数条件逐字一致，
-     * 所以它就是「看板上会出现几个计时格」。{@code units} = 未删的全部（含已停用），
-     * 是「占着编号的单位数」，同步做减法时按它判断多不多。两个数分开给：
-     * 停用一个座位会让 cells 减 1 而 units 不变，前端要能解释这个差额。</p>
+     * <p>「计时格」= 该桌型<b>未软删</b>的 {@code gz_bean_seat} 行数，与 {@code selectBoard} 的取数条件
+     * 逐字一致（{@code del_flag='0'} + 挂桌型），所以它就是「看板上会出现几个格子」。
+     * {@code expectedCells} 与之不等 = 配额和物理座位错配，前端要能解释这个差额。</p>
      *
      * @param configIds 桌型配置 id 集合（非空）
-     * @return 每个桌型一行 {@code (seatTypeConfigId, cells, units)}
+     * @return 每个桌型一行 {@code (seatTypeConfigId, cells)}
      */
     @Select("<script>" +
         "SELECT seat_type_config_id AS seatTypeConfigId, " +
-        "  COALESCE(SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END), 0) AS cells, " +
-        "  COUNT(*) AS units " +
+        "  COUNT(*) AS cells " +
         "FROM gz_bean_seat " +
         "WHERE del_flag = '0' " +
         "  AND seat_type_config_id IN <foreach collection='configIds' item='cid' open='(' separator=',' close=')'>#{cid}</foreach> " +
@@ -74,13 +72,11 @@ public interface GzBeanSeatMapper extends BaseMapperPlus<GzBeanSeat, GzBeanSeatV
         "</script>")
     List<SeatUnitCount> countUnitsByConfigIds(@Param("configIds") Collection<Long> configIds);
 
-    /** {@link #countUnitsByConfigIds} 的行 —— 桌型 id → 看板计时格数 / 占编号单位数。 */
+    /** {@link #countUnitsByConfigIds} 的行 —— 桌型 id → 看板计时格数。 */
     @Data
     class SeatUnitCount {
         private Long seatTypeConfigId;
-        /** 启用且未删 = 看板会渲染的计时格数 */
+        /** 未软删的座位数 = 看板会渲染的计时格数 */
         private Integer cells;
-        /** 未删（含停用）= 占着编号的单位数 */
-        private Integer units;
     }
 }

@@ -110,7 +110,8 @@ class GzBeanWalkInServiceImplTest {
         qrCodeSigner = new QrCodeSigner(props);
         GzBeanBookingServiceImpl real = new GzBeanBookingServiceImpl(
             bookingMapper, bookingGroupMapper, bookingLogMapper, storeMapper, gzUserMapper, qrCodeSigner,
-            seatTypeConfigMapper, seatMapper, seatTypePriceMapper, dayPassPriceMapper, timeSlotTemplateMapper, freePromoService,
+            seatTypeConfigMapper, seatMapper, seatTypePriceMapper, dayPassPriceMapper,
+            new org.dromara.gz.bean.service.internal.GzBeanHourSlotResolver(timeSlotTemplateMapper), freePromoService,
             seatClosureService, slotQuotaCloseService, payServiceProvider, couponServiceProvider,
             payRefundServiceProvider, configService
         );
@@ -129,7 +130,6 @@ class GzBeanWalkInServiceImplTest {
         seat.setStoreId(STORE_ID);
         seat.setSeatTypeConfigId(CONFIG_ID);
         seat.setSeatNo("S1");
-        seat.setEnabled(1);
         lenient().when(seatMapper.selectById(SEAT_ID)).thenReturn(seat);
 
         GzBeanSeatTypeConfig config = new GzBeanSeatTypeConfig();
@@ -141,7 +141,6 @@ class GzBeanWalkInServiceImplTest {
         config.setQuantity(2);
         config.setCapacity(4);
         config.setPriceCent(5000L);
-        config.setEnabled(1);
         lenient().when(seatTypeConfigMapper.selectById(CONFIG_ID)).thenReturn(config);
 
         // 营业窗口 mock（松绑后 walk-in 不再校验窗口，但保留 lenient 兼容其它路径）
@@ -242,6 +241,21 @@ class GzBeanWalkInServiceImplTest {
         // ★ 一次 insert，绝不 updateById（防 @Version 静默不落坑）
         verify(bookingMapper, never()).updateById(any(GzBeanBooking.class));
         verify(bookingMapper).insert(any(GzBeanBooking.class));
+    }
+
+    @Test
+    @DisplayName("★ADR-0024 回归 · 分座候选不再看任何开关：座位 / 桌型可见性字段全不设也能成功分座（原 SEAT_DISABLED 路径已消失）")
+    void adr0024_assignSeat_noEnabledGateAnywhere() {
+        // fixture 的座位与桌型只注 id / storeId / seatTypeConfigId / bookMode / capacity / quantity，
+        //   enabled 与 mp_visible 都不置（新模型里 enabled 列已删，mpVisible=1 只是“对小程序开放”）。
+        //   旧实现里 seat.getEnabled() != 1 会抛 SEAT_DISABLED —— 本用例在那时必然红。
+        GzBeanBookingVO vo = service.walkInCreate(walkInBo(T1634, T1750, false, null), "staff1");
+
+        assertNotNull(vo);
+        assertEquals(1, memBookings.size());
+        GzBeanBooking saved = memBookings.get(0);
+        assertEquals(SEAT_ID, saved.getSeatId(), "分座必须落到该座 —— 没有任何开关能拦住分座");
+        assertEquals("used", saved.getStatus());
     }
 
     @Test
@@ -355,23 +369,6 @@ class GzBeanWalkInServiceImplTest {
     }
 
     @Test
-    @DisplayName("座位停用 → SEAT_DISABLED")
-    void walkIn_seatDisabled() {
-        GzBeanSeat disabled = new GzBeanSeat();
-        disabled.setId(SEAT_ID);
-        disabled.setStoreId(STORE_ID);
-        disabled.setSeatTypeConfigId(CONFIG_ID);
-        disabled.setSeatNo("S1");
-        disabled.setEnabled(0);
-        when(seatMapper.selectById(SEAT_ID)).thenReturn(disabled);
-
-        ServiceException ex = assertThrows(ServiceException.class,
-            () -> service.walkInCreate(walkInBo(T1634, T1750, false, null), "staff1"));
-        assertEquals(GzBeanErrorCode.SEAT_DISABLED, ex.getCode());
-        assertTrue(memBookings.isEmpty());
-    }
-
-    @Test
     @DisplayName("座位不属本店 → SEAT_TAKEN（防跨店误分）")
     void walkIn_seatWrongStore() {
         GzBeanSeat otherStore = new GzBeanSeat();
@@ -379,7 +376,6 @@ class GzBeanWalkInServiceImplTest {
         otherStore.setStoreId(2L);
         otherStore.setSeatTypeConfigId(CONFIG_ID);
         otherStore.setSeatNo("S1");
-        otherStore.setEnabled(1);
         when(seatMapper.selectById(SEAT_ID)).thenReturn(otherStore);
 
         ServiceException ex = assertThrows(ServiceException.class,

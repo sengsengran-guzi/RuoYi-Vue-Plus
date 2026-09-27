@@ -82,10 +82,9 @@ public class GzBeanBookingMpController {
      * 业务错误（R.code）：
      *   4001 PHONE_REQUIRED          → 弹手机号授权
      *   4002 SEAT_TAKEN              → 「该座位该时段已被预约」（具体座位区间互斥，ADR-0015 §2；座不存在/不属本店亦此码）
-     *   4005 SEAT_DISABLED           → 「该座位已停用，请重选」
      *   4016 SLOT_RANGE_INVALID      → 「所选时段不连续或跨越休息时段」（跳选 / 跨午休 / 含不可约格）
-     *   4012 SEAT_TYPE_NOT_CONFIGURED→ 「该座位暂未开放」（座未挂桌型 / 桌型缺失）
-     *   4013 SEAT_TYPE_DISABLED      → 「该座位所属桌型已停用」
+     *   4012 SEAT_TYPE_NOT_CONFIGURED→ 「该座位暂未开放」（桌型已退役 / 未挂桌型）
+     *   4013 SEAT_TYPE_DISABLED      → 「该桌型未对小程序开放」（临时桌 / 桌型刚被改动，ADR-0024）
      *   4004 SUBMIT_TOO_FAST         → 「操作过快」
      * </pre>
      */

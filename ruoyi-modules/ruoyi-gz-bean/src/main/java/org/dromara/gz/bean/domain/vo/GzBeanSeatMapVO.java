@@ -12,7 +12,7 @@ import java.io.Serializable;
  * mp 影院选座可用性 VO（GZ-BEAN-024，ADR-0015 §3 / doc/11 §3.4「可用性接口 VO」）。
  *
  * <p>{@code GET /app/gz/bean/booking/seat-map?storeId&sessDate&slotStart&slotEnd} 返回该门店该日全部
- * <b>启用且挂桌型</b>（{@code seat_type_config_id NOT NULL 且 enabled=1}）的座位单元，每座一档。mp 影院图按
+ * <b>挂桌型且桌型对小程序开放</b>（{@code seat_type_config_id NOT NULL} 且 {@code mp_visible=1}）的座位单元，每座一档。mp 影院图按
  * {@code zone / seatTypeConfigId（桌型）/ tableNo} 分组渲染，对每座算 {@code full}（该座在所选区间内任一格被占
  * → 灰显不可点）。具体座位是离散身份，影院图天然显示「这个座位可订 / 已占」布尔，不存在余量数字泄漏
  * （ADR-0015 §3 铁律微调）。</p>

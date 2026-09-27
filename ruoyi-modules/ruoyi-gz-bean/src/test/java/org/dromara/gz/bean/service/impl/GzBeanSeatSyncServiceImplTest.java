@@ -100,7 +100,6 @@ class GzBeanSeatSyncServiceImplTest {
         s.setSeatNo(seatNo);
         s.setTableNo(tableNo);
         s.setSortNo(sortNo);
-        s.setEnabled(1);
         s.setDelFlag("0"); // DB 该列 NOT NULL DEFAULT '0'，fixture 也照实设，别让测试跑在生产不会出现的状态上
         return s;
     }
@@ -150,26 +149,6 @@ class GzBeanSeatSyncServiceImplTest {
 
         assertTrue(service.deleteByIds(List.of(101L)));
         verify(baseMapper).deleteByIds(anyCollection());
-    }
-
-    @Test
-    @DisplayName("停用座位：与删除等价（看板同样看不见）→ 挂着活跃单时也必须拒绝")
-    void toggleEnabled_off_blockedWhenSeatStillHoldsActiveBooking() {
-        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(seat(101L, "Q3-1", "Q3", 31)));
-        when(bookingMapper.selectSeatIdsWithActiveBookings(anyString(), anyCollection(), any(LocalDate.class)))
-            .thenReturn(List.of(101L));
-
-        assertThrows(ServiceException.class, () -> service.toggleEnabled(101L, 0));
-        verify(baseMapper, never()).updateById(any(GzBeanSeat.class));
-    }
-
-    @Test
-    @DisplayName("启用座位（enabled=1）不过闸 —— 加座位不会让任何单消失，拦它只会挡住恢复操作")
-    void toggleEnabled_on_skipsGuard() {
-        when(baseMapper.updateById(any(GzBeanSeat.class))).thenReturn(1);
-
-        assertTrue(service.toggleEnabled(101L, 1));
-        verify(bookingMapper, never()).selectSeatIdsWithActiveBookings(anyString(), anyCollection(), any());
     }
 
     // ============ 同步：补齐（症状①「改了数量看板没多格子」） ============

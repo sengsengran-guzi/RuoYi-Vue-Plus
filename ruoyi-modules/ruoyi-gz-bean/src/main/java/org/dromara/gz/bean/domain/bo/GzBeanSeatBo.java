@@ -22,7 +22,7 @@ import java.io.Serial;
  * {@link AddGroup} 新增 / {@link EditGroup} 编辑。</p>
  *
  * <p><b>受控字段</b>：storeId / seatTypeConfigId / seatNo / tableNo / zone / rowLabel /
- * colIndex / enabled / sortNo / remark。<b>禁填</b>：id（编辑必传） / tenantId / 公共字段。</p>
+ * colIndex / sortNo / remark。<b>禁填</b>：id（编辑必传） / tenantId / 公共字段。</p>
  *
  * <p>新增必填 seatTypeConfigId（座位单元必须挂桌型）；seatNo UNIQUE(tenant_id, store_id, seat_no)
  * 已由 DB + Service 兜底，撞号友好报错。编辑禁改 storeId / seatNo（业务码 / 归属稳定）。</p>
@@ -70,11 +70,6 @@ public class GzBeanSeatBo extends BaseEntity {
     @Min(value = 1, message = "列序号不能小于 1", groups = {AddGroup.class, EditGroup.class})
     @Max(value = 99, message = "列序号不能大于 99", groups = {AddGroup.class, EditGroup.class})
     private Integer colIndex;
-
-    /** 0=停用 / 1=启用 */
-    @Min(value = 0, message = "enabled 取值仅 0/1", groups = {AddGroup.class, EditGroup.class})
-    @Max(value = 1, message = "enabled 取值仅 0/1", groups = {AddGroup.class, EditGroup.class})
-    private Integer enabled;
 
     /** 排序值 */
     private Integer sortNo;

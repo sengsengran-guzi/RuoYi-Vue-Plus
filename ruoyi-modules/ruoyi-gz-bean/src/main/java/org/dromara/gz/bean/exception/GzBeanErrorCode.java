@@ -38,7 +38,13 @@ public final class GzBeanErrorCode {
     public static final int SUBMIT_TOO_FAST = 4004;
     public static final String SUBMIT_TOO_FAST_MSG = "操作过快，请稍后再试";
 
-    /** 座位被后台停用（doc/10 §3.E3） */
+    /**
+     * 座位不可用（<b>无抛出点</b>，保留码位以免与 mp 既有码位表错位）。
+     *
+     * <p>座位坏了 / 停用一律<b>直接删该座位</b>（{@code gz_bean_seat} 软删 {@code del_flag='1'}），
+     * 不做「不可用」开关：ADR-0024（2026-09-26，Kevin 定）删掉 {@code gz_bean_seat.enabled} 后
+     * 分座候选不再看任何座位级开关，本码在服务端已无任何 throw（全仓 grep 仅剩本定义）。</p>
+     */
     public static final int SEAT_DISABLED = 4005;
     public static final String SEAT_DISABLED_MSG = "该座位已停用，请重选";
 

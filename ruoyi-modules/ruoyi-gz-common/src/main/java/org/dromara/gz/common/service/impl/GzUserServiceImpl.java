@@ -200,10 +200,14 @@ public class GzUserServiceImpl implements IGzUserService {
         if (StrUtil.isBlank(keyword)) {
             return java.util.Collections.emptyList();
         }
-        // 昵称 OR openid 模糊（GZ-ADMIN-103 admin 订单用户关键词搜）
+        // 昵称 OR 手机号 OR openid 模糊（GZ-ADMIN-103 admin 订单用户关键词搜）。
+        //   手机号必须在内：admin 列表本就展示手机号，店员第一反应就是拿它搜；
+        //   只搜昵称/openid 会变成「看得到却搜不到」，是最容易被当成 bug 报上来的形态。
         LambdaQueryWrapper<GzUser> lqw = new LambdaQueryWrapper<GzUser>()
             .select(GzUser::getId)
-            .and(w -> w.like(GzUser::getNickname, keyword).or().like(GzUser::getOpenid, keyword));
+            .and(w -> w.like(GzUser::getNickname, keyword)
+                .or().like(GzUser::getMobile, keyword)
+                .or().like(GzUser::getOpenid, keyword));
         return baseMapper.selectList(lqw).stream()
             .map(GzUser::getId)
             .toList();

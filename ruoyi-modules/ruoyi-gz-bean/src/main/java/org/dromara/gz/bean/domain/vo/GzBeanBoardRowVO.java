@@ -13,8 +13,9 @@ import java.time.LocalTime;
 /**
  * 店内计时看板行 VO（GZ-BEAN-026，ADR-0015 §5 / doc/11 §3.12 / doc/10 §11 看板子流程）。
  *
- * <p>一行 = 当日某门店一个<b>启用且挂桌型</b>的座位单元（{@code gz_bean_seat.enabled=1 且
- * seat_type_config_id NOT NULL}）的实时状态。admin（plus-ui owner/店员，GZ-BEAN-028）+ mp 店员端
+ * <p>一行 = 当日某门店一个<b>挂桌型</b>的座位单元（{@code gz_bean_seat.seat_type_config_id NOT NULL}，
+ * 桌型已退役 / legacy 无桌型座均不进；临时桌 {@code mp_visible=0} <b>照常进</b>）的实时状态。
+ * admin（plus-ui owner/店员，GZ-BEAN-028）+ mp 店员端
  * （GZ-BEAN-031）消费。座位无活跃单 → {@code status=idle}，{@code currentBooking* 字段全空}；
  * 有活跃单 → 回填该座当前（覆盖当前时刻或最近的活跃）单的 booking 信息 + 看板状态。</p>
  *

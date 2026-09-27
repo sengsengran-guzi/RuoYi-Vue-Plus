@@ -24,9 +24,6 @@ public class GzBeanSeatTypeConfigQueryBo implements Serializable {
     /** 座位类型（精确，字典 gz_bean_seat_type 的 value） */
     private String seatType;
 
-    /** 0=停用 / 1=启用 */
-    private Integer enabled;
-
     /** 是否对小程序开放：1=正常桌型 / 0=仅后台临时桌（GZ-BEAN-054）；不传则不过滤 */
     private Integer mpVisible;
 }

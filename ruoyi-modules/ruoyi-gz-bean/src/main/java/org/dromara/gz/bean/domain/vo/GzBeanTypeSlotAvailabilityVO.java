@@ -66,7 +66,8 @@ public class GzBeanTypeSlotAvailabilityVO implements Serializable {
 
     /**
      * 座位类型 config 是否启用（mp 契约字段：active=false 灰显/过滤）。
-     * 余量接口仅查 enabled=1 的 config（service selectTypeSlotAvailability eq enabled=1），故恒 true；
+     * 余量接口仅查「存活且对小程序开放」的 config（service selectTypeSlotAvailability eq mp_visible=1，
+     * 软删由 @TableLogic 过滤），故恒 true；
      * 显式回传以满足 mp TypeSlotVO.active 契约，避免 undefined→falsy→整档被过滤。
      */
     private Boolean active;

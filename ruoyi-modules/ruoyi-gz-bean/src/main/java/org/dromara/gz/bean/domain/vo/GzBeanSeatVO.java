@@ -58,9 +58,6 @@ public class GzBeanSeatVO implements Serializable {
     /** 列序号（影院图行列定位辅助） */
     private Integer colIndex;
 
-    /** 0=停用 / 1=启用 */
-    private Integer enabled;
-
     /** 排序值 */
     private Integer sortNo;
 

@@ -3,6 +3,7 @@ package org.dromara.gz.bean.service.impl;
 import com.baomidou.mybatisplus.core.conditions.Wrapper;
 import org.dromara.common.core.exception.ServiceException;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigBo;
+import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigPriceBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypePriceBo;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
 import org.dromara.gz.bean.domain.entity.GzBeanSeatTypePrice;
@@ -74,7 +75,7 @@ class GzBeanSeatTypeConfigServiceImplTest {
     // ------------------------------ insertByBo ------------------------------
 
     @Test
-    @DisplayName("insertByBo happy → 默认 enabled=1 / sortNo=0 + insert + 回写 st<id> + bo.id 回填")
+    @DisplayName("insertByBo happy → 默认 sortNo=0 + insert + 回写 st<id> + bo.id 回填")
     void insertByBo_happy_appliesDefaults() {
         GzBeanSeatTypeConfigBo bo = validBo();
         when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
@@ -90,7 +91,6 @@ class GzBeanSeatTypeConfigServiceImplTest {
 
         ArgumentCaptor<GzBeanSeatTypeConfig> cap = ArgumentCaptor.forClass(GzBeanSeatTypeConfig.class);
         verify(baseMapper).insert(cap.capture());
-        assertEquals(1, cap.getValue().getEnabled(), "enabled 默认 1");
         assertEquals(0, cap.getValue().getSortNo(), "sortNo 默认 0");
         assertEquals("靠窗单人位", cap.getValue().getName());
         assertEquals("whole", cap.getValue().getBookMode());
@@ -173,7 +173,6 @@ class GzBeanSeatTypeConfigServiceImplTest {
         bo.setCapacity(4);
         bo.setQuantity(8);
         bo.setPriceCent(3000L);
-        bo.setEnabled(0);
         when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
         when(baseMapper.updateById(any(GzBeanSeatTypeConfig.class))).thenReturn(1);
 
@@ -189,8 +188,53 @@ class GzBeanSeatTypeConfigServiceImplTest {
         assertEquals(4, cap.getValue().getCapacity());
         assertEquals(8, cap.getValue().getQuantity());
         assertEquals(3000L, cap.getValue().getPriceCent());
-        assertEquals(0, cap.getValue().getEnabled());
         assertEquals(5L, cap.getValue().getId());
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-057 · updateByBo 必须把 mpLongCloseCount 落到实体（toEntity 是手写逐字段拷贝，漏一个字段=静默不生效）")
+    void updateByBo_writesMpLongCloseCount() {
+        GzBeanSeatTypeConfigBo bo = new GzBeanSeatTypeConfigBo();
+        bo.setId(5L);
+        bo.setStoreId(1L);
+        bo.setName("四人共享桌");
+        bo.setBookMode("seat");
+        bo.setCapacity(4);
+        bo.setQuantity(2);      // 容量 8
+        bo.setPriceCent(3000L);
+        bo.setMpLongCloseCount(2);
+        when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
+        when(baseMapper.updateById(any(GzBeanSeatTypeConfig.class))).thenReturn(1);
+
+        assertTrue(service.updateByBo(bo));
+
+        ArgumentCaptor<GzBeanSeatTypeConfig> cap = ArgumentCaptor.forClass(GzBeanSeatTypeConfig.class);
+        verify(baseMapper).updateById(cap.capture());
+        assertEquals(2, cap.getValue().getMpLongCloseCount(),
+            "长期关闭数没拷进实体 → updateById 写 0/null，等于这个功能静默失效（真机上就是这么漏的）");
+        // 派生口径也顺带钉一下：默认可订量 = 8 − 2 = 6；今天显式设 0 时则全开（覆盖制）
+        assertEquals(6L, cap.getValue().defaultSellableCapacity());
+        assertEquals(8L, cap.getValue().effectiveCapacity(0), "今天显式关 0 个 → 顶掉长期默认，全开");
+        assertEquals(5L, cap.getValue().effectiveCapacity(3), "今天显式关 3 个 → 用当天的值，只对今天生效");
+        assertEquals(6L, cap.getValue().effectiveCapacity(null), "今天没设 → 沿用长期默认 2");
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-057 · updateByBo 长期关闭数 > 总容量 → 拒（不落库）")
+    void updateByBo_longCloseOverCapacity_throws() {
+        GzBeanSeatTypeConfigBo bo = new GzBeanSeatTypeConfigBo();
+        bo.setId(5L);
+        bo.setStoreId(1L);
+        bo.setName("四人共享桌");
+        bo.setBookMode("seat");
+        bo.setCapacity(4);
+        bo.setQuantity(2);      // 容量 8
+        bo.setPriceCent(3000L);
+        bo.setMpLongCloseCount(9);
+
+        ServiceException ex = assertThrows(ServiceException.class, () -> service.updateByBo(bo));
+        assertTrue(ex.getMessage().contains("总容量（8"), ex.getMessage());
+        verify(baseMapper, never()).updateById(any(GzBeanSeatTypeConfig.class));
     }
 
     @Test
@@ -218,34 +262,6 @@ class GzBeanSeatTypeConfigServiceImplTest {
         assertTrue(service.removeByIds(List.of(1L, 2L)));
         verify(baseMapper).deleteByIds(any());
         verify(seatTypePriceMapper, times(2)).delete(any(Wrapper.class));
-    }
-
-    // ------------------------------ toggleEnabled ------------------------------
-
-    @Test
-    @DisplayName("toggleEnabled happy → updateById enabled")
-    void toggleEnabled_happy() {
-        when(baseMapper.updateById(any(GzBeanSeatTypeConfig.class))).thenReturn(1);
-        assertTrue(service.toggleEnabled(3L, 0));
-
-        ArgumentCaptor<GzBeanSeatTypeConfig> cap = ArgumentCaptor.forClass(GzBeanSeatTypeConfig.class);
-        verify(baseMapper).updateById(cap.capture());
-        assertEquals(3L, cap.getValue().getId());
-        assertEquals(0, cap.getValue().getEnabled());
-    }
-
-    @Test
-    @DisplayName("toggleEnabled 非法 enabled（如 2）→ ServiceException")
-    void toggleEnabled_invalidEnabled_throws() {
-        assertThrows(ServiceException.class, () -> service.toggleEnabled(3L, 2));
-        verify(baseMapper, never()).updateById(any(GzBeanSeatTypeConfig.class));
-    }
-
-    @Test
-    @DisplayName("toggleEnabled id=null → ServiceException")
-    void toggleEnabled_nullId_throws() {
-        assertThrows(ServiceException.class, () -> service.toggleEnabled(null, 1));
-        verify(baseMapper, never()).updateById(any(GzBeanSeatTypeConfig.class));
     }
 
     // ------------------------------ 按星期 × 1h 格价格覆盖（ADR-0015 §3.1） ------------------------------
@@ -419,6 +435,66 @@ class GzBeanSeatTypeConfigServiceImplTest {
         verify(dayPassPriceMapper, never()).physicalDeleteByConfig(anyLong());
     }
 
+    // ------------------------------ updateDefaultPrice（GZ-BEAN-058） ------------------------------
+
+    @Test
+    @DisplayName("★GZ-BEAN-058 · updateDefaultPrice 只写 id + 两个价（其余列不进 SET）—— 价格挪到价格弹窗后不许把别的配置写掉")
+    void updateDefaultPrice_patchesOnlyPrices() {
+        GzBeanSeatTypeConfig exist = GzBeanSeatTypeConfig.builder().id(5L).storeId(1L).name("四人桌").build();
+        when(baseMapper.selectById(5L)).thenReturn(exist);
+        when(baseMapper.updateById(any(GzBeanSeatTypeConfig.class))).thenReturn(1);
+
+        GzBeanSeatTypeConfigPriceBo bo = new GzBeanSeatTypeConfigPriceBo();
+        bo.setId(5L);
+        bo.setPriceCent(1800L);
+        bo.setDayPassPriceCent(6900L);
+
+        assertTrue(service.updateDefaultPrice(bo));
+
+        ArgumentCaptor<GzBeanSeatTypeConfig> cap = ArgumentCaptor.forClass(GzBeanSeatTypeConfig.class);
+        verify(baseMapper).updateById(cap.capture());
+        GzBeanSeatTypeConfig patch = cap.getValue();
+        assertEquals(5L, patch.getId());
+        assertEquals(1800L, patch.getPriceCent());
+        assertEquals(6900L, patch.getDayPassPriceCent());
+        // 其余列必须全是 null（MP updateStrategy=NOT_NULL → 不会出现在 UPDATE 里）
+        assertNull(patch.getName(), "name 不许被写");
+        assertNull(patch.getDayPassQuota(), "包天名额不许被写（缺省 0 会把已配的名额清掉）");
+        assertNull(patch.getMpVisible(), "mp_visible 不许被写");
+        assertNull(patch.getMpLongCloseCount(), "长期关闭不许被写");
+        assertNull(patch.getQuantity());
+        assertNull(patch.getBookMode());
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-058 · updateDefaultPrice 包天价为空 → 落 0（与 toEntity 同口径，不留 null 让 MP 跳过）")
+    void updateDefaultPrice_nullDayPassFallsToZero() {
+        when(baseMapper.selectById(5L)).thenReturn(GzBeanSeatTypeConfig.builder().id(5L).build());
+        when(baseMapper.updateById(any(GzBeanSeatTypeConfig.class))).thenReturn(1);
+
+        GzBeanSeatTypeConfigPriceBo bo = new GzBeanSeatTypeConfigPriceBo();
+        bo.setId(5L);
+        bo.setPriceCent(1500L);
+        bo.setDayPassPriceCent(null);
+
+        assertTrue(service.updateDefaultPrice(bo));
+        ArgumentCaptor<GzBeanSeatTypeConfig> cap = ArgumentCaptor.forClass(GzBeanSeatTypeConfig.class);
+        verify(baseMapper).updateById(cap.capture());
+        assertEquals(0L, cap.getValue().getDayPassPriceCent());
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-058 · updateDefaultPrice 桌型不存在 → false，不打 update")
+    void updateDefaultPrice_missingConfig_returnsFalse() {
+        when(baseMapper.selectById(5L)).thenReturn(null);
+        GzBeanSeatTypeConfigPriceBo bo = new GzBeanSeatTypeConfigPriceBo();
+        bo.setId(5L);
+        bo.setPriceCent(1500L);
+
+        assertFalse(service.updateDefaultPrice(bo));
+        verify(baseMapper, never()).updateById(any(GzBeanSeatTypeConfig.class));
+    }
+
     // ------------------------------ selectVoById / selectList 派生字段 ------------------------------
 
     @Test
@@ -433,6 +509,36 @@ class GzBeanSeatTypeConfigServiceImplTest {
         GzBeanSeatTypeConfigVO result = service.selectVoById(9L);
         assertNotNull(result);
         assertEquals(0, new BigDecimal("19.90").compareTo(result.getPriceYuan()), "1990 分 → 19.90 元");
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-057 · selectVoById 回填「小程序可约数量」= 总容量 − 长期关闭（甲方 2026-09-26 要那一列）")
+    void selectVoById_fillsMpSellableCapacity() {
+        GzBeanSeatTypeConfigVO vo = new GzBeanSeatTypeConfigVO();
+        vo.setId(3L);
+        vo.setName("四人桌");
+        vo.setBookMode("seat");
+        vo.setQuantity(2);
+        vo.setCapacity(4);          // 总容量 8
+        vo.setMpLongCloseCount(2);  // 长期默认关 2
+        when(baseMapper.selectVoById(3L)).thenReturn(vo);
+
+        GzBeanSeatTypeConfigVO result = service.selectVoById(3L);
+        assertEquals(6L, result.getMpSellableCapacity(), "小程序可约数量 = 8 − 2 = 6（今天没在看板改时的口径）");
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-057 · 长期关闭越界（裸 SQL 写入）时「小程序可约数量」夹到 0，不出负数")
+    void selectVoById_mpSellableCapacityClampsAtZero() {
+        GzBeanSeatTypeConfigVO vo = new GzBeanSeatTypeConfigVO();
+        vo.setId(3L);
+        vo.setBookMode("whole");
+        vo.setQuantity(3);
+        vo.setCapacity(1);          // 总容量 3
+        vo.setMpLongCloseCount(99); // 越界
+        when(baseMapper.selectVoById(3L)).thenReturn(vo);
+
+        assertEquals(0L, service.selectVoById(3L).getMpSellableCapacity());
     }
 
     @Test
@@ -555,7 +661,6 @@ class GzBeanSeatTypeConfigServiceImplTest {
         c.setBookMode(bookMode);
         c.setCapacity(capacity);
         c.setQuantity(quantity);
-        c.setEnabled(1);
         return c;
     }
 
@@ -563,7 +668,7 @@ class GzBeanSeatTypeConfigServiceImplTest {
         return GzBeanSeatSyncResultVO.builder()
             .expected(expected).before(0).after(after).created(0).pruned(0)
             .prunedSeatNos(List.of()).blockedSeatNos(blocked).conflictSeatNos(conflict)
-            .prefix("S").disabled(0).build();
+            .prefix("S").build();
     }
 
     @Test
@@ -615,16 +720,15 @@ class GzBeanSeatTypeConfigServiceImplTest {
     }
 
     @Test
-    @DisplayName("停用的桌型不生成座位 —— 它的座位本就不上看板，改数量不该凭空造格子")
-    void updateByBo_skipsAlignForDisabledConfig() {
+    @DisplayName("已退役（软删）的桌型不生成座位 —— 它本就不在看板上，改数量不该凭空造格子")
+    void updateByBo_skipsAlignForDeletedConfig() {
         GzBeanSeatTypeConfigBo bo = validBo();
         bo.setId(77L);
         bo.setQuantity(8);
         when(baseMapper.exists(any(Wrapper.class))).thenReturn(false);
         when(baseMapper.updateById(any(GzBeanSeatTypeConfig.class))).thenReturn(1);
-        GzBeanSeatTypeConfig disabled = configRow(8, 1, "whole");
-        disabled.setEnabled(0);
-        when(baseMapper.selectById(anyLong())).thenReturn(disabled);
+        // 软删行的 selectById 被 @TableLogic 过滤掉 → null（与生产一致）
+        when(baseMapper.selectById(anyLong())).thenReturn(null);
 
         assertTrue(service.updateByBo(bo));
 

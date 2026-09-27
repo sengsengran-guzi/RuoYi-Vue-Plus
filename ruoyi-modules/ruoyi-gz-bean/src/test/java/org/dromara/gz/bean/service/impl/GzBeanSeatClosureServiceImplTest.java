@@ -250,6 +250,6 @@ class GzBeanSeatClosureServiceImplTest {
 
     private GzBeanSeat newSeat(Long id, Long storeId) {
         return GzBeanSeat.builder().id(id).storeId(storeId).seatTypeConfigId(10L)
-            .seatNo("S" + id).enabled(1).build();
+            .seatNo("S" + id).build();
     }
 }

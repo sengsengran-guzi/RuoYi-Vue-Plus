@@ -67,14 +67,24 @@ public class GzBeanSeatTypeConfigVO implements Serializable {
     /** 包天固定价（元；Service 由 dayPassPriceCent /100 算） */
     private BigDecimal dayPassPriceYuan;
 
-    /** 0=停用 / 1=启用 */
-    private Integer enabled;
-
     /**
-     * 是否对小程序开放：1=开放可订 / 0=仅后台看板可见的**临时桌**（GZ-BEAN-054 / ADR-0023）。
-     * 与 {@code enabled} 正交 —— 详见 {@link org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig#getMpVisible()}。
+     * 是否对小程序开放：1=开放可订 / 0=仅后台可见的**临时桌**（GZ-BEAN-054 / ADR-0023）——
+     * 唯一的桌型级「小程序可订」开关（ADR-0024）。退役 = 软删，见
+     * {@link org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig#getMpVisible()}。
      */
     private Integer mpVisible;
+
+    /** 长期关闭数（GZ-BEAN-057）：看板「今天关闭」的默认值（whole=桌 / seat=座） */
+    private Integer mpLongCloseCount;
+
+    /**
+     * 小程序可约数量（GZ-BEAN-057，派生）：{@code 总容量 − 长期关闭}，单位同 {@code expectedCells}
+     * （whole=桌 / seat=座）。
+     *
+     * <p>口径说明：这是「<b>今天店员没在看板改</b>」时每个 1h 格能约到的数量。店员当天在看板
+     * 「今日可售」抽屉里改了关闭数，只影响那一天，不会改这个值（它就是桌型配置里的长期默认）。</p>
+     */
+    private Long mpSellableCapacity;
 
     /** 排序值 */
     private Integer sortNo;
@@ -95,20 +105,11 @@ public class GzBeanSeatTypeConfigVO implements Serializable {
     private Integer expectedCells;
 
     /**
-     * 看板上<b>实际</b>有几个计时格 = 该桌型启用且未删的 {@code gz_bean_seat} 行数。
+     * 看板上<b>实际</b>有几个计时格 = 该桌型未删的 {@code gz_bean_seat} 行数。
      *
      * <p>与 {@link #expectedCells} 不等 = 配额和物理座位错配（ADR-0016 取舍 C 要求两者必须相等）：
      * <b>配额多</b> → 小程序卖得出但核销时没座可分；<b>座位多</b> → 那些格子线上永远卖不掉。
      * 改「数量」不会动座位表、批量生成又只增不减，所以这个差额会自己长出来 —— 必须显式暴露。</p>
      */
     private Integer boardCells;
-
-    /**
-     * 占着编号但<b>已停用</b>的座位数 = {@code 未删单位数 − boardCells}。
-     *
-     * <p>停用座位不上看板也不可分座，但仍占着 {@code seat_no}（全店唯一）。
-     * 它是「同步之后 boardCells 仍然少于 expectedCells」的合法解释，前端要能说清楚，
-     * 否则店员会反复点同步却看不到格子变多。</p>
-     */
-    private Integer disabledCells;
 }

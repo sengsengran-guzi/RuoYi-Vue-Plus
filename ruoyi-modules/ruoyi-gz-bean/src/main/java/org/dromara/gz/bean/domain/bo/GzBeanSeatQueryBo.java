@@ -27,7 +27,4 @@ public class GzBeanSeatQueryBo implements Serializable {
 
     /** 同桌聚合标识（精确） */
     private String tableNo;
-
-    /** 0=停用 / 1=启用 */
-    private Integer enabled;
 }

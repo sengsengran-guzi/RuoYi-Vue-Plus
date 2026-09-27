@@ -36,7 +36,7 @@ public class GzBeanSeatSyncResultVO implements Serializable {
     /** 按桌型配置应有的计时格数（整桌 = 数量；按座 = 数量 × 每桌座位数） */
     private Integer expected;
 
-    /** 同步前该桌型实际的座位单元数（含已停用的——它们占着编号，只是不上看板） */
+    /** 同步前该桌型实际的座位单元数 */
     private Integer before;
 
     /** 同步后实际座位单元数；仍 != expected 说明有 {@code blockedSeatNos} 挡着 */
@@ -64,7 +64,4 @@ public class GzBeanSeatSyncResultVO implements Serializable {
 
     /** 本次补齐实际使用的编号前缀（从该桌型已有座位反推，无已有座位时按桌型名/编码派生） */
     private String prefix;
-
-    /** 同步后仍处于停用状态的座位数——它们占编号但不上看板，是 {@code after} 与看板格数的差额来源 */
-    private Integer disabled;
 }

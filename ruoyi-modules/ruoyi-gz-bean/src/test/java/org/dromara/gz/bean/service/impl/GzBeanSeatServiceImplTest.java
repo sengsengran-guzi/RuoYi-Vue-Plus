@@ -38,11 +38,10 @@ import static org.mockito.Mockito.*;
  * <ul>
  *   <li>insertByBo happy + 默认值兜底 + 桌型校验（不存在 / 跨门店）+ UNIQUE 拦截</li>
  *   <li>updateByBo 忽略 storeId / seatNo（业务码 / 归属稳定）/ id=null 异常</li>
- *   <li>toggleEnabled happy + 非法 enabled / 空 id 异常</li>
  *   <li>batchGenerate whole（quantity 个桌单元，编号 S1..SN）</li>
  *   <li>batchGenerate seat（quantity×capacity 个座单元，编号 Q1-1.. + table_no=Q1）</li>
  *   <li>batchGenerate 幂等：命中正常座跳过 / 命中软删座复活</li>
- *   <li>batchGenerate 全量模式（storeId → 所有启用桌型）/ 无桌型异常 / quantity<=0 跳过</li>
+ *   <li>batchGenerate 全量模式（storeId → 该店所有存活桌型）/ 无桌型异常 / quantity<=0 跳过</li>
  *   <li>checkSeatNoUnique 含软删探测 + 编辑排除自身</li>
  *   <li>deleteByIds 空集合 → false</li>
  * </ul>
@@ -77,14 +76,13 @@ class GzBeanSeatServiceImplTest {
         c.setBookMode(bookMode);
         c.setCapacity(capacity);
         c.setQuantity(quantity);
-        c.setEnabled(1);
         return c;
     }
 
     // ------------------------------ insertByBo ------------------------------
 
     @Test
-    @DisplayName("insertByBo happy → 默认 enabled=1 / sortNo=0 + insert + bo.id 回填")
+    @DisplayName("insertByBo happy → 默认 sortNo=0 + insert + bo.id 回填")
     void insertByBo_happy_appliesDefaults() {
         GzBeanSeatBo bo = new GzBeanSeatBo();
         bo.setStoreId(1L);
@@ -104,7 +102,6 @@ class GzBeanSeatServiceImplTest {
 
         ArgumentCaptor<GzBeanSeat> cap = ArgumentCaptor.forClass(GzBeanSeat.class);
         verify(baseMapper).insert(cap.capture());
-        assertEquals(1, cap.getValue().getEnabled());
         assertEquals(0, cap.getValue().getSortNo());
         assertEquals(7L, cap.getValue().getSeatTypeConfigId());
     }
@@ -163,7 +160,7 @@ class GzBeanSeatServiceImplTest {
         bo.setId(5L);
         bo.setStoreId(999L);
         bo.setSeatNo("HACK");
-        bo.setEnabled(0);
+        bo.setSortNo(3);
         when(baseMapper.updateById(any(GzBeanSeat.class))).thenReturn(1);
 
         boolean ok = service.updateByBo(bo);
@@ -173,7 +170,7 @@ class GzBeanSeatServiceImplTest {
         verify(baseMapper).updateById(cap.capture());
         assertNull(cap.getValue().getSeatNo(), "seatNo 应被忽略（null）");
         assertNull(cap.getValue().getStoreId(), "storeId 应被忽略（null）");
-        assertEquals(0, cap.getValue().getEnabled());
+        assertEquals(3, cap.getValue().getSortNo());
         assertEquals(5L, cap.getValue().getId());
     }
 
@@ -317,28 +314,6 @@ class GzBeanSeatServiceImplTest {
         verify(bookingMapper, never()).selectSeatIdsWithActiveBookings(anyString(), anyCollection(), any());
     }
 
-    // ------------------------------ toggleEnabled ------------------------------
-
-    @Test
-    @DisplayName("toggleEnabled happy → updateById")
-    void toggleEnabled_happy() {
-        when(baseMapper.updateById(any(GzBeanSeat.class))).thenReturn(1);
-        assertTrue(service.toggleEnabled(3L, 0));
-
-        ArgumentCaptor<GzBeanSeat> cap = ArgumentCaptor.forClass(GzBeanSeat.class);
-        verify(baseMapper).updateById(cap.capture());
-        assertEquals(3L, cap.getValue().getId());
-        assertEquals(0, cap.getValue().getEnabled());
-    }
-
-    @Test
-    @DisplayName("toggleEnabled 非法 enabled / 空 id → ServiceException")
-    void toggleEnabled_invalid_throws() {
-        assertThrows(ServiceException.class, () -> service.toggleEnabled(null, 1));
-        assertThrows(ServiceException.class, () -> service.toggleEnabled(3L, 5));
-        verify(baseMapper, never()).updateById(any(GzBeanSeat.class));
-    }
-
     // ------------------------------ batchGenerate · whole ------------------------------
 
     @Test
@@ -449,6 +424,25 @@ class GzBeanSeatServiceImplTest {
 
         int generated = service.batchGenerate(bo).getCreated();
         assertEquals(3, generated, "single 2 + double 1 = 3");
+    }
+
+    @Test
+    @DisplayName("★ADR-0024 回归 · 已退役（软删）桌型不参与批量生成：只生成存活桌型的座位")
+    void adr0024_batchGenerate_skipsSoftDeletedConfig() {
+        GzBeanSeatBatchGenerateBo bo = new GzBeanSeatBatchGenerateBo();
+        bo.setStoreId(1L);
+        // 软删桌型被 @TableLogic 的 del_flag='0' 过滤掉，selectList 只回存活的那一个
+        when(configMapper.selectList(any(Wrapper.class)))
+            .thenReturn(List.of(config(7L, 1L, "single", "单人位", "whole", 1, 2)));
+        when(baseMapper.selectRawBySeatNo(eq(1L), anyString())).thenReturn(null);
+        when(baseMapper.insert(any(GzBeanSeat.class))).thenReturn(1);
+
+        int generated = service.batchGenerate(bo).getCreated();
+
+        assertEquals(2, generated, "只按存活桌型生成 S1/S2");
+        verify(baseMapper, times(2)).insert(any(GzBeanSeat.class));
+        // 退役桌型的 id 从未被当作生成目标去查（requireConfig 才会 selectById）
+        verify(configMapper, never()).selectById(anyLong());
     }
 
     @Test

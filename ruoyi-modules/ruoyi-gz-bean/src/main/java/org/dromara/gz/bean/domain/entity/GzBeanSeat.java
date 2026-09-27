@@ -31,7 +31,6 @@ import java.time.LocalDate;
  *   <li>{@code tableNo} — 同桌聚合标识：seat 模式把同桌多座聚成一组供影院图渲染；whole 可空。仅视觉聚合，不参与防超卖</li>
  *   <li>{@code zone} — 分区标签（如「靠窗区」「大厅」），影院图分区渲染用</li>
  *   <li>{@code rowLabel} / {@code colIndex} — 影院图行列定位辅助；自动生成时按桌型顺序填</li>
- *   <li>{@code enabled} — `0`=停用 / `1`=启用；停用不影响已有预约（doc/10 §3.E3）</li>
  *   <li>{@code sortNo} — 店内 / 同桌内排序值（升序）</li>
  * </ul>
  *
@@ -72,9 +71,6 @@ public class GzBeanSeat extends TenantEntity {
 
     /** 列序号，影院图行列定位辅助 */
     private Integer colIndex;
-
-    /** 0=停用 / 1=启用 */
-    private Integer enabled;
 
     /** 排序值（升序） */
     private Integer sortNo;

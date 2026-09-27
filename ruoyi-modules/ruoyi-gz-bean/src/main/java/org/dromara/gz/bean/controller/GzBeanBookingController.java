@@ -19,6 +19,7 @@ import org.dromara.gz.bean.domain.bo.GzBeanBoardNoteBo;
 import org.dromara.gz.bean.domain.bo.GzBeanWalkInBo;
 import org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
+import org.dromara.gz.bean.domain.vo.GzBeanDaySellableVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSlotAvailabilityDetailVO;
 import org.dromara.gz.bean.mapper.GzAdminUserStoreMapper;
 import org.dromara.gz.bean.service.IGzBeanBookingService;
@@ -176,6 +177,26 @@ public class GzBeanBookingController extends BaseController {
         @RequestParam Long storeId,
         @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate sessDate) {
         return R.ok(bookingService.selectTypeSlotAvailabilityDetail(storeId, sessDate));
+    }
+
+    /**
+     * 「今日可售」抽屉（ADR-0024 §3，甲方 2026-09-26 红框位）：某门店某日各<b>对小程序开放</b>桌型的
+     * 每格可订 / 今日已订 / 逐时段剩余 / 今日关闭 + 展开可见「当天没被预订的座位」。
+     *
+     * <p><b>只读</b>（ADR-0018 §3 / ADR-0024 §1：关闭一律数量制，不做座位级开关）。两个写动作走
+     * {@code POST /system/gz/bean/slotQuotaClose}（逐时段单格 upsert）与
+     * {@code POST /system/gz/bean/slotQuotaClose/close-day}（按天统一覆盖）。
+     * 与 {@code /board} 同权（{@code gz:bean:booking:verify}，店员现场操作）。</p>
+     *
+     * @param storeId  门店 ID（必填）
+     * @param sessDate 看板日期（必填，前端传当前看板日期）
+     */
+    @SaCheckPermission("gz:bean:booking:verify")
+    @GetMapping("/day-sellable")
+    public R<List<GzBeanDaySellableVO>> daySellable(
+            @RequestParam Long storeId,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate sessDate) {
+        return R.ok(bookingService.selectDaySellable(storeId, sessDate));
     }
 
     /**

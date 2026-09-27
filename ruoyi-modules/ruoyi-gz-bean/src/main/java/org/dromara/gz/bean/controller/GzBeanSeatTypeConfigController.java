@@ -17,6 +17,7 @@ import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.common.web.core.BaseController;
 import org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigBo;
+import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigPriceBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypePriceBo;
 import org.dromara.gz.bean.domain.vo.GzBeanDayPassPriceVO;
@@ -45,7 +46,7 @@ import java.util.List;
  * <ul>
  *   <li>{@code gz:bean:seatTypeConfig:list} — 列表 / 详情（owner + staff）</li>
  *   <li>{@code gz:bean:seatTypeConfig:add} — 新增（owner）</li>
- *   <li>{@code gz:bean:seatTypeConfig:edit} — 编辑 / 切启用（owner）</li>
+ *   <li>{@code gz:bean:seatTypeConfig:edit} — 编辑（owner）</li>
  *   <li>{@code gz:bean:seatTypeConfig:remove} — 删除（owner）</li>
  * </ul>
  *
@@ -60,7 +61,7 @@ public class GzBeanSeatTypeConfigController extends BaseController {
 
     private final IGzBeanSeatTypeConfigService seatTypeConfigService;
 
-    /** 分页列表（按 storeId / seatType / enabled 筛） */
+    /** 分页列表（按 storeId / seatType / mpVisible 筛） */
     @SaCheckPermission("gz:bean:seatTypeConfig:list")
     @GetMapping("/list")
     public TableDataInfo<GzBeanSeatTypeConfigVO> list(GzBeanSeatTypeConfigQueryBo query, PageQuery pageQuery) {
@@ -107,12 +108,18 @@ public class GzBeanSeatTypeConfigController extends BaseController {
         return toAjax(seatTypeConfigService.updateByBo(bo) ? 1 : 0);
     }
 
-    /** 切换启用状态（属编辑权限） */
+    /**
+     * 只改「全局默认价」（GZ-BEAN-058）：基础单价 / 包天基础价。
+     *
+     * <p>「星期 × 时段价格」弹窗用 —— 价格配置集中到那一个入口后，它同时管这两个桌型级兜底价与逐格价。
+     * <b>不要改成走 {@code PUT} 全量编辑</b>：那条路会按缺省值把 dayPassQuota / mpVisible / mpLongCloseCount
+     * 等字段一起写掉。</p>
+     */
     @SaCheckPermission("gz:bean:seatTypeConfig:edit")
-    @Log(title = "拼豆座位类型配额切启用", businessType = BusinessType.UPDATE)
-    @PutMapping("/{id}/enabled/{enabled}")
-    public R<Void> toggleEnabled(@NotNull @PathVariable Long id, @NotNull @PathVariable Integer enabled) {
-        return toAjax(seatTypeConfigService.toggleEnabled(id, enabled) ? 1 : 0);
+    @Log(title = "拼豆座位类型默认价", businessType = BusinessType.UPDATE)
+    @PutMapping("/default-price")
+    public R<Void> editDefaultPrice(@Validated @RequestBody GzBeanSeatTypeConfigPriceBo bo) {
+        return toAjax(seatTypeConfigService.updateDefaultPrice(bo) ? 1 : 0);
     }
 
     /** 软删（按 id 集合） */

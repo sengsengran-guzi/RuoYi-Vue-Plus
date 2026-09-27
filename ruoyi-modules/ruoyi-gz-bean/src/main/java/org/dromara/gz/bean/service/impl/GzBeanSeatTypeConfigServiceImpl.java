@@ -14,6 +14,7 @@ import org.dromara.common.mybatis.core.page.PageQuery;
 import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.bean.domain.bo.GzBeanDayPassPriceBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigBo;
+import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigPriceBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypeConfigQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanSeatTypePriceBo;
 import org.dromara.gz.bean.domain.entity.GzBeanDayPassPrice;
@@ -65,8 +66,6 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigService {
 
-    private static final int ENABLED_ON = 1;
-    private static final int ENABLED_OFF = 0;
     /** 合法订法（ADR-0014 §2）：whole=整桌 / seat=按座。Bo @Pattern 已校验，service Set 双层兜底。 */
     private static final Set<String> VALID_BOOK_MODES = Set.of("whole", "seat");
     private static final BigDecimal CENT_PER_YUAN = new BigDecimal("100");
@@ -108,7 +107,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
     }
 
     /**
-     * 批量回填「应有 / 实际 / 已停用」计时格数（GZ-BEAN-055）—— 一次 group by，不逐行查。
+     * 批量回填「应有 / 看板实际」计时格数（GZ-BEAN-055）—— 一次 group by，不逐行查。
      *
      * <p>没有任何座位单元的桌型也要回填 0（不是 null）：前端要能把「一个格子都没生成」
      * 和「字段没返回」区分开，前者是需要红字提示的真实错配。</p>
@@ -125,10 +124,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
             .collect(Collectors.toMap(GzBeanSeatMapper.SeatUnitCount::getSeatTypeConfigId, c -> c, (a, b) -> a));
         for (GzBeanSeatTypeConfigVO vo : list) {
             GzBeanSeatMapper.SeatUnitCount c = counts.get(vo.getId());
-            int cells = c == null || c.getCells() == null ? 0 : c.getCells();
-            int units = c == null || c.getUnits() == null ? 0 : c.getUnits();
-            vo.setBoardCells(cells);
-            vo.setDisabledCells(units - cells);
+            vo.setBoardCells(c == null || c.getCells() == null ? 0 : c.getCells());
             vo.setExpectedCells(expectedCells(vo.getBookMode(), vo.getQuantity(), vo.getCapacity()));
         }
     }
@@ -152,15 +148,13 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
     @Transactional(rollbackFor = Exception.class)
     public boolean insertByBo(GzBeanSeatTypeConfigBo bo) {
         validateBookMode(bo.getBookMode());
+        validateMpLongClose(bo);
         validateDayPass(bo);
         validateMpVisible(bo);
         if (!checkNameUnique(bo)) {
             throw new ServiceException("该门店已存在同名座位类型：" + bo.getName());
         }
         GzBeanSeatTypeConfig add = toEntity(bo, false);
-        if (add.getEnabled() == null) {
-            add.setEnabled(ENABLED_ON);
-        }
         if (add.getSortNo() == null) {
             add.setSortNo(0);
         }
@@ -188,6 +182,7 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         }
         validateBookMode(bo.getBookMode());
         validateBookModeChange(bo);
+        validateMpLongClose(bo);
         validateDayPass(bo);
         validateMpVisible(bo);
         if (!checkNameUnique(bo)) {
@@ -197,9 +192,9 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         GzBeanSeatTypeConfig update = toEntity(bo, true);
         boolean flag = baseMapper.updateById(update) > 0;
         if (flag) {
-            log.info("[gz-bean-seat-type-config] UPDATE id={} name={} bookMode={} capacity={} quantity={} priceCent={} enabled={} sortNo={}",
+            log.info("[gz-bean-seat-type-config] UPDATE id={} name={} bookMode={} capacity={} quantity={} priceCent={} sortNo={}",
                 update.getId(), update.getName(), update.getBookMode(), update.getCapacity(),
-                update.getQuantity(), update.getPriceCent(), update.getEnabled(), update.getSortNo());
+                update.getQuantity(), update.getPriceCent(), update.getSortNo());
             alignSeatUnits(bo.getId());
         }
         return flag;
@@ -223,8 +218,8 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
      */
     private void alignSeatUnits(Long configId) {
         GzBeanSeatTypeConfig current = baseMapper.selectById(configId);
-        if (current == null || !Integer.valueOf(ENABLED_ON).equals(current.getEnabled())) {
-            // 停用的桌型不生成座位：它的座位本来就不上看板，改它的数量不该凭空造格子
+        if (current == null) {
+            // 软删（= 已退役）的桌型不生成座位：它已不在看板上，改它的数量也不该凭空造格子
             return;
         }
         int expected = expectedCells(current.getBookMode(), current.getQuantity(), current.getCapacity());
@@ -271,25 +266,6 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         }
         log.info("[gz-bean-seat-type-config] DELETE ids={} affected={}", ids, affected);
         return affected > 0;
-    }
-
-    @Override
-    @Transactional(rollbackFor = Exception.class)
-    public boolean toggleEnabled(Long id, Integer enabled) {
-        if (id == null) {
-            throw new ServiceException("配置 ID 不能为空");
-        }
-        if (enabled == null || (enabled != ENABLED_ON && enabled != ENABLED_OFF)) {
-            throw new ServiceException("enabled 取值仅 0/1");
-        }
-        GzBeanSeatTypeConfig update = new GzBeanSeatTypeConfig();
-        update.setId(id);
-        update.setEnabled(enabled);
-        boolean flag = baseMapper.updateById(update) > 0;
-        if (flag) {
-            log.info("[gz-bean-seat-type-config] TOGGLE id={} enabled={}", id, enabled);
-        }
-        return flag;
     }
 
     @Override
@@ -436,10 +412,11 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         e.setDayPassQuota(bo.getDayPassQuota() == null ? 0 : bo.getDayPassQuota());
         e.setPriceCent(bo.getPriceCent());
         e.setDayPassPriceCent(bo.getDayPassPriceCent() == null ? 0L : bo.getDayPassPriceCent());
-        e.setEnabled(bo.getEnabled());
         // 小程序可见性（GZ-BEAN-054）：空视作 1（正常桌型），与 DB DEFAULT 1 同口径 —— 老客户端/老脚本
         // 不传该字段时绝不能意外把桌型藏起来
         e.setMpVisible(bo.getMpVisible() == null ? 1 : bo.getMpVisible());
+        // 长期关闭数（GZ-BEAN-057）：空视作 0，与 DB DEFAULT 0 同口径
+        e.setMpLongCloseCount(bo.getMpLongCloseCount() == null ? 0 : bo.getMpLongCloseCount());
         e.setSortNo(bo.getSortNo());
         e.setRemark(bo.getRemark());
         return e;
@@ -458,6 +435,29 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
             || (bo.getDayPassPriceCent() != null && bo.getDayPassPriceCent() > 0L);
         if (temp && wantsDayPass) {
             throw new ServiceException("临时桌不支持包天套餐（包天仅对小程序开放的桌型有效），请把包天名额与包天价置 0");
+        }
+    }
+
+    /**
+     * 长期关闭数上界校验（GZ-BEAN-057）：{@code 0 ≤ mp_long_close_count ≤ slotCapacity}
+     * （whole=quantity / seat=quantity*capacity）。超出容量无意义 —— 已经关掉全部档位了，
+     * 再大只是让「可订量」永远夹在 0，看不出差别。
+     *
+     * <p>实体侧 {@code mpLongClose()} 也会夹一次（防裸 SQL 写入越界值把可订量算成负数），
+     * 这里只是把"能改出越界值"这条路在入口堵掉。</p>
+     */
+    private void validateMpLongClose(GzBeanSeatTypeConfigBo bo) {
+        int longClose = bo.getMpLongCloseCount() == null ? 0 : bo.getMpLongCloseCount();
+        if (longClose <= 0) {
+            return;
+        }
+        long slotCapacity = "seat".equals(bo.getBookMode())
+            ? (bo.getQuantity() == null ? 0L : bo.getQuantity())
+                * (bo.getCapacity() == null ? 1L : Math.max(1L, bo.getCapacity()))
+            : (bo.getQuantity() == null ? 0L : bo.getQuantity());
+        if (longClose > slotCapacity) {
+            throw new ServiceException("长期关闭数（" + longClose + "）不能超过该桌型总容量（" + slotCapacity
+                + " = " + ("seat".equals(bo.getBookMode()) ? "数量 × 每桌座位数" : "数量") + "）");
         }
     }
 
@@ -492,20 +492,44 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         }
     }
 
+    @Override
+    public boolean updateDefaultPrice(GzBeanSeatTypeConfigPriceBo bo) {
+        GzBeanSeatTypeConfig exist = baseMapper.selectById(bo.getId());
+        if (exist == null) {
+            return false;
+        }
+        // 只建「id + 两个价」的补丁实体：MP updateStrategy=NOT_NULL，其余列不在 SET 里，别的配置一根汗毛都不动。
+        GzBeanSeatTypeConfig patch = new GzBeanSeatTypeConfig();
+        patch.setId(bo.getId());
+        patch.setPriceCent(bo.getPriceCent());
+        // 包天基础价语义与 toEntity 一致：空视作 0（= 未设包天价），不能留 null 让 MP 跳过
+        patch.setDayPassPriceCent(bo.getDayPassPriceCent() == null ? 0L : bo.getDayPassPriceCent());
+        boolean flag = baseMapper.updateById(patch) > 0;
+        if (flag) {
+            log.info("[gz-bean-seat-type-config] UPDATE-DEFAULT-PRICE id={} priceCent={} dayPassPriceCent={}",
+                bo.getId(), bo.getPriceCent(), patch.getDayPassPriceCent());
+        }
+        return flag;
+    }
+
     /**
      * 包天名额上界校验（GZ-BEAN-042 / ADR-0017）：{@code day_pass_quota ≤ slotCapacity}
      * （whole=quantity / seat=quantity*capacity）。超界无意义（包天卖光即占满所有 1h 格，quota 上界失效）。
      * 空 day_pass_quota 视作 0（不开放包天）；day_pass_price_cent 非负由 Bo @Min 兜底。
+     *
+     * <p><b>不看「长期关闭」</b>（GZ-BEAN-057 修正）：长期关闭只是看板「今日关闭」的<b>默认值</b>，
+     * 店员随时能在今天把它覆盖成 0（全开）。拿一个"默认值"去卡包天名额，会出现「今天明明全开、
+     * 包天名额却被永久压住」的假约束。</p>
      */
     private void validateDayPass(GzBeanSeatTypeConfigBo bo) {
         int quota = bo.getDayPassQuota() == null ? 0 : bo.getDayPassQuota();
         if (quota <= 0) {
             return;
         }
-        long quantity = bo.getQuantity() == null ? 0L : bo.getQuantity();
         long slotCapacity = "seat".equals(bo.getBookMode())
-            ? quantity * (bo.getCapacity() == null ? 1L : Math.max(1L, bo.getCapacity()))
-            : quantity;
+            ? (bo.getQuantity() == null ? 0L : bo.getQuantity())
+                * (bo.getCapacity() == null ? 1L : Math.max(1L, bo.getCapacity()))
+            : (bo.getQuantity() == null ? 0L : bo.getQuantity());
         if (quota > slotCapacity) {
             throw new ServiceException("包天名额（" + quota + "）不能超过该桌型总座位数（" + slotCapacity + "）");
         }
@@ -545,6 +569,11 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         if (vo.getDayPassPriceCent() != null) {
             vo.setDayPassPriceYuan(new BigDecimal(vo.getDayPassPriceCent()).divide(CENT_PER_YUAN, 2, RoundingMode.HALF_UP));
         }
+        // 小程序可约数量（GZ-BEAN-057）：总容量 − 长期关闭（长期关闭是看板「今天关闭」的默认值）。
+        //   容量口径复用本类 expectedCells(...)（与 slotCapacity 同一条规则），避免另写一份乘法。
+        long cap = expectedCells(vo.getBookMode(), vo.getQuantity(), vo.getCapacity());
+        long longClose = vo.getMpLongCloseCount() == null ? 0L : Math.max(0L, Math.min(vo.getMpLongCloseCount(), cap));
+        vo.setMpSellableCapacity(Math.max(0L, cap - longClose));
     }
 
     private LambdaQueryWrapper<GzBeanSeatTypeConfig> buildWrapper(GzBeanSeatTypeConfigQueryBo q) {
@@ -552,7 +581,6 @@ public class GzBeanSeatTypeConfigServiceImpl implements IGzBeanSeatTypeConfigSer
         if (q != null) {
             lqw.eq(ObjectUtil.isNotNull(q.getStoreId()), GzBeanSeatTypeConfig::getStoreId, q.getStoreId());
             lqw.eq(StrUtil.isNotBlank(q.getSeatType()), GzBeanSeatTypeConfig::getSeatType, q.getSeatType());
-            lqw.eq(ObjectUtil.isNotNull(q.getEnabled()), GzBeanSeatTypeConfig::getEnabled, q.getEnabled());
             lqw.eq(ObjectUtil.isNotNull(q.getMpVisible()), GzBeanSeatTypeConfig::getMpVisible, q.getMpVisible());
         }
         lqw.orderByAsc(GzBeanSeatTypeConfig::getStoreId)

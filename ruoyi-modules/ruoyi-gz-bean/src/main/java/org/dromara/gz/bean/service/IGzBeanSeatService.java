@@ -22,7 +22,7 @@ import java.util.List;
  */
 public interface IGzBeanSeatService {
 
-    /** admin 分页列表（按 storeId / seatTypeConfigId / seatNo / tableNo / enabled 筛；回填 typeName / bookMode） */
+    /** admin 分页列表（按 storeId / seatTypeConfigId / seatNo / tableNo 筛；回填 typeName / bookMode） */
     TableDataInfo<GzBeanSeatVO> selectPageList(GzBeanSeatQueryBo query, PageQuery pageQuery);
 
     /** admin 全量列表（按条件筛；回填 typeName / bookMode） */
@@ -34,20 +34,11 @@ public interface IGzBeanSeatService {
     /** 新增 — 必挂桌型 seatTypeConfigId；seat_no UNIQUE(tenant_id, store_id, seat_no) 撞号友好报错 */
     boolean insertByBo(GzBeanSeatBo bo);
 
-    /** 编辑 — storeId / seat_no 不可改（业务码 / 归属稳定）；可改归属桌型 / 分区 / 启停 / 排序 */
+    /** 编辑 — storeId / seat_no 不可改（业务码 / 归属稳定）；可改归属桌型 / 分区 / 排序 */
     boolean updateByBo(GzBeanSeatBo bo);
 
     /** 软删（按 id 集合） */
     boolean deleteByIds(Collection<Long> ids);
-
-    /**
-     * 切换启用状态（启停）。
-     *
-     * @param id      座位单元 id
-     * @param enabled 0=停用 / 1=启用
-     * @return 是否成功
-     */
-    boolean toggleEnabled(Long id, Integer enabled);
 
     /**
      * 按桌型批量生成座位单元（ADR-0015 §1 / doc/11 §3.3）。
@@ -58,7 +49,8 @@ public interface IGzBeanSeatService {
      *   <li>{@code seat} → 生成 {@code quantity × capacity} 个座位单元（按 table_no 分组，同桌聚合编号）。</li>
      * </ul>
      *
-     * <p>传 seatTypeConfigId 仅为该桌型生成；仅传 storeId 为该门店所有启用桌型全量生成。
+     * <p>传 seatTypeConfigId 仅为该桌型生成；仅传 storeId 为该门店所有存活桌型全量生成
+     * （退役桌型已被 {@code @TableLogic} 的软删过滤排除）。
      * 幂等：已存在同 seat_no 不重复建，命中软删座则复活并回填 config 关联。</p>
      *
      * @return 实际新建 + 复活的座位单元数量

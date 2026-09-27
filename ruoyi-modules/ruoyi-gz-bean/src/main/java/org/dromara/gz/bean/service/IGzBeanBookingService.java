@@ -5,6 +5,7 @@ import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.bean.domain.bo.GzBeanBookingQueryBo;
 import org.dromara.gz.bean.domain.bo.GzBeanPaidBookingSubmitBo;
 import org.dromara.gz.bean.domain.vo.GzBeanBoardRowVO;
+import org.dromara.gz.bean.domain.vo.GzBeanDaySellableVO;
 import org.dromara.gz.bean.domain.vo.GzBeanSeatVO;
 import org.dromara.gz.bean.domain.vo.GzBeanBookingVO;
 import org.dromara.gz.bean.domain.vo.GzBeanPaidSubmitVO;
@@ -309,9 +310,30 @@ public interface IGzBeanBookingService {
     List<GzBeanSlotAvailabilityDetailVO> selectTypeSlotAvailabilityDetail(Long storeId, LocalDate sessDate);
 
     /**
+     * 店内计时看板「今日可售」抽屉（ADR-0024 §3，甲方 2026-09-26 红框位）。
+     *
+     * <p>某门店某日各<b>对小程序开放</b>（{@code mp_visible=1}）桌型的：每格配额 {@code capPerSlot} /
+     * 当日格数 {@code slotCount} / 当日活跃单量 {@code activeBookings}（去重，非逐格求和） /
+     * <b>逐小时格明细</b> {@code slots}（该格已订 / 今日关闭 / 剩余）+ <b>当天没被预订的座位</b>
+     * {@code freeSeats}。各格关闭数是否一致由前端从 {@code slots} 推，不再下发汇总字段。</p>
+     *
+     * <p><b>只读</b>：口径与 {@link #selectTypeSlotAvailability} / {@link #selectTypeSlotAvailabilityDetail}
+     * 同源（同一 {@code GzBeanHourSlotResolver} 格集合 + 逐格 {@code countActiveCoveringSlot} /
+     * {@code getQuotaClose}）；{@code freeSeats} 的活跃口径复用看板那条
+     * {@code selectActiveBookingsForBoard}（status IN pending/used AND pay_status IN paying/paid）。
+     * 两个写动作（逐时段单格 upsert / 按天统一 closeDay）走 {@code IGzBeanSlotQuotaCloseService}，
+     * <b>关闭一律数量制</b>，不做座位级开关（ADR-0018 §3 + ADR-0024 §1）。</p>
+     *
+     * @param storeId  门店 ID
+     * @param sessDate 看板日期
+     * @return 各开放桌型的可售概览（门店不存在 / 无开放桌型 → 空列表）
+     */
+    List<GzBeanDaySellableVO> selectDaySellable(Long storeId, LocalDate sessDate);
+
+    /**
      * mp 影院选座可用性查询（GZ-BEAN-024，ADR-0015 §3 / doc/11 §3.4「可用性接口 VO」）。
      *
-     * <p>返回该门店该日全部<b>启用且挂桌型</b>（{@code seat_type_config_id NOT NULL 且 enabled=1}）的座位单元，
+     * <p>返回该门店该日全部<b>挂桌型</b>（{@code seat_type_config_id NOT NULL}，已退役桌型与 legacy 无桌型座均不进）的座位单元，
      * 每座一档 = {@code seatId / seatNo / tableNo / zone / seatTypeConfigId / typeName（config.name）/
      * bookMode / unitPriceCent（按 sessDate 星期取生效价）/ full（该座在 [slotStart, slotEnd) 内任一格被占）}。
      * mp 影院图按 zone / 桌型 / table_no 分组渲染，对所选区间逐座算 full（被占 → 灰显不可点）。</p>
@@ -448,7 +470,7 @@ public interface IGzBeanBookingService {
      * 使用中（已核销）回 {@code remainingMinutes}（到计划 slot_end 倒计时），≤ 阈值（sys_config
      * {@code gz.bean.board.near_end_minutes}，默认 15）→ near_end 高亮。</p>
      *
-     * <p>座位单元来源同 seat-map（{@code enabled=1 且 seat_type_config_id NOT NULL}，legacy 无桌型座不进）；
+     * <p>座位单元来源同 seat-map（{@code seat_type_config_id NOT NULL}，legacy 无桌型座不进）；
      * 活跃单口径同防超卖（status IN pending/used AND pay_status IN paying/paid，ADR-0007）。</p>
      *
      * @param storeId  门店 ID
@@ -569,7 +591,7 @@ public interface IGzBeanBookingService {
      *
      * <p><b>一事务（{@code REPEATABLE_READ}）</b>：</p>
      * <ol>
-     *   <li>载 {@link org.dromara.gz.bean.domain.entity.GzBeanSeat} → 取 {@code seat_type_config_id}，校验 enabled + 属本店；</li>
+     *   <li>载 {@link org.dromara.gz.bean.domain.entity.GzBeanSeat} → 取 {@code seat_type_config_id}，校验桌型存活且属本店；</li>
      *   <li><b>座位级占用 guard = 按请求时段判区间重叠</b>（GZ-BEAN-048，取代 GZ-BEAN-046 的「当下物理在座」present-moment）：
      *       Redis seat 锁 + ③a {@code selectSeatUsedOverlapForUpdate}（与该座未放座 used 单区间重叠 → {@code SEAT_TAKEN 4002}）
      *       + ③c {@code selectReservedSeatOverlapForUpdate}（与排位 pending 单区间重叠 → {@code SEAT_RESERVED_OVERLAP 4026}）。

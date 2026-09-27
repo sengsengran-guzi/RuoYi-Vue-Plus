@@ -57,8 +57,6 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
 
-    private static final int ENABLED_ON = 1;
-    private static final int ENABLED_OFF = 0;
     /**
      * 未软删标志 —— 对齐全局 {@code mybatis-plus.global-config.dbConfig.logicNotDeleteValue: 0}。
      *
@@ -116,9 +114,6 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
             throw new ServiceException("所属桌型不属于该门店");
         }
         GzBeanSeat add = toEntity(bo, false);
-        if (add.getEnabled() == null) {
-            add.setEnabled(ENABLED_ON);
-        }
         if (add.getSortNo() == null) {
             add.setSortNo(0);
         }
@@ -146,8 +141,8 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
         update.setSeatNo(resolveSeatNoRename(bo));
         boolean flag = baseMapper.updateById(update) > 0;
         if (flag) {
-            log.info("[gz-bean-seat] UPDATE id={} configId={} seatNo={} enabled={} sortNo={}",
-                update.getId(), update.getSeatTypeConfigId(), update.getSeatNo(), update.getEnabled(), update.getSortNo());
+            log.info("[gz-bean-seat] UPDATE id={} configId={} seatNo={} sortNo={}",
+                update.getId(), update.getSeatTypeConfigId(), update.getSeatNo(), update.getSortNo());
         }
         return flag;
     }
@@ -208,7 +203,6 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
         e.setZone(bo.getZone());
         e.setRowLabel(bo.getRowLabel());
         e.setColIndex(bo.getColIndex());
-        e.setEnabled(bo.getEnabled());
         e.setSortNo(bo.getSortNo());
         e.setRemark(bo.getRemark());
         return e;
@@ -276,29 +270,6 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
 
     @Override
     @Transactional(rollbackFor = Exception.class)
-    public boolean toggleEnabled(Long id, Integer enabled) {
-        if (id == null) {
-            throw new ServiceException("座位 ID 不能为空");
-        }
-        if (enabled == null || (enabled != ENABLED_ON && enabled != ENABLED_OFF)) {
-            throw new ServiceException("enabled 取值仅 0/1");
-        }
-        if (enabled == ENABLED_OFF) {
-            // 停用与删除对看板等价：座位从 selectBoard 消失，挂它的活跃单一并消失（同 assertSeatsRemovable 注释）
-            assertSeatsRemovable(List.of(id), "停用座位");
-        }
-        GzBeanSeat update = new GzBeanSeat();
-        update.setId(id);
-        update.setEnabled(enabled);
-        boolean flag = baseMapper.updateById(update) > 0;
-        if (flag) {
-            log.info("[gz-bean-seat] toggleEnabled id={} enabled={}", id, enabled);
-        }
-        return flag;
-    }
-
-    @Override
-    @Transactional(rollbackFor = Exception.class)
     public GzBeanSeatBatchGenerateResultVO batchGenerate(GzBeanSeatBatchGenerateBo bo) {
         List<GzBeanSeatTypeConfig> configs = resolveConfigs(bo);
         if (CollUtil.isEmpty(configs)) {
@@ -360,7 +331,6 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
         }
 
         List<GzBeanSeat> after = listActiveUnits(config.getId());
-        int disabled = (int) after.stream().filter(s -> !Integer.valueOf(ENABLED_ON).equals(s.getEnabled())).count();
         log.info("[gz-bean-seat] sync configId={} prefix={} expected={} before={} after={} created={} pruned={} blocked={} conflicts={}",
             config.getId(), prefix, expected, before.size(), after.size(), tally.created, prunedNos.size(), blockedNos, tally.conflictSeatNos);
         return GzBeanSeatSyncResultVO.builder()
@@ -373,7 +343,6 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
             .blockedSeatNos(List.copyOf(blockedNos))
             .conflictSeatNos(List.copyOf(tally.conflictSeatNos))
             .prefix(prefix)
-            .disabled(disabled)
             .build();
     }
 
@@ -515,7 +484,7 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
      * 确定要生成的桌型集合：
      * <ul>
      *   <li>传 seatTypeConfigId → 单桌型；</li>
-     *   <li>仅传 storeId → 该门店所有启用桌型。</li>
+     *   <li>仅传 storeId → 该门店所有存活桌型（{@code @TableLogic} 自动过滤软删 = 已退役的桌型不参与生成）。</li>
      * </ul>
      */
     private List<GzBeanSeatTypeConfig> resolveConfigs(GzBeanSeatBatchGenerateBo bo) {
@@ -527,7 +496,6 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
         }
         return configMapper.selectList(Wrappers.<GzBeanSeatTypeConfig>lambdaQuery()
             .eq(GzBeanSeatTypeConfig::getStoreId, bo.getStoreId())
-            .eq(GzBeanSeatTypeConfig::getEnabled, ENABLED_ON)
             .orderByAsc(GzBeanSeatTypeConfig::getSortNo));
     }
 
@@ -643,7 +611,6 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
         e.setSeatTypeConfigId(config.getId());
         e.setSeatNo(seatNo);
         e.setTableNo(tableNo);
-        e.setEnabled(ENABLED_ON);
         e.setSortNo(sortNo);
         baseMapper.insert(e);
         tally.countCreated();
@@ -708,7 +675,6 @@ public class GzBeanSeatServiceImpl implements IGzBeanSeatService {
             lqw.eq(ObjectUtil.isNotNull(q.getSeatTypeConfigId()), GzBeanSeat::getSeatTypeConfigId, q.getSeatTypeConfigId());
             lqw.like(StrUtil.isNotBlank(q.getSeatNo()), GzBeanSeat::getSeatNo, q.getSeatNo());
             lqw.eq(StrUtil.isNotBlank(q.getTableNo()), GzBeanSeat::getTableNo, q.getTableNo());
-            lqw.eq(ObjectUtil.isNotNull(q.getEnabled()), GzBeanSeat::getEnabled, q.getEnabled());
         }
         lqw.orderByAsc(GzBeanSeat::getStoreId)
             .orderByAsc(GzBeanSeat::getSeatTypeConfigId)

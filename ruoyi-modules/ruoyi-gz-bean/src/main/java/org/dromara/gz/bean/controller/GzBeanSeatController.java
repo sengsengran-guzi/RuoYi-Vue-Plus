@@ -28,7 +28,6 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
@@ -36,8 +35,8 @@ import java.util.List;
 /**
  * GZ-BEAN-023 拼豆座位单元管理（admin 端，ADR-0015）。
  *
- * <p>路径前缀 {@code /system/gz/bean/seat}。座位单元挂桌型 config 之下，影院选座以具体座位为准；
- * admin 单独 CRUD / 启停 + 按桌型批量生成（不逐个手画）。</p>
+ * <p>路径前缀 {@code /system/gz/bean/seat}。座位单元挂桌型 config 之下，核销时店员分座到具体座位；
+ * admin 单独 CRUD + 按桌型批量生成（不逐个手画）。</p>
  *
  * <p>权限（DDL menu_id 6021-6025）：</p>
  * <ul>
@@ -92,21 +91,13 @@ public class GzBeanSeatController extends BaseController {
         return toAjax(seatService.insertByBo(bo) ? 1 : 0);
     }
 
-    /** 编辑（storeId / seatNo 不可改 — service 内部忽略；可改归属桌型 / 分区 / 启停 / 排序） */
+    /** 编辑（storeId / seatNo 不可改 — service 内部忽略；可改归属桌型 / 分区 / 排序） */
     @SaCheckPermission("gz:bean:seat:edit")
     @Log(title = "拼豆座位单元", businessType = BusinessType.UPDATE)
     @RepeatSubmit()
     @PutMapping
     public R<Void> edit(@Validated(EditGroup.class) @RequestBody GzBeanSeatBo bo) {
         return toAjax(seatService.updateByBo(bo) ? 1 : 0);
-    }
-
-    /** 启停（0=停用 / 1=启用） */
-    @SaCheckPermission("gz:bean:seat:edit")
-    @Log(title = "拼豆座位单元启停", businessType = BusinessType.UPDATE)
-    @PutMapping("/{id}/enabled")
-    public R<Void> toggleEnabled(@NotNull @PathVariable Long id, @RequestParam Integer enabled) {
-        return toAjax(seatService.toggleEnabled(id, enabled) ? 1 : 0);
     }
 
     /** 软删（按 id 集合） */

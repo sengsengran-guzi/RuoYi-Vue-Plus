@@ -14,6 +14,7 @@ import org.dromara.gz.common.service.IGzFileService;
 import org.dromara.gz.common.wechat.WxJscode2SessionResult;
 import org.dromara.gz.common.wechat.WxMiniappProperties;
 import org.dromara.gz.common.wechat.WxMiniappProperties.MiniappApp;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -57,6 +58,15 @@ class GzUserServiceImplTest {
 
     /** 现小程序（谷子宇宙）—— 单值配置形态解析出来的那一个，register-source 继承全局默认 mp_wechat。 */
     private MiniappApp app;
+
+    @BeforeAll
+    static void initMpLambdaCache() {
+        // 纯 Mockito 单测无 Spring/MP 启动 → LambdaQueryWrapper.getSqlSegment() 需要的 lambda 列缓存未装载
+        //（断言 wrapper 实际拼出的列名时会急切解析）。手动初始化 GzUser 的 TableInfo（幂等、全局静态、无副作用）。
+        com.baomidou.mybatisplus.core.metadata.TableInfoHelper.initTableInfo(
+            new org.apache.ibatis.builder.MapperBuilderAssistant(new com.baomidou.mybatisplus.core.MybatisConfiguration(), ""),
+            GzUser.class);
+    }
 
     @BeforeEach
     void setUp() {
@@ -223,6 +233,28 @@ class GzUserServiceImplTest {
         ArgumentCaptor<Wrapper<GzUser>> wrapperCaptor = ArgumentCaptor.forClass(Wrapper.class);
         verify(baseMapper).selectVoPage(any(), wrapperCaptor.capture());
         assertNotNull(wrapperCaptor.getValue());
+    }
+
+    @Test
+    @DisplayName("selectIdsByKeyword: 昵称 / 手机号 / openid 三路模糊（admin 列表展示手机号 → 必须搜得到）")
+    void selectIdsByKeyword_matchesNicknameMobileOpenid() {
+        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of());
+
+        assertTrue(gzUserService.selectIdsByKeyword("13800138000").isEmpty());
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Wrapper<GzUser>> captor = ArgumentCaptor.forClass(Wrapper.class);
+        verify(baseMapper).selectList(captor.capture());
+        String sql = captor.getValue().getSqlSegment();
+        // 三列都要在内：漏 mobile 就是「列表里看得到手机号、却搜不到」= 店员必报的 bug
+        assertTrue(sql.contains("nickname"), "应含 nickname 模糊：" + sql);
+        assertTrue(sql.contains("mobile"), "应含 mobile 模糊：" + sql);
+        assertTrue(sql.contains("openid"), "应含 openid 模糊：" + sql);
+
+        // 空白 keyword → 空列表且不查库（调用方据此判定「无匹配」）
+        assertTrue(gzUserService.selectIdsByKeyword("   ").isEmpty());
+        assertTrue(gzUserService.selectIdsByKeyword(null).isEmpty());
+        verify(baseMapper, times(1)).selectList(any(Wrapper.class));
     }
 
     @Test
