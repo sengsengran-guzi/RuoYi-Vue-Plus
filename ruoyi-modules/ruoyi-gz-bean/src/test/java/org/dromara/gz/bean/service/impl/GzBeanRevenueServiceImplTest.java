@@ -54,6 +54,13 @@ class GzBeanRevenueServiceImplTest {
     private GzBeanBookingMapper bookingMapper;
     @Mock
     private GzBeanStoreMapper storeMapper;
+    // GZ-BEAN-059 报表新增依赖
+    @Mock
+    private org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper seatTypeConfigMapper;
+    @Mock
+    private org.dromara.gz.bean.mapper.GzBeanSlotQuotaCloseMapper slotQuotaCloseMapper;
+    @Mock
+    private org.dromara.gz.bean.service.internal.GzBeanHourSlotResolver hourSlotResolver;
 
     @InjectMocks
     private GzBeanRevenueServiceImpl service;
@@ -79,6 +86,269 @@ class GzBeanRevenueServiceImplTest {
         r.setOrderCount(cnt);
         r.setTypeName(typeName);
         return r;
+    }
+
+    // ============================================================
+    //  GZ-BEAN-059「桌型使用时长 · 上桌率」月度报表
+    // ============================================================
+
+    private static final LocalDate D1 = LocalDate.of(2026, 9, 1);
+    private static final LocalDate D2 = LocalDate.of(2026, 9, 2);
+
+    /** 门店 + 单桌型（whole，quantity=4 → 每格容量 4）+ 两个营业窗口 10-12 / 14-16 → 每天 4 格 */
+    private void stubUsage(String storeId) {
+        GzBeanStore store = new GzBeanStore();
+        store.setId(1L);
+        store.setName("成都春熙路店");
+        store.setTenantId("1001");
+        when(storeMapper.selectList(any())).thenReturn(List.of(store));
+        when(seatTypeConfigMapper.selectList(any())).thenReturn(List.of(
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+                .id(10L).storeId(1L).seatType("quad").name("四人桌")
+                .bookMode("whole").quantity(4).capacity(1).mpVisible(1).build()));
+        // 每天 10/11/14/15 四格（午休 12-14 不生成）
+        when(hourSlotResolver.selectEnabledSlotsForDate(any(), any(), any())).thenReturn(List.of());
+        when(hourSlotResolver.sliceWindowsToHourSlots(any())).thenReturn(List.of(
+            java.time.LocalTime.of(10, 0), java.time.LocalTime.of(11, 0),
+            java.time.LocalTime.of(14, 0), java.time.LocalTime.of(15, 0)));
+        when(bookingMapper.selectUsageRowsInRange(any(), any(), any(), any())).thenReturn(List.of());
+        when(slotQuotaCloseMapper.selectCloseRowsInRange(any(), any(), any(), any())).thenReturn(List.of());
+    }
+
+    private GzBeanBookingMapper.UsageRow usage(LocalDate d, String status, String payStatus,
+                                               java.time.LocalTime s, java.time.LocalTime e, Integer dayPass) {
+        GzBeanBookingMapper.UsageRow r = new GzBeanBookingMapper.UsageRow();
+        r.setSessDate(d);
+        r.setStoreId(1L);
+        r.setSeatTypeConfigId(10L);
+        r.setSlotStart(s);
+        r.setSlotEnd(e);
+        r.setStatus(status);
+        r.setPayStatus(payStatus);
+        r.setIsDayPass(dayPass);
+        return r;
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-059 · 时长按「营业格数」而不是钟表时长：包天单 10:00→22:00 只算 4 格（午休不算坐）")
+    void seatUsage_countsBusinessSlotsNotClockHours() {
+        stubUsage("1001");
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(TenantHelper::getTenantId).thenReturn("1001");
+            when(bookingMapper.selectUsageRowsInRange(any(), any(), any(), any())).thenReturn(List.of(
+                // 包天单：钟表 12 小时，但当天只有 4 个营业格 → 时长必须 = 4
+                usage(D1, "used", "paid", java.time.LocalTime.of(10, 0), java.time.LocalTime.of(22, 0), 1)));
+
+            List<org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO> rows =
+                service.selectSeatUsage("2026-09-01", "2026-09-01", null, null);
+
+            assertEquals(1, rows.size());
+            org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO vo = rows.get(0);
+            assertEquals(4L, vo.getUsedHours(), "包天必须按营业格算（4），不是钟表 12 小时");
+            assertEquals(1L, vo.getDayPassBookings());
+            assertEquals(1L, vo.getSeatedBookings());
+            // 分母 B = 4 格 × 容量 4 = 16；分母 A 无关闭 = 16
+            assertEquals(16L, vo.getOpenHours());
+            assertEquals(16L, vo.getSellableHours());
+        }
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-059 · 未到店 / 取消 / 未支付都不算「坐了」，但各给一列计数")
+    void seatUsage_excludesNoShowAndCancelled() {
+        stubUsage("1001");
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(TenantHelper::getTenantId).thenReturn("1001");
+            when(bookingMapper.selectUsageRowsInRange(any(), any(), any(), any())).thenReturn(List.of(
+                usage(D1, "used", "paid", java.time.LocalTime.of(10, 0), java.time.LocalTime.of(11, 0), 0),
+                usage(D1, "no_show", "paid", java.time.LocalTime.of(11, 0), java.time.LocalTime.of(12, 0), 0),
+                usage(D1, "cancelled", "pay_closed", java.time.LocalTime.of(14, 0), java.time.LocalTime.of(15, 0), 0),
+                usage(D1, "pending", "paying", java.time.LocalTime.of(15, 0), java.time.LocalTime.of(16, 0), 0)));
+
+            org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO vo =
+                service.selectSeatUsage("2026-09-01", "2026-09-01", null, null).get(0);
+
+            assertEquals(1L, vo.getUsedHours(), "只有 used 那 1 格算坐了");
+            assertEquals(4L, vo.getBookings(), "总单数含全部 4 条");
+            assertEquals(1L, vo.getSeatedBookings());
+            assertEquals(1L, vo.getNoShowBookings());
+            assertEquals(1L, vo.getCancelledBookings());
+        }
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-059 · 分母两条：A 扣关闭（长期+当日，且当日是覆盖不是相加）、B 不扣")
+    void seatUsage_denominators() {
+        stubUsage("1001");
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(TenantHelper::getTenantId).thenReturn("1001");
+            // 桌型长期关闭 1（每格 effectiveCapacity = 4−1 = 3）
+            when(seatTypeConfigMapper.selectList(any())).thenReturn(List.of(
+                org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+                    .id(10L).storeId(1L).seatType("quad").name("四人桌")
+                    .bookMode("whole").quantity(4).capacity(1).mpVisible(1).mpLongCloseCount(1).build()));
+            // 该日 14:00 那格当日显式关闭 2 → 覆盖掉长期默认 → 该格 effectiveCapacity = 4−2 = 2
+            org.dromara.gz.bean.mapper.GzBeanSlotQuotaCloseMapper.CloseRow c =
+                new org.dromara.gz.bean.mapper.GzBeanSlotQuotaCloseMapper.CloseRow();
+            c.setSeatTypeConfigId(10L);
+            c.setSessDate(D1);
+            c.setSlotStart(java.time.LocalTime.of(14, 0));
+            c.setCloseCount(2);
+            when(slotQuotaCloseMapper.selectCloseRowsInRange(any(), any(), any(), any())).thenReturn(List.of(c));
+
+            org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO vo =
+                service.selectSeatUsage("2026-09-01", "2026-09-01", null, null).get(0);
+
+            // 分母 B = 4 格 × 4 = 16（营业容量，不扣任何关闭）
+            assertEquals(16L, vo.getOpenHours());
+            // 分母 A = 3 格 × (4−1) + 1 格 × (4−2 覆盖) = 9 + 2 = 11
+            assertEquals(11L, vo.getSellableHours(), "当日关闭是覆盖长期默认，不是相加（4−2=2，不是 4−1−2=1）");
+            assertEquals(0L, vo.getUsedHours());
+            assertEquals(0.0d, vo.getOccupancyRate(), "0/11 = 0");
+        }
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-059 · 平均每桌/每座时长 = 已上桌时长 ÷ 容量；容量 0 给 null 而不是除零")
+    void seatUsage_avgHoursPerUnit() {
+        stubUsage("1001");
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(TenantHelper::getTenantId).thenReturn("1001");
+            when(seatTypeConfigMapper.selectList(any())).thenReturn(List.of(
+                // 有容量的桌型：2 小时 ÷ 4 桌 = 0.5 小时/桌
+                org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+                    .id(10L).storeId(1L).seatType("single").name("单人")
+                    .bookMode("whole").quantity(4).capacity(1).mpVisible(1).build(),
+                // 容量 0（数量被调成 0 的历史桌型）：不许出现 Infinity，必须给 null
+                org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+                    .id(20L).storeId(1L).seatType("zero").name("空桌型")
+                    .bookMode("whole").quantity(0).capacity(1).mpVisible(1).build()));
+            GzBeanBookingMapper.UsageRow zero = usage(D1, "used", "paid",
+                java.time.LocalTime.of(10, 0), java.time.LocalTime.of(11, 0), 0);
+            zero.setSeatTypeConfigId(20L);
+            when(bookingMapper.selectUsageRowsInRange(any(), any(), any(), any())).thenReturn(List.of(
+                usage(D1, "used", "paid", java.time.LocalTime.of(10, 0), java.time.LocalTime.of(11, 0), 0),
+                usage(D1, "used", "paid", java.time.LocalTime.of(11, 0), java.time.LocalTime.of(12, 0), 0),
+                zero));
+
+            List<org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO> rows =
+                service.selectSeatUsage("2026-09-01", "2026-09-01", null, null);
+
+            assertEquals(2, rows.size());
+            org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO cap4 = rows.get(0);
+            assertEquals(4L, cap4.getCapacityPerSlot());
+            assertEquals(2L, cap4.getUsedHours());
+            assertEquals(0.5d, cap4.getAvgHoursPerUnit(), 1e-9, "2 小时 ÷ 4 桌 = 0.5 小时/桌");
+
+            org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO cap0 = rows.get(1);
+            assertEquals(0L, cap0.getCapacityPerSlot());
+            assertEquals(1L, cap0.getUsedHours());
+            assertNull(cap0.getAvgHoursPerUnit(), "容量 0 → 平均值必须 null（前端显示「—」），不能是 Infinity");
+        }
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-059 · 跨月区间按月分行；组单多子单累加；分母 0 时比率为 null")
+    void seatUsage_monthBucketsAndGroupRows() {
+        stubUsage("1001");
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(TenantHelper::getTenantId).thenReturn("1001");
+            when(bookingMapper.selectUsageRowsInRange(any(), any(), any(), any())).thenReturn(List.of(
+                // 组单两条子单：同一格各占 1 单位 → 2 单位·小时
+                usage(D1, "used", "paid", java.time.LocalTime.of(10, 0), java.time.LocalTime.of(11, 0), 0),
+                usage(D1, "used", "paid", java.time.LocalTime.of(10, 0), java.time.LocalTime.of(11, 0), 0),
+                usage(LocalDate.of(2026, 8, 31), "used", "paid", java.time.LocalTime.of(10, 0), java.time.LocalTime.of(11, 0), 0)));
+
+            List<org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO> rows =
+                service.selectSeatUsage("2026-08-31", "2026-09-02", null, null);
+
+            assertEquals(2, rows.size(), "跨月 → 8 月 / 9 月各一行");
+            assertEquals("2026-08", rows.get(0).getMonth());
+            assertEquals(1L, rows.get(0).getUsedHours());
+            assertEquals("2026-09", rows.get(1).getMonth());
+            assertEquals(2L, rows.get(1).getUsedHours(), "组单两条子单各占 1 格 → 2 单位·小时");
+        }
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-059 · 桌型不存在的日子不计容量（新建「六人桌」不会在历史月份显示成 0% 上桌）")
+    void seatUsage_capacityCountedOnlyAfterConfigCreated() {
+        stubUsage("1001");
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(TenantHelper::getTenantId).thenReturn("1001");
+            org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig cfg =
+                org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig.builder()
+                    .id(10L).storeId(1L).seatType("six").name("六人桌")
+                    .bookMode("whole").quantity(4).capacity(1).mpVisible(1).build();
+            // @Builder 不含继承字段 → createTime 用 setter 补（2026-09-15 建的桌型）
+            cfg.setCreateTime(java.sql.Timestamp.valueOf("2026-09-15 10:00:00"));
+            when(seatTypeConfigMapper.selectList(any())).thenReturn(List.of(cfg));
+            when(bookingMapper.selectUsageRowsInRange(any(), any(), any(), any())).thenReturn(List.of());
+
+            List<org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO> rows =
+                service.selectSeatUsage("2026-08-01", "2026-09-30", null, null);
+
+            // 8 月整月都在这张桌子存在之前 → 容量 0 且无单 → 整行不出现（而不是显示 0% 上桌）
+            assertEquals(1, rows.size(), "只应剩 9 月一行");
+            assertEquals("2026-09", rows.get(0).getMonth());
+            // 9 月 15~30 共 16 天 × 4 格/天 × 容量 4 = 256
+            assertEquals(256L, rows.get(0).getOpenHours(), "容量只从桌型创建那天起算");
+            assertEquals(256L, rows.get(0).getSellableHours());
+            assertNotNull(rows.get(0).getAvgHoursPerUnit(), "容量存在 → 平均值应是 0.0 而不是 null");
+            assertEquals(0.0d, rows.get(0).getAvgHoursPerUnit());
+        }
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-059 · 返回顺序 = 月份 → 门店（否则月份会重复两轮，看表的人以为有两个 4 月）")
+    void seatUsage_sortedByMonthThenStore() {
+        stubUsage("1001");
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(TenantHelper::getTenantId).thenReturn("1001");
+            // 两家门店（循环是门店在外、月份在内 → 天然会是「4月…7月(店1) → 4月…7月(店2)」）
+            GzBeanStore s1 = new GzBeanStore();
+            s1.setId(1L);
+            s1.setName("成都春熙路店");
+            s1.setTenantId("1001");
+            GzBeanStore s2 = new GzBeanStore();
+            s2.setId(2L);
+            s2.setName("成都建设路店");
+            s2.setTenantId("1001");
+            when(storeMapper.selectList(any())).thenReturn(List.of(s1, s2));
+
+            List<org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO> rows =
+                service.selectSeatUsage("2026-04-01", "2026-07-31", null, null);
+
+            List<String> months = rows.stream()
+                .map(org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO::getMonth).toList();
+            List<String> sortedMonths = new java.util.ArrayList<>(months);
+            java.util.Collections.sort(sortedMonths);
+            assertEquals(sortedMonths, months, "月份必须单调不减（月份优先于门店）");
+
+            long april = rows.stream()
+                .filter(r -> "2026-04".equals(r.getMonth()))
+                .map(org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO::getStoreId).distinct().count();
+            assertEquals(2L, april, "4 月的两家门店必须落在相邻位置（同一月份连续一段）");
+        }
+    }
+
+    @Test
+    @DisplayName("★GZ-BEAN-059 · 比率为 null 而不是除零：该月无营业格（店休）→ 分母 0")
+    void seatUsage_zeroDenominatorGivesNullRate() {
+        stubUsage("1001");
+        when(hourSlotResolver.sliceWindowsToHourSlots(any())).thenReturn(List.of());
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(TenantHelper::getTenantId).thenReturn("1001");
+            when(bookingMapper.selectUsageRowsInRange(any(), any(), any(), any())).thenReturn(List.of(
+                usage(D1, "used", "paid", java.time.LocalTime.of(10, 0), java.time.LocalTime.of(11, 0), 0)));
+
+            org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO vo =
+                service.selectSeatUsage("2026-09-01", "2026-09-01", null, null).get(0);
+
+            assertEquals(0L, vo.getSellableHours());
+            assertNull(vo.getOccupancyRate(), "分母 0 → null（前端显示「—」），绝不 NaN");
+            assertEquals(0L, vo.getUsedHours(), "没有营业格 → 那格不算时长");
+        }
     }
 
     @Test

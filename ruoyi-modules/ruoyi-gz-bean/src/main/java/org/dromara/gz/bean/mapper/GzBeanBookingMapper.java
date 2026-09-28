@@ -1,5 +1,6 @@
 package org.dromara.gz.bean.mapper;
 
+import lombok.Data;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
 import org.apache.ibatis.annotations.Update;
@@ -633,6 +634,43 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
         @Param("start") LocalDate start,
         @Param("end") LocalDate end,
         @Param("granularity") String granularity);
+
+    /**
+     * 区间内全部未删单的<b>轻量投影</b>（GZ-BEAN-059 桌型使用时长报表）。
+     *
+     * <p>只取算时长需要的列（不拉 verify_code / dedup_token / mobile_snapshot 这些大字段）；
+     * 状态分类放 Java 侧做 —— 分子口径与「已上桌」的定义要能一眼看懂，不适合埋在 SQL 的 CASE 里。</p>
+     *
+     * @param from 服务日起（含）
+     * @param to   服务日止（含）
+     */
+    @Select("SELECT sess_date, store_id, seat_type_config_id, seat_type_snapshot, " +
+        "       slot_start, slot_end, status, pay_status, is_day_pass " +
+        "FROM gz_bean_booking " +
+        "WHERE tenant_id = #{tenantId} AND del_flag = '0' " +
+        "  AND sess_date BETWEEN #{from} AND #{to} " +
+        "  AND (#{storeId} IS NULL OR store_id = #{storeId})")
+    List<UsageRow> selectUsageRowsInRange(@Param("tenantId") String tenantId,
+                                          @Param("storeId") Long storeId,
+                                          @Param("from") LocalDate from,
+                                          @Param("to") LocalDate to);
+
+    /**
+     * 区间内单的轻量投影行（GZ-BEAN-059）。列名与 {@code @Select} 里的别名一一对应，靠
+     * {@code mapUnderscoreToCamelCase} 自动映射（与 {@link GzBeanSeatMapper.SeatUnitCount} 同一套做法）。
+     */
+    @Data
+    class UsageRow {
+        private LocalDate sessDate;
+        private Long storeId;
+        private Long seatTypeConfigId;
+        private String seatTypeSnapshot;
+        private LocalTime slotStart;
+        private LocalTime slotEnd;
+        private String status;
+        private String payStatus;
+        private Integer isDayPass;
+    }
 
     /**
      * 这批座位里，哪些还挂着<b>今天及以后</b>的活跃单（GZ-BEAN-055 座位移除守卫）。

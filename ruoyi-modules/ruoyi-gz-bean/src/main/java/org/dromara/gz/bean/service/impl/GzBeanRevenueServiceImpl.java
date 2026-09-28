@@ -15,15 +15,24 @@ import org.dromara.gz.bean.domain.entity.GzBeanBooking;
 import org.dromara.gz.bean.domain.entity.GzBeanStore;
 import org.dromara.gz.bean.domain.vo.GzBeanRevenueAggregateVO;
 import org.dromara.gz.bean.domain.vo.GzBeanRevenueDetailVO;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO;
 import org.dromara.gz.bean.mapper.GzBeanBookingMapper;
 import org.dromara.gz.bean.mapper.GzBeanStoreMapper;
+import org.dromara.gz.bean.mapper.GzBeanSlotQuotaCloseMapper;
+import org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper;
+import org.dromara.gz.bean.domain.entity.GzBeanSeatTypeConfig;
 import org.dromara.gz.bean.service.IGzBeanRevenueService;
+import org.dromara.gz.bean.service.internal.GzBeanHourSlotResolver;
 import org.springframework.stereotype.Service;
 
+import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -63,6 +72,10 @@ public class GzBeanRevenueServiceImpl implements IGzBeanRevenueService {
 
     private final GzBeanBookingMapper bookingMapper;
     private final GzBeanStoreMapper storeMapper;
+    /** GZ-BEAN-059：报表分母要按桌型容量 + 关闭算可售时长，分子要按营业格算时长 */
+    private final org.dromara.gz.bean.mapper.GzBeanSeatTypeConfigMapper seatTypeConfigMapper;
+    private final org.dromara.gz.bean.mapper.GzBeanSlotQuotaCloseMapper slotQuotaCloseMapper;
+    private final org.dromara.gz.bean.service.internal.GzBeanHourSlotResolver hourSlotResolver;
 
     @Override
     public GzBeanRevenueAggregateVO selectAggregate(String granularity, String startStr, String endStr,
@@ -256,6 +269,185 @@ public class GzBeanRevenueServiceImpl implements IGzBeanRevenueService {
         Page<GzBeanRevenueDetailVO> page = bookingMapper.selectVoPage(pageQuery.build(), wrapper, GzBeanRevenueDetailVO.class);
         enrich(page.getRecords());
         return TableDataInfo.build(page);
+    }
+
+    // ============================================================
+    //  GZ-BEAN-059「桌型使用时长 · 上桌率」月度报表（甲方 2026-09-28）
+    // ============================================================
+
+    /** 已上桌 = 核销过（used）/ 已完结（completed）且已收款 —— 这才是"坐了" */
+    private static final Set<String> SEATED_STATUSES = Set.of("used", "completed");
+
+    @Override
+    public List<GzBeanSeatUsageVO> selectSeatUsage(String startStr, String endStr, Long storeId, Long staffStoreId) {
+        String tenantId = requireTenantId();
+        LocalDate start = parseDate(startStr);
+        LocalDate end = parseDate(endStr);
+        validateRange(start, end);
+        Long effectiveStoreId = staffStoreId != null ? staffStoreId : storeId;
+
+        // ① 门店集合（全部门店时逐店分行；staff 只有一个）
+        List<GzBeanStore> stores = storeMapper.selectList(Wrappers.<GzBeanStore>lambdaQuery()
+            .eq(GzBeanStore::getTenantId, tenantId)
+            .eq(effectiveStoreId != null, GzBeanStore::getId, effectiveStoreId)
+            .orderByAsc(GzBeanStore::getId));
+        if (stores.isEmpty()) {
+            return List.of();
+        }
+
+        // ② 日期 → 营业格集合：唯一真源 resolver，逐日算一次（含 weekday / 生效区间过滤）；顺带按天缓存
+        Map<LocalDate, List<LocalTime>> slotsByDate = new HashMap<>();
+        for (LocalDate d = start; !d.isAfter(end); d = d.plusDays(1)) {
+            slotsByDate.put(d, List.of());
+        }
+
+        List<GzBeanSeatUsageVO> result = new ArrayList<>();
+        for (GzBeanStore store : stores) {
+            Long sid = store.getId();
+            // 每日营业格（同一门店内所有桌型共用）
+            for (LocalDate d = start; !d.isAfter(end); d = d.plusDays(1)) {
+                slotsByDate.put(d, hourSlotResolver.sliceWindowsToHourSlots(
+                    hourSlotResolver.selectEnabledSlotsForDate(tenantId, sid, d)));
+            }
+            // ③ 该店全部存活桌型（**不过滤 mp_visible**：临时桌也在被使用，必须统计）
+            List<GzBeanSeatTypeConfig> configs = seatTypeConfigMapper.selectList(
+                Wrappers.<GzBeanSeatTypeConfig>lambdaQuery()
+                    .eq(GzBeanSeatTypeConfig::getTenantId, tenantId)
+                    .eq(GzBeanSeatTypeConfig::getStoreId, sid)
+                    .orderByAsc(GzBeanSeatTypeConfig::getSortNo)
+                    .orderByAsc(GzBeanSeatTypeConfig::getId));
+            if (configs.isEmpty()) {
+                continue;
+            }
+            // ④ 关闭行一次拉全（逐格查会变成上千次）
+            Map<String, Integer> closeMap = new HashMap<>();
+            for (GzBeanSlotQuotaCloseMapper.CloseRow c : slotQuotaCloseMapper.selectCloseRowsInRange(tenantId, sid, start, end)) {
+                closeMap.put(closeKey(c.getSeatTypeConfigId(), c.getSessDate(), c.getSlotStart()), c.getCloseCount());
+            }
+            // ⑤ 单一次拉全（轻量投影），按 (月, 桌型) 归集
+            Map<String, List<GzBeanBookingMapper.UsageRow>> usageMap = new LinkedHashMap<>();
+            for (GzBeanBookingMapper.UsageRow r : bookingMapper.selectUsageRowsInRange(tenantId, sid, start, end)) {
+                usageMap.computeIfAbsent(monthOf(r.getSessDate()) + "#" + r.getSeatTypeConfigId(), k -> new ArrayList<>()).add(r);
+            }
+
+            // ⑥ 逐 (月 × 桌型) 装配
+            for (LocalDate monthStart = start.withDayOfMonth(1); !monthStart.isAfter(end); monthStart = monthStart.plusMonths(1)) {
+                String month = monthOf(monthStart);
+                LocalDate mFrom = monthStart.isBefore(start) ? start : monthStart;
+                LocalDate mTo = monthStart.withDayOfMonth(monthStart.lengthOfMonth()).isAfter(end)
+                    ? end : monthStart.withDayOfMonth(monthStart.lengthOfMonth());
+                for (GzBeanSeatTypeConfig cfg : configs) {
+                    long cap = cfg.slotCapacity();
+                    // 桌型还不存在的日子不计容量：否则今天新建的「六人桌」会在过去 6 个月里各显示一行
+                    // 「上桌率 0%」，甲方会读成「这张桌子没人坐」，而真相是它当时还没买回来。
+                    // create_time 为空（早期 seed 行）→ 视为一直存在，不夹取。
+                    LocalDate cfgBorn = cfg.getCreateTime() == null ? null
+                        : Instant.ofEpochMilli(cfg.getCreateTime().getTime())
+                            .atZone(ZoneId.systemDefault()).toLocalDate();
+                    long openHours = 0L;      // 分母 B：营业格 × 容量（不扣关闭）
+                    long sellableHours = 0L;  // 分母 A：逐格 effectiveCapacity（扣长期 + 当日关闭）
+                    for (LocalDate d = mFrom; !d.isAfter(mTo); d = d.plusDays(1)) {
+                        if (cfgBorn != null && d.isBefore(cfgBorn)) {
+                            continue;
+                        }
+                        List<LocalTime> slots = slotsByDate.getOrDefault(d, List.of());
+                        openHours += (long) slots.size() * cap;
+                        for (LocalTime slot : slots) {
+                            Integer recorded = closeMap.get(closeKey(cfg.getId(), d, slot));
+                            sellableHours += cfg.effectiveCapacity(recorded);
+                        }
+                    }
+
+                    List<GzBeanBookingMapper.UsageRow> rows =
+                        usageMap.getOrDefault(month + "#" + cfg.getId(), List.of());
+                    long usedHours = 0L, seated = 0L, noShow = 0L, cancelled = 0L, dayPass = 0L;
+                    for (GzBeanBookingMapper.UsageRow r : rows) {
+                        boolean paid = "paid".equals(r.getPayStatus()) || "paying".equals(r.getPayStatus());
+                        boolean seatedRow = paid && SEATED_STATUSES.contains(r.getStatus());
+                        if (seatedRow) {
+                            seated++;
+                            if (Integer.valueOf(1).equals(r.getIsDayPass())) {
+                                dayPass++;
+                            }
+                            // 覆盖营业格数 = 时长（单位·小时）。用格集合求交而不是钟表相减：
+                            //   午休格不算"坐着"，包天单（10:00-22:00）因此 = 当天营业格数而不是 12 小时，
+                            //   分子分母同量纲 → 上桌率天然 ≤ 100%。
+                            usedHours += coveredSlots(slotsByDate.get(r.getSessDate()), r.getSlotStart(), r.getSlotEnd());
+                        } else if (paid && "no_show".equals(r.getStatus())) {
+                            noShow++;
+                        } else if ("cancelled".equals(r.getStatus())) {
+                            cancelled++;
+                        }
+                    }
+                    if (rows.isEmpty() && sellableHours == 0L) {
+                        continue; // 该月这个桌型既没单也没营业格 → 不出空行
+                    }
+
+                    GzBeanSeatUsageVO vo = new GzBeanSeatUsageVO();
+                    vo.setStoreId(sid);
+                    vo.setStoreName(store.getName());
+                    vo.setMonth(month);
+                    vo.setSeatTypeConfigId(cfg.getId());
+                    vo.setSeatType(cfg.getSeatType());
+                    vo.setName(StrUtil.isNotBlank(cfg.getName()) ? cfg.getName() : cfg.getSeatType());
+                    vo.setBookMode(cfg.getBookMode());
+                    vo.setCapacityPerSlot(cap);
+                    vo.setUsedHours(usedHours);
+                    vo.setSellableHours(sellableHours);
+                    vo.setOpenHours(openHours);
+                    // 平均每个座位（整桌桌型 = 每张桌）坐了几小时 —— 与上桌率只差一个「营业格数」因子：
+                    //   上桌率 = used / (cap × 格数)，平均时长 = used / cap。甲方要的「店内调整」依据是绝对量，
+                    //   百分比只是它的归一化视图，两个都给。
+                    vo.setAvgHoursPerUnit(rate(usedHours, cap));
+                    vo.setOccupancyRate(rate(usedHours, sellableHours));
+                    vo.setOpenOccupancyRate(rate(usedHours, openHours));
+                    vo.setBookings((long) rows.size());
+                    vo.setSeatedBookings(seated);
+                    vo.setNoShowBookings(noShow);
+                    vo.setCancelledBookings(cancelled);
+                    vo.setDayPassBookings(dayPass);
+                    result.add(vo);
+                }
+            }
+        }
+        // 返回顺序 = 月份 → 门店 → 桌型（stable sort：同一「月×店」内保持桌型 sort_no 顺序）。
+        // 循环是门店在外、月份在内，直接返回会变成「4 月…9 月（店A）→ 4 月…9 月（店B）」——
+        // 看表的人会以为出现了两个 4 月。月份优先才能让时间轴单调，前端据此合并月份单元格。
+        result.sort(Comparator.comparing(GzBeanSeatUsageVO::getMonth)
+            .thenComparing(GzBeanSeatUsageVO::getStoreId));
+        return result;
+    }
+
+    /** 分母为 0 时给 null（前端显示「—」，不显示 NaN / 除零）。 */
+    private static Double rate(long numerator, long denominator) {
+        return denominator <= 0L ? null : (double) numerator / (double) denominator;
+    }
+
+    /**
+     * {@code [slotStart, slotEnd)} 覆盖了几个营业格 —— 报表时长口径的唯一实现。
+     *
+     * <p>与 mp 的"某格是否被该单占用"同一判据（{@code slot_start <= gi AND slot_end > gi}），
+     * 所以午休格不会被算进来；区间与营业格错开（历史单遇到后来改过的营业时段）时也只会算交集。</p>
+     */
+    private static long coveredSlots(List<LocalTime> slots, LocalTime slotStart, LocalTime slotEnd) {
+        if (slots == null || slots.isEmpty() || slotStart == null || slotEnd == null || !slotStart.isBefore(slotEnd)) {
+            return 0L;
+        }
+        long n = 0L;
+        for (LocalTime gi : slots) {
+            if (!slotStart.isAfter(gi) && slotEnd.isAfter(gi)) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    private static String closeKey(Long configId, LocalDate date, LocalTime slot) {
+        return configId + "|" + date + "|" + slot;
+    }
+
+    private static String monthOf(LocalDate d) {
+        return d.format(DateTimeFormatter.ofPattern("yyyy-MM"));
     }
 
     /** 派生 payMethod / walkIn + 批量填门店名（避免 N+1）。 */

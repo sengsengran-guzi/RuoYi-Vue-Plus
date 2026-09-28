@@ -12,6 +12,7 @@ import org.dromara.common.web.core.BaseController;
 import org.dromara.gz.bean.domain.bo.GzBeanRevenueQueryBo;
 import org.dromara.gz.bean.domain.vo.GzBeanRevenueAggregateVO;
 import org.dromara.gz.bean.domain.vo.GzBeanRevenueDetailVO;
+import org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO;
 import org.dromara.gz.bean.mapper.GzAdminUserStoreMapper;
 import org.dromara.gz.bean.service.IGzBeanRevenueService;
 import org.springframework.validation.annotation.Validated;
@@ -20,6 +21,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -64,6 +66,25 @@ public class GzBeanRevenueController extends BaseController {
                                                  @RequestParam(required = false) Long storeId) {
         Long staffStoreId = resolveStaffStoreId();
         return R.ok(revenueService.selectAggregate(granularity, startDate, endDate, storeId, staffStoreId));
+    }
+
+    /**
+     * 「桌型使用时长 · 上桌率」月度报表（GZ-BEAN-059，甲方 2026-09-28）。
+     *
+     * <p>甲方要用它做店内调整（每种桌型每月坐了多少小时）。<b>不看金额</b> —— 店员没填现金，
+     * 金额口径不可靠；时长完全由已成交单的时段推出。</p>
+     *
+     * @param startDate 区间起 yyyy-MM-dd（必填）
+     * @param endDate   区间止 yyyy-MM-dd（必填，与起始同月则只出一个月）
+     * @param storeId   门店 id（可选；owner 传空 = 全部门店，staff 忽略强制本店）
+     */
+    @SaCheckPermission("gz:bean:revenue:list")
+    @GetMapping("/seat-usage")
+    public R<List<GzBeanSeatUsageVO>> seatUsage(@RequestParam String startDate,
+                                               @RequestParam String endDate,
+                                               @RequestParam(required = false) Long storeId) {
+        Long staffStoreId = resolveStaffStoreId();
+        return R.ok(revenueService.selectSeatUsage(startDate, endDate, storeId, staffStoreId));
     }
 
     /**

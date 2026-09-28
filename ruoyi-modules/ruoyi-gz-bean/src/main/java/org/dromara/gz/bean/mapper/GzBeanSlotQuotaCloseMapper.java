@@ -1,5 +1,6 @@
 package org.dromara.gz.bean.mapper;
 
+import lombok.Data;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
 import org.dromara.common.mybatis.core.mapper.BaseMapperPlus;
@@ -8,6 +9,7 @@ import org.dromara.gz.bean.domain.vo.GzBeanSlotQuotaCloseVO;
 
 import java.time.LocalDate;
 import java.time.LocalTime;
+import java.util.List;
 
 /**
  * gz_bean_slot_quota_close 数据层（客户 0702 反馈 #4a）。
@@ -44,6 +46,31 @@ public interface GzBeanSlotQuotaCloseMapper extends BaseMapperPlus<GzBeanSlotQuo
                              @Param("seatTypeConfigId") Long seatTypeConfigId,
                              @Param("sessDate") LocalDate sessDate,
                              @Param("slotStart") LocalTime slotStart);
+
+    /**
+     * 区间内该门店全部关闭行（GZ-BEAN-059 报表分母用）。
+     *
+     * <p><b>为什么整段拉</b>：分母要逐（日 × 营业格 × 桌型）算 {@code effectiveCapacity}，
+     * 逐格调 {@code getQuotaCloseOrNull} 一个月就是上千次查询。一次拉回按
+     * {@code (configId|sessDate|slotStart)} 建索引即可，行数按月只有几十行。</p>
+     */
+    @Select("SELECT seat_type_config_id, sess_date, slot_start, close_count " +
+        "FROM gz_bean_slot_quota_close " +
+        "WHERE tenant_id = #{tenantId} AND store_id = #{storeId} AND del_flag = '0' " +
+        "  AND sess_date BETWEEN #{from} AND #{to}")
+    List<CloseRow> selectCloseRowsInRange(@Param("tenantId") String tenantId,
+                                         @Param("storeId") Long storeId,
+                                         @Param("from") LocalDate from,
+                                         @Param("to") LocalDate to);
+
+    /** 区间内单条关闭行（GZ-BEAN-059）。列名与 {@code @Select} 别名一致，自动驼峰映射。 */
+    @Data
+    class CloseRow {
+        private Long seatTypeConfigId;
+        private LocalDate sessDate;
+        private LocalTime slotStart;
+        private Integer closeCount;
+    }
 
     /**
      * 命中唯一键（tenant/store/config/date/slot）的现存配额关闭行 id（含软删=0），供 upsert 判断改 or 建。
