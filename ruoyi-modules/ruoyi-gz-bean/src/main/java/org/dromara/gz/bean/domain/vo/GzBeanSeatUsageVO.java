@@ -70,6 +70,15 @@ public class GzBeanSeatUsageVO implements Serializable {
     /** 【甲方要的就是它】已上桌时长（单位·小时）= Σ 已上桌单覆盖的营业格数 */
     private Long usedHours;
 
+    /** 【甲方 2026-09-29 追加】其中**小程序**来的时长（`source='mp'`）—— 与 offlineHours 相加 = usedHours */
+    private Long mpHours;
+
+    /** 【甲方 2026-09-29 追加】其中**线下**来的时长（看板现金入座 `walk_in` + 后台代客 `admin`） */
+    private Long offlineHours;
+
+    /** 【甲方 2026-09-29 追加】其中线下的**单数**（现金入座常常没录金额，靠单数对账） */
+    private Long offlineBookings;
+
     /** 可售时长（单位·小时）= Σ 营业格 effectiveCapacity（扣长期关闭 + 当日关闭）—— 分母 A */
     private Long sellableHours;
 

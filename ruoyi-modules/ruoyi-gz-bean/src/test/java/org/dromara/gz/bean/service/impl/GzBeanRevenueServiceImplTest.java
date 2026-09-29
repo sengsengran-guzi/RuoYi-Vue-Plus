@@ -271,6 +271,36 @@ class GzBeanRevenueServiceImplTest {
     }
 
     @Test
+    @DisplayName("★GZ-BEAN-059 · 时长按来源拆：小程序 / 线下（看板现金 walk_in + 后台代客 admin），两段相加 = 总时长")
+    void seatUsage_splitsMpAndOfflineHours() {
+        stubUsage("1001");
+        try (MockedStatic<TenantHelper> th = mockStatic(TenantHelper.class)) {
+            th.when(TenantHelper::getTenantId).thenReturn("1001");
+            GzBeanBookingMapper.UsageRow mp = usage(D1, "used", "paid",
+                java.time.LocalTime.of(10, 0), java.time.LocalTime.of(11, 0), 0);
+            mp.setSource("mp");
+            GzBeanBookingMapper.UsageRow walkIn = usage(D1, "used", "paid",
+                java.time.LocalTime.of(10, 0), java.time.LocalTime.of(12, 0), 0);
+            walkIn.setSource("walk_in");
+            GzBeanBookingMapper.UsageRow admin = usage(D1, "used", "paid",
+                java.time.LocalTime.of(14, 0), java.time.LocalTime.of(15, 0), 0);
+            admin.setSource("admin");
+            when(bookingMapper.selectUsageRowsInRange(any(), any(), any(), any()))
+                .thenReturn(List.of(mp, walkIn, admin));
+
+            org.dromara.gz.bean.domain.vo.GzBeanSeatUsageVO vo =
+                service.selectSeatUsage("2026-09-01", "2026-09-01", null, null).get(0);
+
+            assertEquals(4L, vo.getUsedHours(), "1 + 2 + 1");
+            assertEquals(1L, vo.getMpHours(), "只有 source=mp 的那张单算小程序");
+            assertEquals(3L, vo.getOfflineHours(), "walk_in 2h + admin 1h");
+            assertEquals(2L, vo.getOfflineBookings(), "线下的单数（供现金对账）");
+            assertEquals(vo.getUsedHours(), vo.getMpHours() + vo.getOfflineHours(),
+                "两段相加必须恒等于总时长（否则就是漏算或重复算）");
+        }
+    }
+
+    @Test
     @DisplayName("★GZ-BEAN-059 · 桌型不存在的日子不计容量（新建「六人桌」不会在历史月份显示成 0% 上桌）")
     void seatUsage_capacityCountedOnlyAfterConfigCreated() {
         stubUsage("1001");

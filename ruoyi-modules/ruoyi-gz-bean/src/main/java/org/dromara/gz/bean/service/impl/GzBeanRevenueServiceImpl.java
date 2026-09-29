@@ -60,6 +60,9 @@ public class GzBeanRevenueServiceImpl implements IGzBeanRevenueService {
 
     private static final String PAY_STATUS_PAID = "paid";
     private static final String SOURCE_ADMIN = "admin";
+
+    /** 小程序来源 = `gz_bean_booking.source` 的列默认值（看板入座写 `walk_in`、后台代客写 `admin`）。 */
+    private static final String SOURCE_MP = "mp";
     private static final String PAY_METHOD_CASH = "cash";
     private static final String PAY_METHOD_ONLINE = "online";
 
@@ -360,7 +363,8 @@ public class GzBeanRevenueServiceImpl implements IGzBeanRevenueService {
 
                     List<GzBeanBookingMapper.UsageRow> rows =
                         usageMap.getOrDefault(month + "#" + cfg.getId(), List.of());
-                    long usedHours = 0L, seated = 0L, noShow = 0L, cancelled = 0L, dayPass = 0L;
+                    long usedHours = 0L, mpHours = 0L, offlineHours = 0L, offlineBookings = 0L;
+                    long seated = 0L, noShow = 0L, cancelled = 0L, dayPass = 0L;
                     for (GzBeanBookingMapper.UsageRow r : rows) {
                         boolean paid = "paid".equals(r.getPayStatus()) || "paying".equals(r.getPayStatus());
                         boolean seatedRow = paid && SEATED_STATUSES.contains(r.getStatus());
@@ -372,7 +376,16 @@ public class GzBeanRevenueServiceImpl implements IGzBeanRevenueService {
                             // 覆盖营业格数 = 时长（单位·小时）。用格集合求交而不是钟表相减：
                             //   午休格不算"坐着"，包天单（10:00-22:00）因此 = 当天营业格数而不是 12 小时，
                             //   分子分母同量纲 → 上桌率天然 ≤ 100%。
-                            usedHours += coveredSlots(slotsByDate.get(r.getSessDate()), r.getSlotStart(), r.getSlotEnd());
+                            long covered = coveredSlots(slotsByDate.get(r.getSessDate()), r.getSlotStart(), r.getSlotEnd());
+                            usedHours += covered;
+                            // 甲方 2026-09-29：线下现金入座（看板 walk_in / 后台代客 admin）**也算时长**，
+                            // 但要能和小程序来的分开看 —— 分子按 source 再拆一刀，两段相加恒等于 usedHours。
+                            if (SOURCE_MP.equals(r.getSource())) {
+                                mpHours += covered;
+                            } else {
+                                offlineHours += covered;
+                                offlineBookings++;
+                            }
                         } else if (paid && "no_show".equals(r.getStatus())) {
                             noShow++;
                         } else if ("cancelled".equals(r.getStatus())) {
@@ -393,6 +406,9 @@ public class GzBeanRevenueServiceImpl implements IGzBeanRevenueService {
                     vo.setBookMode(cfg.getBookMode());
                     vo.setCapacityPerSlot(cap);
                     vo.setUsedHours(usedHours);
+                    vo.setMpHours(mpHours);
+                    vo.setOfflineHours(offlineHours);
+                    vo.setOfflineBookings(offlineBookings);
                     vo.setSellableHours(sellableHours);
                     vo.setOpenHours(openHours);
                     // 平均每个座位（整桌桌型 = 每张桌）坐了几小时 —— 与上桌率只差一个「营业格数」因子：

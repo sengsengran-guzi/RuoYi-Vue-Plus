@@ -645,7 +645,7 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
      * @param to   服务日止（含）
      */
     @Select("SELECT sess_date, store_id, seat_type_config_id, seat_type_snapshot, " +
-        "       slot_start, slot_end, status, pay_status, is_day_pass " +
+        "       slot_start, slot_end, status, pay_status, is_day_pass, source " +
         "FROM gz_bean_booking " +
         "WHERE tenant_id = #{tenantId} AND del_flag = '0' " +
         "  AND sess_date BETWEEN #{from} AND #{to} " +
@@ -670,6 +670,8 @@ public interface GzBeanBookingMapper extends BaseMapperPlus<GzBeanBooking, GzBea
         private String status;
         private String payStatus;
         private Integer isDayPass;
+        /** 单来源：{@code mp}=小程序（列默认值）/ {@code walk_in}=看板现金入座 / {@code admin}=后台代客 */
+        private String source;
     }
 
     /**
