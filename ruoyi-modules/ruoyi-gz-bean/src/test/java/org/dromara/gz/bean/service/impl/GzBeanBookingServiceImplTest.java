@@ -3350,6 +3350,9 @@ class GzBeanBookingServiceImplTest {
         assertEquals(0L, slots.get(1).getBooked());
         assertEquals(3L, slots.get(1).getRemaining());
         assertEquals("10:00", slots.get(0).getSlotStart().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm")));
+        // 档位口径的当日摘要 = 各格剩余取最小（11:00 的 3）—— 抽屉「今天还能卖」用它，
+        //   与物理座位口径的 freeSeats 并列，消除「关了还显示有空闲座位」的误读。
+        assertEquals(3L, vo.getMinSlotRemaining(), "当日摘要取各格剩余最小值");
     }
 
     @Test
@@ -3362,6 +3365,7 @@ class GzBeanBookingServiceImplTest {
             service.selectDaySellable(1L, sessDate).get(0);
 
         assertEquals(0L, vo.getSlots().get(0).getRemaining(), "close 远超 cap → 剩余下限 0");
+        assertEquals(0L, vo.getMinSlotRemaining(), "关满 → 档位口径摘要 0（甲方期望的「关闭后不该还有可卖」）");
     }
 
 }

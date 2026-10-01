@@ -20,7 +20,11 @@ import java.util.List;
  *   <li>{@link #slots} 是逐小时格明细（可订上限 / 已订 / 今日关闭 / 剩余），驱动抽屉里「不同时段还剩多少」表格；
  *       <b>逐时段</b>调整走 {@code POST /system/gz/bean/slotQuotaClose}（该格 upsert）；</li>
  *   <li><b>按天统一</b>调整走 {@code POST /system/gz/bean/slotQuotaClose/close-day}（该日全部小时格统一覆盖）；</li>
- *   <li>{@link #freeSeats} 只读：当天没被预订的座位（供店员判断线下来人能接几桌）。</li>
+ *   <li>{@link #freeSeats} 只读：当天没被预订的<b>物理座位</b>（供店员判断线下来人能接几桌）。
+ *       <b>它不受任何关闭影响</b> —— 关闭少卖的是「档位」（桌/座），不是座位本身。</li>
+ *   <li>{@link #minSlotRemaining} 只读：<b>档位口径</b>的当日摘要 = 各小时格 {@code remaining} 的最小值
+ *       （「今天最难订的那个小时还剩几个」）—— 这个数**随关闭立刻变化**，关满 = 0。
+ *       甲方 2026-09-29 反馈「关闭了桌子，空闲座位还显示 1」正是把这两个口径读混了，故并列下发。</li>
  * </ul>
  *
  * <p><b>关闭一律是「数量制」</b>（ADR-0018 §3 客户 7.05 定，2026-09-26 复核维持）：mp 顾客只选桌型档
@@ -90,8 +94,18 @@ public class GzBeanDaySellableVO implements Serializable {
      */
     private List<SlotRow> slots;
 
-    /** 当天<b>没被预订</b>的座位（该桌型未软删座位 − 当天有活跃单的座位） */
+    /** 当天<b>没被预订</b>的座位（该桌型未软删座位 − 当天有活跃单的座位）。物理座位口径，不受关闭影响 */
     private List<FreeSeat> freeSeats;
+
+    /**
+     * 【档位口径】各小时格 {@code remaining} 的**最小值** = 「今天最难订的那个小时还剩几个」。
+     *
+     * <p>为什么用 min 而不是求和：店员/老板的问题是「今天还能不能接客」，min 是保守答案；
+     * 求和是「档位·小时」总量（= 营业额页的可售时长口径），单位不是「几个」。
+     * 关满 → 0；有格可卖 → 关几个就少几个（{@code remaining = max(0, cap − close − booked)} 的同源结果）。
+     * 当日无营业格 → 0。</p>
+     */
+    private Long minSlotRemaining;
 
     /**
      * 逐 1h 格明细行：可订上限取父行 {@link #capPerSlot}，剩余 = {@code max(0, cap − booked − closeCount)}。

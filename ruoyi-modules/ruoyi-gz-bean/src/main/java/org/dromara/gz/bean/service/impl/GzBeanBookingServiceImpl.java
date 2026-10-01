@@ -2327,6 +2327,12 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                         .build());
                 }
 
+                // 【档位口径】当日摘要 = 各格 remaining 最小值（关满 → 0；关几个就少几个）。
+                //   与 freeSeats（物理座位、不受关闭影响）并列下发，专门消除「关了还显示有空闲座位」的误读。
+                long minSlotRemaining = slotRows.stream()
+                    .mapToLong(GzBeanDaySellableVO.SlotRow::getRemaining)
+                    .min().orElse(0L);
+
                 Long cfgId = cfg.getId();
                 List<GzBeanDaySellableVO.FreeSeat> freeSeats = seats.stream()
                     .filter(s -> cfgId.equals(s.getSeatTypeConfigId()))
@@ -2349,6 +2355,7 @@ public class GzBeanBookingServiceImpl implements IGzBeanBookingService {
                     .activeBookings(activeBookingsOfCfg)
                     .slots(slotRows)
                     .freeSeats(freeSeats)
+                    .minSlotRemaining(minSlotRemaining)
                     .build());
             }
             return result;
