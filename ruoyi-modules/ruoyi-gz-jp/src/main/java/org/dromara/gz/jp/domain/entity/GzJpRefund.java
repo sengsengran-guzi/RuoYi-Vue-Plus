@@ -25,7 +25,8 @@ import java.time.LocalDateTime;
  * <b>只共用通道层</b> {@code IWechatPayClient.refund}（它的 record 本就有
  * {@code refundAmountCent} 与 {@code totalAmountCent} 两个独立参数）。</p>
  *
- * <p><b>★ 一个商品行至多一条退款单</b>：DB 上是 {@code UNIQUE(tenant_id, order_item_id)}。
+ * <p><b>★ 一个商品行每种退款类型至多一条退款单</b>：DB 上是 {@code UNIQUE(tenant_id, order_item_id, refund_type)}
+ * （二期由 {@code uk_order_item} 换成 {@code uk_item_type}，让到付运费差价退款与购买失败退款共存）。
  * 这是防重复退款最硬的一道闸 —— 并发、重复点击、回调重放都撞在数据库上，不依赖任何应用层判断。
  * 重试退款<b>复用同一行</b>（微信按 {@code out_refund_no} 幂等），不新建第二条。</p>
  *
@@ -64,8 +65,16 @@ public class GzJpRefund extends TenantEntity {
     /** 所属订单 FK→gz_jp_order.id */
     private Long orderId;
 
-    /** ★ 退的是哪一行 FK→gz_jp_order_item.id —— UNIQUE(tenant_id, order_item_id) */
+    /** ★ 退的是哪一行 FK→gz_jp_order_item.id —— UNIQUE(tenant_id, order_item_id, refund_type) */
     private Long orderItemId;
+
+    /**
+     * 退款类型（字典 gz_jp_refund_type，见 {@code GzJpRefundType}；二期新增，DB 默认 {@code purchase_failed}）。
+     *
+     * <p>★ 只有 {@code purchase_failed} 写订单行退款结果并参与 rollup；{@code shipping_diff}（到付运费多退）
+     * 不碰订单行（FLOW:F-JP-09.step2）。新建退款单时<b>显式赋值</b>，不依赖列默认值。</p>
+     */
+    private String refundType;
 
     /** 冗余下单用户 id FK→gz_user.id（admin 退款单列表按客人筛选，免 join） */
     private Long userId;

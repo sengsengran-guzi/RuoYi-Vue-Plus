@@ -178,6 +178,10 @@ public interface GzJpOrderItemMapper extends BaseMapperPlus<GzJpOrderItem, GzJpO
      * <p><b>恒按客人聚簇排序</b>（{@code user_id, order_id, id}）：主视图按客人聚合，
      * 排序保证同一客人的行在分页里连续出现，前端断组即可，不必回表二次查询。</p>
      *
+     * <p><b>★ 不 JOIN {@code gz_jp_product}</b>（GZ-SNAP-102 起是硬约束）：代切行 {@code product_id} 为空，
+     * 内连接商品表会把它们整行吞掉。商品名称 / 编号一律读 {@code product_snapshot_json}；
+     * 「按场筛选」用 {@code product_id IN (子查询)}，代切行不属于任何场、被筛掉是正确语义。</p>
+     *
      * @param page 分页参数
      * @param q    筛选条件（服务层已把 keyword 解析成 userIds、日期解析成 datetime 边界）
      * @param userIds 客人 id 过滤（null = 不限；空集合由服务层短路，不会传进来）

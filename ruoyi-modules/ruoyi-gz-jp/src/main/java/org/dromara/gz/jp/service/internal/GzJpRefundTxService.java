@@ -15,6 +15,7 @@ import org.dromara.gz.jp.domain.enums.GzJpFulfillStatus;
 import org.dromara.gz.jp.domain.enums.GzJpOrderStatus;
 import org.dromara.gz.jp.domain.enums.GzJpRefundSkipReason;
 import org.dromara.gz.jp.domain.enums.GzJpRefundStatus;
+import org.dromara.gz.jp.domain.enums.GzJpRefundType;
 import org.dromara.gz.jp.exception.GzJpRefundErrorCode;
 import org.dromara.gz.jp.mapper.GzJpOrderItemMapper;
 import org.dromara.gz.jp.mapper.GzJpOrderMapper;
@@ -85,7 +86,7 @@ public class GzJpRefundTxService {
      * <p><b>「已是 purchase_failed」不是拒绝而是补退款候选</b>：106 的 {@code /advance} 端点本来就允许
      * 把行推成 {@code purchase_failed}（不带退款）。若这里也一律拒掉，那些行的钱<b>永远退不出去</b>、
      * 且没有任何入口能补 —— 所以它们进「补建退款单」分支，靠
-     * {@code UNIQUE(tenant_id, order_item_id)} 保证不会退第二次。</p>
+     * {@code UNIQUE(tenant_id, order_item_id, refund_type)}（uk_item_type）保证不会退第二次。</p>
      *
      * @param ids        已去重升序的行 id
      * @param reason     退款原因（空则取默认）
@@ -240,6 +241,8 @@ public class GzJpRefundTxService {
                 .refundNo(refundNoGenerator.generate())
                 .orderId(order.getId())
                 .orderItemId(itemId)
+                // 购买失败全额退；显式赋值不靠列默认（到付运费差价 shipping_diff 走另一条路径，GZ-SNAP-306）
+                .refundType(GzJpRefundType.PURCHASE_FAILED.getCode())
                 .userId(row.getUserId())
                 .outTradeNo(txn == null ? order.getOrderNo() : txn.getOutTradeNo())
                 .payTransactionId(txn == null ? null : txn.getId())
@@ -258,7 +261,7 @@ public class GzJpRefundTxService {
             try {
                 refundMapper.insert(refund);
             } catch (DuplicateKeyException e) {
-                // 撞 uk_order_item = 并发的另一个请求刚为这一行建了退款单 → 幂等跳过（DB 层保证不重复退款）
+                // 撞 uk_item_type = 并发的另一个请求刚为这一行建了同类型退款单 → 幂等跳过（DB 层保证不重复退款）
                 // 撞 uk_refund_no  = Redis 号段落后 DB → 自愈后由调用方重试（本次这一行跳过，不重复扣款）
                 refundNoGenerator.reconcileToDbMax();
                 GzJpRefund concurrent = refundMapper.selectByOrderItemIds(List.of(itemId))

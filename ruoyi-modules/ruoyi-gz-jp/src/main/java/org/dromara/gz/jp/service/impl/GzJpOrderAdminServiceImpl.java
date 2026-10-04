@@ -237,9 +237,10 @@ public class GzJpOrderAdminServiceImpl implements IGzJpOrderAdminService {
         JpOrderSnapshot.Product snap = readSnapshot(item.getProductSnapshotJson(), JpOrderSnapshot.Product.class);
         if (snap != null) {
             vo.setProductNo(snap.getProductNo());
-            vo.setName(snap.getName());
+            // 代切行（无商品表外键）名称 / 图片取快照 snap 段；拼团行结果与一期一致
+            vo.setName(snap.resolveName());
             // ★ 下发 file id 不是 URL：admin 用 GzImageThumb 自己换预签名，后端不为一屏 30 行各签一次
-            vo.setMainImageId(snap.getMainImageId());
+            vo.setMainImageId(snap.resolveMainImageId());
             vo.setEventName(snap.getEventName());
             vo.setDeliveryDateText(snap.getDeliveryDateText());
             vo.setNoticeText(snap.getNoticeText());

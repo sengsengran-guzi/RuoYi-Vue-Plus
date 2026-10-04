@@ -37,7 +37,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
  * 行级退款的<b>内存版数据层</b>（GZ-JP-107 单测夹具）。
  *
  * <p><b>为什么不是纯 mock 桩</b>：本卡的正确性几乎全部落在 SQL 的守卫上 ——
- * {@code UNIQUE(tenant_id, order_item_id)}（一行至多一条退款单）、
+ * {@code UNIQUE(tenant_id, order_item_id, refund_type)}（uk_item_type：一行每种类型至多一条退款单）、
  * {@code WHERE status='refunding'}（回调幂等）、
  * {@code WHERE business_status IN ('paid','partial_refunded')}（订单 rollup 不降级）。
  * 用 {@code when(...).thenReturn(1)} 把 mapper 桩掉，等于把要测的东西删掉了。
@@ -332,13 +332,15 @@ class GzJpRefundFixture {
     }
 
     private void wireRefundMapper() {
-        // ★ INSERT 带 UNIQUE(tenant_id, order_item_id) —— 一行至多一条退款单，撞了抛 DuplicateKeyException
+        // ★ INSERT 带 UNIQUE(tenant_id, order_item_id, refund_type) —— 一行每种类型至多一条退款单，撞了抛 DuplicateKeyException
         Mockito.when(refundMapper.insert(any(GzJpRefund.class))).thenAnswer(inv -> {
             GzJpRefund r = inv.getArgument(0);
             boolean dupItem = refunds.values().stream()
-                .anyMatch(e -> e.getOrderItemId().equals(r.getOrderItemId()) && "0".equals(e.getDelFlag()));
+                .anyMatch(e -> e.getOrderItemId().equals(r.getOrderItemId())
+                    && java.util.Objects.equals(e.getRefundType(), r.getRefundType())
+                    && "0".equals(e.getDelFlag()));
             if (dupItem) {
-                throw new DuplicateKeyException("Duplicate entry for key 'uk_order_item'");
+                throw new DuplicateKeyException("Duplicate entry for key 'uk_item_type'");
             }
             boolean dupNo = refunds.values().stream().anyMatch(e -> e.getRefundNo().equals(r.getRefundNo()));
             if (dupNo) {
