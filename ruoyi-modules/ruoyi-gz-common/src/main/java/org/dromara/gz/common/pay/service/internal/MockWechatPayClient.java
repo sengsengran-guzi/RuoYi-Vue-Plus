@@ -96,6 +96,11 @@ public class MockWechatPayClient implements IWechatPayClient {
      */
     private boolean transferAcceptFail = false;
 
+    /**
+     * 最近一次统一下单请求（GZ-PAY-106 单测断言 time_expire 用；mock 不连微信，只记录）。
+     */
+    private volatile UnifiedOrderRequest lastUnifiedOrderRequest;
+
     public MockWechatPayClient(WechatPayProperties properties) {
         log.warn("[gz-pay] MockWechatPayClient 已激活（client-mode != real）—— 不连真实微信通道，仅供 dev/单测/商户号未到位降级。");
     }
@@ -103,11 +108,21 @@ public class MockWechatPayClient implements IWechatPayClient {
     @Override
     public String createJsapiOrder(UnifiedOrderRequest req) {
         String prepayId = MOCK_PREPAY_PREFIX + req.outTradeNo();
+        lastUnifiedOrderRequest = req;
         // appid 在 mock 通道不参与任何计算（不连微信），但要打进日志：多小程序并行 dev 时
         // 这行是「这一单归属哪个小程序」的唯一现场（ADR-0019 §3）。
-        log.info("[gz-pay-mock] createJsapiOrder out_trade_no={} amount={} appid={} → prepay_id={}",
-            req.outTradeNo(), req.amountCent(), req.appid(), prepayId);
+        log.info("[gz-pay-mock] createJsapiOrder out_trade_no={} amount={} appid={} time_expire={} → prepay_id={}",
+            req.outTradeNo(), req.amountCent(), req.appid(), req.timeExpireRfc3339(), prepayId);
         return prepayId;
+    }
+
+    /**
+     * 取最近一次统一下单请求（GZ-PAY-106：断言 time_expire 已随下单传给通道）。
+     *
+     * @return 最近一次 {@link #createJsapiOrder} 入参；从未下单时为 null
+     */
+    public UnifiedOrderRequest getLastUnifiedOrderRequest() {
+        return lastUnifiedOrderRequest;
     }
 
     @Override

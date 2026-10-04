@@ -1,6 +1,9 @@
 package org.dromara.gz.common.pay.service.internal;
 
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 
 /**
  * 微信支付 V3 通道客户端抽象（GZ-PAY-001 AC 9，决策 D2）。
@@ -174,9 +177,36 @@ public interface IWechatPayClient {
      *                    跨小程序不通用），否则微信返「openid 与 appid 不匹配」
      * @param description 商品描述
      * @param appid       下单所用的小程序 appid（ADR-0019 §3：从下单上下文携带，不再读全局配置）
+     * @param timeExpire  支付结束时间（GZ-PAY-106，可空）= 本地 {@code gz_pay_transaction.expire_time}。
+     *                    写进微信 V3 下单请求体 {@code time_expire}：到点后微信侧拒绝付款，杜绝「本地已超时、
+     *                    微信仍可付」。为 null 时不传（微信按默认时效处理）。
      */
     record UnifiedOrderRequest(String outTradeNo, long amountCent, String openid, String description,
-                               String appid) {
+                               String appid, OffsetDateTime timeExpire) {
+
+        /**
+         * 微信 V3 {@code time_expire} 格式：RFC3339 {@code yyyy-MM-DDTHH:mm:ss+TIMEZONE}
+         * （官方示例 {@code 2015-05-20T13:29:35+08:00}）。用 {@code xxx} 而非 {@code XXX}：
+         * UTC 时区输出 {@code +00:00} 而不是 {@code Z}，与官方示例写法保持一致。
+         */
+        public static final DateTimeFormatter TIME_EXPIRE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssxxx");
+
+        /**
+         * 旧构造方式（不带支付结束时间）—— 保留，既有调用方不用改。
+         */
+        public UnifiedOrderRequest(String outTradeNo, long amountCent, String openid, String description,
+                                   String appid) {
+            this(outTradeNo, amountCent, openid, description, appid, null);
+        }
+
+        /**
+         * 按微信格式输出支付结束时间（秒精度，保留原时区偏移）。
+         *
+         * @return 形如 {@code 2026-10-05T12:05:00+08:00}；{@code timeExpire} 为空时返回 null
+         */
+        public String timeExpireRfc3339() {
+            return timeExpire == null ? null : timeExpire.truncatedTo(ChronoUnit.SECONDS).format(TIME_EXPIRE_FORMAT);
+        }
     }
 
     /**

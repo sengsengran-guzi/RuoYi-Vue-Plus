@@ -109,13 +109,20 @@ public class WechatPayV3ClientImpl implements IWechatPayClient {
         payer.setOpenid(req.openid());
         request.setPayer(payer);
 
+        // GZ-PAY-106：支付结束时间 = 本地 expire_time，到点后微信侧拒绝付款（REQ-ORDER-012）。
+        //   旧构造方式未带时间时不传，微信按默认时效处理。
+        String timeExpire = req.timeExpireRfc3339();
+        if (timeExpire != null) {
+            request.setTimeExpire(timeExpire);
+        }
+
         // prepayWithRequestPayment 一步拿到 prepay_id 包装 + 5 参签名；此处仅取 prepay_id 落库
         PrepayWithRequestPaymentResponse resp = jsapiService.prepayWithRequestPayment(request);
         // packageVal 形如 "prepay_id=wx..."，剥前缀回填 prepay_id
         String pkg = resp.getPackageVal();
         String prepayId = pkg != null && pkg.startsWith("prepay_id=") ? pkg.substring("prepay_id=".length()) : pkg;
-        log.info("[gz-pay] createJsapiOrder out_trade_no={} appid={} → prepay_id={}",
-            req.outTradeNo(), appid, prepayId);
+        log.info("[gz-pay] createJsapiOrder out_trade_no={} appid={} time_expire={} → prepay_id={}",
+            req.outTradeNo(), appid, timeExpire, prepayId);
         return prepayId;
     }
 

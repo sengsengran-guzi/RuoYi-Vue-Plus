@@ -79,7 +79,8 @@ public interface IGzPayTransactionService {
      * @param transactionId 微信交易号（查单返回）
      * @param feeCent       通道手续费（查单不给，传 null，PAY-104 回写）
      * @param rawBody       查单返回原始报文（入 callback_log raw_body，决策 D5 来源区分）
-     * @return 补单结果（PAID 推进成功 / SKIPPED_TERMINAL 已终态幂等跳过 / SKIPPED_NOT_FOUND 行不存在）
+     * @return 补单结果（PAID 推进成功 / SKIPPED_TERMINAL 已终态幂等跳过 / SKIPPED_NOT_FOUND 行不存在 /
+     *         LATE_PAID 本地已 timeout·closed 的迟到付款，仅记录不推进）
      */
     ReconcileOutcome reconcilePaid(Long txId, String transactionId, Long feeCent, String rawBody);
 
@@ -129,6 +130,11 @@ public interface IGzPayTransactionService {
         /** 锁行后已是终态（并发回调 / 上轮已处理）→ 幂等跳过 */
         SKIPPED_TERMINAL,
         /** 行不存在（软删 / 并发删除）→ 跳过 */
-        SKIPPED_NOT_FOUND
+        SKIPPED_NOT_FOUND,
+        /**
+         * 迟到付款（GZ-PAY-106）：微信 SUCCESS 但本地已 timeout / closed → 记 callback_log late_paid +
+         * ERROR 日志，不推进 paid、不分发业务，留人工原路退款或补单
+         */
+        LATE_PAID
     }
 }

@@ -128,6 +128,26 @@ public interface GzPayTransactionMapper extends BaseMapperPlus<GzPayTransaction,
                                          @Param("limit") int limit);
 
     /**
+     * 扫迟到付款核查窗口内的 timeout 订单 id（GZ-PAY-106，FLOW:F-JP-06.step4b）。
+     *
+     * <p>条件：{@code status='timeout'} AND 标 timeout 的时间（{@code closed_time}）在 [windowStart, now] 内，
+     * 且<b>尚未记过 late_paid</b>（已发现的迟到付款只报一次，不每轮重复告警）。查单发现微信侧 SUCCESS →
+     * 记 late_paid 留人工；即便回调丢失也能被发现。{@code LIMIT} 控量，与 pending 扫描同口径。</p>
+     *
+     * @param windowStart 窗口下界（now - 24h）
+     * @param limit       单轮上限
+     * @return 待核查的 timeout 订单 id 列表
+     */
+    @Select("SELECT t.id FROM gz_pay_transaction t " +
+        "WHERE t.status = 'timeout' AND t.del_flag = '0' AND t.closed_time >= #{windowStart} " +
+        "AND NOT EXISTS (SELECT 1 FROM gz_pay_callback_log l " +
+        "    WHERE l.tenant_id = t.tenant_id AND l.out_trade_no = t.out_trade_no " +
+        "    AND l.process_status = 'late_paid' AND l.del_flag = '0') " +
+        "ORDER BY t.id LIMIT #{limit}")
+    List<Long> selectLatePaidCheckTimeoutIds(@Param("windowStart") LocalDateTime windowStart,
+                                             @Param("limit") int limit);
+
+    /**
      * 行级锁加载订单（GZ-PAY-102 AC 4 / AC 5，{@code SELECT ... FOR UPDATE}）。
      *
      * <p>主动查单补单在锁行后做状态判定 + 推进，与被动回调走同一幂等基础（强约束 #1）。
