@@ -2,16 +2,15 @@ package org.dromara.gz.jp.service.internal;
 
 import org.dromara.gz.jp.domain.enums.GzJpFulfillRejectReason;
 import org.dromara.gz.jp.domain.enums.GzJpFulfillStatus;
+import org.dromara.gz.jp.domain.enums.GzJpItemSource;
 
 /**
  * 履约状态机 —— <b>合法转移判定的唯一真源</b>（GZ-JP-106，FLOW:F-JP-03.step2/step3）。
  *
  * <pre>
- *   purchasing 购买中
- *     ├─ purchase_failed 购买失败       ← 分支终态（退款由 GZ-JP-107 接手）
- *     └─ await_seller_ship 等待官方发货
- *          → jp_shipped 日本仓库已发货 → customs 清关中
- *          → cn_sorting 国内分拣中 → delivered 发货完毕（终态，必带运单号）
+ *   主链：purchasing 购买中 → await_seller_ship 等待官方发货 → jp_shipped 日本仓库已发货
+ *         → customs 清关中 → cn_sorting 国内分拣中 → delivered 发货完毕（终态，必带运单号）
+ *   分支：任一非终态 → purchase_failed 购买失败（终态，退款由 GZ-JP-107 接手；见下文「两个刻意的决定」）
  * </pre>
  *
  * <p><b>三条规则，只有三条</b>：</p>
@@ -39,8 +38,11 @@ import org.dromara.gz.jp.domain.enums.GzJpFulfillStatus;
  *       且拦在<b>写库之前</b>。</li>
  * </ul>
  *
- * <p>纯静态、无状态、无 Spring 依赖 —— 单测直接断言（accept 第 1 条跑
- * {@code GzJpFulfillStateMachineTest}）。</p>
+ * <p><b>按来源的入口</b> {@link #checkAdvance(String, String, String)}（GZ-SNAP-102）：拼团行结果与
+ * 两参版逐一相同；代切行显式允许 {@code await_seller_ship → purchase_failed}。</p>
+ *
+ * <p>纯静态、无状态、无 Spring 依赖 —— 单测直接断言（{@code GzJpFulfillStateMachineTest} /
+ * {@code GzJpFulfillStateMachineSnapTest}）。</p>
  *
  * @author kevin-coder (sensenran-guzi · GZ-JP-106)
  */
@@ -62,6 +64,41 @@ public final class GzJpFulfillStateMachine {
             return GzJpFulfillRejectReason.SHIP_REQUIRED;
         }
         return check(from, to);
+    }
+
+    /**
+     * 按订单行来源判定的「推进」入口（GZ-SNAP-102，ADR-0025 §5：代切行与拼团行共用这一套状态机）。
+     *
+     * <ul>
+     *   <li><b>{@code batch}</b>：结果与 {@link #checkAdvance(String, String)} <b>对全部 (from, to) 逐一相同</b>——
+     *       一期规则不收紧也不放宽（{@code GzJpFulfillStateMachineSnapTest} 穷举 7×7 守住）。</li>
+     *   <li><b>{@code snap}</b>：代切行买到后停在 {@code await_seller_ship} 直到评价完成，期间卖家取消 /
+     *       验货退货都要把行改成 {@code purchase_failed}（FLOW:F-JP-09.step1 / step4），
+     *       所以 {@code await_seller_ship → purchase_failed} <b>显式允许</b>；其余转移沿用一期规则。</li>
+     *   <li>来源为空 / 未知 → {@link GzJpFulfillRejectReason#UNKNOWN_CURRENT}（不回落成 batch，
+     *       与 {@code GzJpOrderItemSourceInvariant} 同一口径）。</li>
+     * </ul>
+     *
+     * <p>★ 这里只判「状态链上走不走得通」。「source=snap 且 trade_status≠rated 不许走 admin 批量入口」
+     * 是另一道守卫（FLOW:F-JP-09.step3），挂在 admin 批量入口上，不在本类。</p>
+     *
+     * @param source 订单行 {@code source}（batch / snap）
+     * @param from   行当前 {@code fulfill_status}
+     * @param to     目标 {@code fulfill_status}
+     * @return {@code null} = 允许；否则为拒绝原因
+     */
+    public static GzJpFulfillRejectReason checkAdvance(String source, String from, String to) {
+        GzJpItemSource src = GzJpItemSource.of(source);
+        if (src == null) {
+            return GzJpFulfillRejectReason.UNKNOWN_CURRENT;
+        }
+        if (src == GzJpItemSource.SNAP
+            && GzJpFulfillStatus.AWAIT_SELLER_SHIP.getCode().equals(from)
+            && GzJpFulfillStatus.PURCHASE_FAILED.getCode().equals(to)) {
+            // 代切：卖家取消 / 验货不通过 → 行级退款的入口（REQ-SNAP-032/033）
+            return null;
+        }
+        return checkAdvance(from, to);
     }
 
     /**
