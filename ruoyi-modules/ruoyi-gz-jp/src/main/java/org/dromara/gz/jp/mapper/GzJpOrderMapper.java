@@ -7,6 +7,7 @@ import org.dromara.common.mybatis.core.mapper.BaseMapperPlus;
 import org.dromara.gz.jp.domain.entity.GzJpOrder;
 
 import java.time.LocalDateTime;
+import java.util.List;
 
 /**
  * gz_jp_order 数据层（GZ-JP-105）。
@@ -108,4 +109,22 @@ public interface GzJpOrderMapper extends BaseMapperPlus<GzJpOrder, GzJpOrder> {
         + "WHERE id = #{id} AND del_flag = '0' AND business_status IN ('paid','partial_refunded') "
         + "AND business_status <> #{target}")
     int markRefundRollup(@Param("id") Long id, @Param("target") String target);
+
+    // ================================================================
+    //  GZ-JP-110 未付款超时关单（FLOW:F-JP-10.step1）
+    // ================================================================
+
+    /**
+     * 扫「下单后迟迟未付款」的订单：{@code business_status='created'} 且 {@code create_time < deadline}。
+     *
+     * <p>按 id 升序 + {@code LIMIT} 分批：一轮处理不完的下一轮（5 分钟后）接着扫，不会一次把库拖满。
+     * 调用方在 {@code TenantHelper.ignore} 内调（调度线程没有登录上下文，不忽略租户会被拦成空集）。</p>
+     *
+     * @param deadline 截止时间（= now − 超时分钟数），早于它创建的才算超时
+     * @param limit    本轮最多取几单
+     * @return 超时未付款订单（含 id / order_no，供逐单查单 / 关单）
+     */
+    @Select("SELECT * FROM gz_jp_order WHERE business_status = 'created' AND create_time < #{deadline} "
+        + "AND del_flag = '0' ORDER BY id LIMIT #{limit}")
+    List<GzJpOrder> selectUnpaidExpired(@Param("deadline") LocalDateTime deadline, @Param("limit") int limit);
 }
