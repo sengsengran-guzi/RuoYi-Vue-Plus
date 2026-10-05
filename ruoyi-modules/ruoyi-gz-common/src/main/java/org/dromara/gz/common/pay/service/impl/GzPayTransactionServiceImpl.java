@@ -307,7 +307,10 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
         if (affected == 0) {
             // GZ-PAY-106：回调读到 pending 后、markPaid 前被超时任务抢先标了 timeout → 这是迟到付款不是重复，
             //   不能记 duplicated 吞掉。重读一次最新状态区分两者。
-            GzPayTransaction latest = transactionMapper.selectById(tx.getId());
+            //   ★ 必须是当前读（FOR UPDATE）：回调路径前面那次 selectByOutTradeNo 已在本事务里建好 RR 快照，
+            //   普通 SELECT 重读仍返回快照里的 pending，超时任务已提交的 timeout 看不见 → 又落回 duplicated。
+            //   markPaid 这条 UPDATE 已对该行加了 X 锁，这里再锁同一行不会新增等待。
+            GzPayTransaction latest = transactionMapper.selectByIdForUpdate(tx.getId());
             if (latest != null && isLatePaidStatus(latest.getStatus())) {
                 recordLatePaid(latest, transactionId, null, rawBody, signature, "并发超时");
                 return false;

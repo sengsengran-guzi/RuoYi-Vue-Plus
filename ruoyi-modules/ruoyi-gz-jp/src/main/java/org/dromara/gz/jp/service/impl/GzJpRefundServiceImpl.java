@@ -550,7 +550,12 @@ public class GzJpRefundServiceImpl implements IGzJpRefundService {
             return CompensateOutcome.RESENT;
         } catch (Exception e) {
             String msg = StrUtil.blankToDefault(e.getMessage(), e.getClass().getSimpleName());
-            txService.markAcceptFailed(refund.getId(), refund.getOrderItemId(), "查单补偿补发失败：" + msg);
+            if (!txService.markAcceptFailedIfRefunding(refund.getId(), refund.getOrderItemId(), "查单补偿补发失败：" + msg)) {
+                // 补发抛错期间退款回调已把单落了终态（多半是微信其实受理了、只是应答超时）—— 以库里为准，不算失败
+                log.warn("[gz-jp-refund] 查单补偿：补发抛错，但退款单已被回调抢先推进，未改写 refund_no={}: {}",
+                    refund.getRefundNo(), msg);
+                return CompensateOutcome.ALREADY_SETTLED;
+            }
             log.error("[gz-jp-refund] 查单补偿：补发仍失败，已落 refund_failed 留 admin 处理 refund_no={}: {}",
                 refund.getRefundNo(), msg, e);
             return CompensateOutcome.RESEND_FAILED;

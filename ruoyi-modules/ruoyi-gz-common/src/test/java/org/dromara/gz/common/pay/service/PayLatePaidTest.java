@@ -251,20 +251,49 @@ class PayLatePaidTest {
         assertLatePaidLog(capturedLogs(2).get(1));
     }
 
+    /**
+     * 并发形态的 mock 建模（真库 REPEATABLE-READ 语义）：回调事务里第一次 SELECT 建了快照 ——
+     * 之后同事务的普通 SELECT（{@code selectById}）仍返回快照里的 pending；只有当前读
+     * （{@code selectByIdForUpdate}）才看得到超时任务已提交的 timeout。
+     * 这里让两条读路径返回不同的值，锁死「affected=0 后必须用当前读区分迟到付款 / 重复」。
+     * mock 只能守住「用的是哪条读」，RR 快照本身的行为由真库并发用例
+     * {@code doc/jp/regression/D7/D7QaConcurrencyTest#pay106_race_callbackVsTimeout} 覆盖。
+     */
     @Test
-    @DisplayName("回调并发：读到 pending、markPaid 前被超时任务抢先标 timeout（affected=0）→ late_paid，不是 duplicated")
+    @DisplayName("回调并发：读到 pending、markPaid 前被超时任务抢先标 timeout（affected=0）→ 当前读重读 → late_paid，不是 duplicated")
     void notify_raceWithExpire_recordsLatePaidNotDuplicated() {
         when(wechatPayClient.parseAndVerifyNotify(any())).thenReturn(successCallback());
         when(transactionMapper.selectByOutTradeNo(OUT_TRADE_NO)).thenReturn(tx(92L, PayStatus.PENDING));
         when(transactionMapper.markPaid(eq(92L), eq(3), eq(TXN_ID), any(), any())).thenReturn(0);
-        when(transactionMapper.selectById(92L)).thenReturn(tx(92L, PayStatus.TIMEOUT));
+        // RR 快照读：仍是 pending（超时任务的提交对本事务的普通 SELECT 不可见）
+        when(transactionMapper.selectById(92L)).thenReturn(tx(92L, PayStatus.PENDING));
+        // 当前读：看得到已提交的 timeout
+        when(transactionMapper.selectByIdForUpdate(92L)).thenReturn(tx(92L, PayStatus.TIMEOUT));
+
+        assertTrue(service.handlePaymentNotify(successNotify()));
+
+        verify(dispatcher, never()).dispatch(any(GzPayTransaction.class));
+        verify(transactionMapper).selectByIdForUpdate(92L);
+        verify(transactionMapper, never()).selectById(92L);
+        List<GzPayCallbackLog> logs = capturedLogs(2);
+        assertLatePaidLog(logs.get(1));
+        assertTrue(logs.stream().noneMatch(l -> "duplicated".equals(l.getProcessStatus())));
+    }
+
+    @Test
+    @DisplayName("回调并发：markPaid affected=0 且当前读为 paid（并发回调 / 查单已推进）→ 仍记 duplicated，不误报迟到付款")
+    void notify_raceWithOtherPaid_stillDuplicated() {
+        when(wechatPayClient.parseAndVerifyNotify(any())).thenReturn(successCallback());
+        when(transactionMapper.selectByOutTradeNo(OUT_TRADE_NO)).thenReturn(tx(98L, PayStatus.PENDING));
+        when(transactionMapper.markPaid(eq(98L), eq(3), eq(TXN_ID), any(), any())).thenReturn(0);
+        when(transactionMapper.selectByIdForUpdate(98L)).thenReturn(tx(98L, PayStatus.PAID));
 
         assertTrue(service.handlePaymentNotify(successNotify()));
 
         verify(dispatcher, never()).dispatch(any(GzPayTransaction.class));
         List<GzPayCallbackLog> logs = capturedLogs(2);
-        assertLatePaidLog(logs.get(1));
-        assertTrue(logs.stream().noneMatch(l -> "duplicated".equals(l.getProcessStatus())));
+        assertEquals("duplicated", logs.get(1).getProcessStatus());
+        assertTrue(logs.stream().noneMatch(l -> "late_paid".equals(l.getProcessStatus())));
     }
 
     @Test
@@ -280,6 +309,7 @@ class PayLatePaidTest {
         List<GzPayCallbackLog> logs = capturedLogs(2);
         assertEquals("processed", logs.get(1).getProcessStatus());
         verify(transactionMapper, never()).selectById(anyLong());
+        verify(transactionMapper, never()).selectByIdForUpdate(anyLong());
     }
 
     @Test

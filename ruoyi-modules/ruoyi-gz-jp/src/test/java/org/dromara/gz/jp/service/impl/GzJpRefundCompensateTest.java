@@ -1,5 +1,6 @@
 package org.dromara.gz.jp.service.impl;
 
+import org.dromara.common.core.exception.ServiceException;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.NotifyContext;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.RefundQueryResult;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.RefundRequest;
@@ -19,12 +20,14 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
+import java.time.LocalDateTime;
 import java.util.Date;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -228,6 +231,55 @@ class GzJpRefundCompensateTest {
         assertTrue(refund.getFailReason().contains("补发失败"), refund.getFailReason());
         assertEquals(GzJpRefundStatus.REFUND_FAILED.getCode(), f.row(11L).getRefundStatus());
         verify(f.payClient, times(1)).refund(any());
+    }
+
+    /**
+     * D7 QA r1 O2：补发调用期间退款成功回调先落账（典型：微信其实受理了、只是应答超时抛错）。
+     * 受理失败回写的 {@code markFailed} 守卫 affected=0 → <b>商品行不能被改回 refund_failed</b>。
+     * 内存表只能建模「回调先提交」这一种交错；真库行锁等待形态见
+     * {@code doc/jp/regression/D7/D7ReworkO2RefundRaceTest}。
+     */
+    @Test
+    @DisplayName("NOT_FOUND 补发抛错但回调已抢先落账：退款单 / 商品行保持 refunded，结果 ALREADY_SETTLED，不改回 refund_failed")
+    void notFound_resendThrows_afterCallbackSettled_rowKeepsRefunded() {
+        GzJpRefundFixture f = new GzJpRefundFixture();
+        GzJpRefund refund = stuck(f, 1L, 11L, 10000L);
+        f.payClient.setQueryRefundStatus(refund.getRefundNo(), RefundQueryResult.NOT_FOUND);
+        String body = f.callbackBody(refund, "SUCCESS");
+        Mockito.doAnswer(inv -> {
+            assertTrue(f.service.handleRefundNotify(ctx(body)));
+            throw new IllegalStateException("模拟微信应答超时");
+        }).when(f.payClient).refund(any());
+
+        CompensateResult r = job(f).run();
+
+        assertEquals(1, r.count(CompensateOutcome.ALREADY_SETTLED));
+        assertEquals(0, r.count(CompensateOutcome.RESEND_FAILED));
+        assertEquals(GzJpRefundStatus.REFUNDED.getCode(), refund.getStatus());
+        assertNull(refund.getFailReason());
+        assertEquals(GzJpRefundStatus.REFUNDED.getCode(), f.row(11L).getRefundStatus(), "★ 已退成功的行不得被改回 refund_failed");
+        assertEquals(10000L, f.row(11L).getRefundAmountCent());
+        assertEquals(GzJpOrderStatus.REFUNDED.getCode(), f.orderStatus(1L));
+    }
+
+    @Test
+    @DisplayName("admin 重新发起抛错但回调已抢先落账：商品行保持 refunded（与补偿同一受理失败回写）")
+    void retryThrows_afterCallbackSettled_rowKeepsRefunded() {
+        GzJpRefundFixture f = new GzJpRefundFixture();
+        GzJpRefund refund = stuck(f, 1L, 11L, 10000L);
+        refund.setTriggeredTime(LocalDateTime.now().minusMinutes(11));
+        String body = f.callbackBody(refund, "SUCCESS");
+        Mockito.doAnswer(inv -> {
+            assertTrue(f.service.handleRefundNotify(ctx(body)));
+            throw new IllegalStateException("模拟微信应答超时");
+        }).when(f.payClient).refund(any());
+
+        assertThrows(ServiceException.class,
+            () -> f.service.retry(refund.getId(), "admin"));
+
+        assertEquals(GzJpRefundStatus.REFUNDED.getCode(), refund.getStatus());
+        assertEquals(GzJpRefundStatus.REFUNDED.getCode(), f.row(11L).getRefundStatus(), "★ 已退成功的行不得被改回 refund_failed");
+        assertEquals(10000L, f.row(11L).getRefundAmountCent());
     }
 
     // ============================================================

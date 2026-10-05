@@ -314,14 +314,41 @@ public class GzJpRefundTxService {
      * <p><b>REQUIRES_NEW</b>：调用方此时不在事务里（事务①已提交），但显式声明避免将来被人包进外层事务后，
      * 失败记录跟着一起回滚 —— 那正是本类拆分要防的事。</p>
      *
+     * <p><b>商品行只跟着退款单走</b>：{@code markFailed} 带 {@code status='refunding'} 守卫，affected=0 说明
+     * 调微信这段时间里退款回调（或查单补偿）已经把退款单推成了终态（典型：微信其实受理了，只是应答超时抛错）。
+     * 此时<b>不写商品行</b> —— 否则已退款成功的行会被改回 {@code refund_failed}，与退款单 / 订单 rollup 对不上。</p>
+     *
      * @param refundId   退款单 id
      * @param itemId     商品行 id
      * @param failReason 失败原因（本方法内截断）
      */
     @Transactional(rollbackFor = Exception.class, propagation = Propagation.REQUIRES_NEW)
     public void markAcceptFailed(Long refundId, Long itemId, String failReason) {
-        refundMapper.markFailed(refundId, null, trunc(failReason));
+        writeAcceptFailed(refundId, itemId, failReason);
+    }
+
+    /**
+     * 同 {@link #markAcceptFailed}，但把「本次是否真的落了 refund_failed」告诉调用方（查单补偿据此区分
+     * 「补发失败」与「已被回调抢先落账」）。
+     *
+     * @param refundId   退款单 id
+     * @param itemId     商品行 id
+     * @param failReason 失败原因（本方法内截断）
+     * @return true = 退款单 refunding → refund_failed 且商品行已同步；false = 退款单已非 refunding，什么都没写
+     */
+    @Transactional(rollbackFor = Exception.class, propagation = Propagation.REQUIRES_NEW)
+    public boolean markAcceptFailedIfRefunding(Long refundId, Long itemId, String failReason) {
+        return writeAcceptFailed(refundId, itemId, failReason);
+    }
+
+    private boolean writeAcceptFailed(Long refundId, Long itemId, String failReason) {
+        if (refundMapper.markFailed(refundId, null, trunc(failReason)) == 0) {
+            log.warn("[gz-jp-refund] 受理失败回写跳过：退款单已非 refunding（回调 / 补偿已抢先推进），商品行不动 "
+                + "refund_id={} item={} reason={}", refundId, itemId, failReason);
+            return false;
+        }
         itemMapper.writeRefundResult(itemId, GzJpRefundStatus.REFUND_FAILED.getCode(), null);
+        return true;
     }
 
     // ============================================================
