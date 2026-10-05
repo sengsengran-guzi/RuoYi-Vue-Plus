@@ -10,7 +10,12 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 微信支付通道 mock 实现（GZ-PAY-001 AC 9）。
@@ -73,6 +78,19 @@ public class MockWechatPayClient implements IWechatPayClient {
      * 驱动 service「受理失败 → gz_pay_refund=failed + transaction 回滚 paid」分支。默认 false（受理成功）。
      */
     private boolean refundAcceptFail = false;
+
+    /**
+     * mock 退款登记表（GZ-JP-111）：out_refund_no → 微信侧退款单状态。{@link #refund} 受理成功即登记为
+     * {@code PROCESSING}（与受理返回一致），{@link #queryRefund} 按它回答；没登记过的单 = 微信侧不存在（NOT_FOUND）。
+     * 单测 / dev 可用 {@link #setQueryRefundStatus} 改某张单的状态，模拟微信侧退款成功 / 异常 / 关闭。
+     */
+    private final Map<String, String> refundRegistry = new ConcurrentHashMap<>();
+
+    /**
+     * 测试可注入的退款查询失败开关（GZ-JP-111）。true → {@link #queryRefund} 抛异常模拟网络 / 微信 5xx，
+     * 驱动调用方「查不到就本轮跳过、绝不当成 NOT_FOUND 去补发」分支。默认 false。
+     */
+    private volatile boolean queryRefundFail = false;
 
     /** mock 反向打款单号前缀（GZ-PAY-105，便于 admin / 日志辨识非真实通道） */
     public static final String MOCK_PAYOUT_ID_PREFIX = "mock_payout_";
@@ -238,7 +256,59 @@ public class MockWechatPayClient implements IWechatPayClient {
             req.outTradeNo(), req.outRefundNo(), req.refundAmountCent(), refundId);
         String rawBody = "{\"out_refund_no\":\"" + req.outRefundNo() + "\",\"refund_id\":\"" + refundId
             + "\",\"status\":\"PROCESSING\"}";
+        // 登记进 mock 退款登记表（GZ-JP-111 queryRefund 据此回答）。同号重复受理 = 微信按 out_refund_no 幂等，
+        // 已有状态（如已被置为 SUCCESS）原样保留，不倒退回 PROCESSING。
+        refundRegistry.putIfAbsent(req.outRefundNo(), RefundQueryResult.PROCESSING);
         return new RefundResult(refundId, "PROCESSING", rawBody);
+    }
+
+    @Override
+    public RefundQueryResult queryRefund(String outRefundNo) {
+        if (queryRefundFail) {
+            throw new ServiceException("[gz-pay-mock] 模拟查询退款单失败 out_refund_no=" + outRefundNo);
+        }
+        String status = refundRegistry.get(outRefundNo);
+        if (status == null || RefundQueryResult.NOT_FOUND.equals(status)) {
+            log.info("[gz-pay-mock] queryRefund out_refund_no={} → NOT_FOUND（mock 登记表无此单）", outRefundNo);
+            return RefundQueryResult.notFound(outRefundNo,
+                "{\"code\":\"RESOURCE_NOT_EXISTS\",\"message\":\"退款单不存在\",\"source\":\"query\"}");
+        }
+        String refundId = "mock_refund_id_" + outRefundNo;
+        String successTime = RefundQueryResult.SUCCESS.equals(status)
+            ? OffsetDateTime.now().truncatedTo(ChronoUnit.SECONDS).format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+            : null;
+        String rawBody = "{\"out_refund_no\":\"" + outRefundNo + "\",\"refund_id\":\"" + refundId
+            + "\",\"status\":\"" + status + "\""
+            + (successTime == null ? "" : ",\"success_time\":\"" + successTime + "\"")
+            + ",\"source\":\"query\"}";
+        log.info("[gz-pay-mock] queryRefund out_refund_no={} → status={}", outRefundNo, status);
+        return new RefundQueryResult(outRefundNo, refundId, status, successTime, rawBody);
+    }
+
+    /**
+     * 单测 / dev 设定 mock 登记表里某张退款单的微信侧状态（GZ-JP-111）。
+     *
+     * <p>{@code SUCCESS} / {@code PROCESSING} / {@code ABNORMAL} / {@code CLOSED} 直接登记（没登记过的单也会被登记，
+     * 等价于「微信侧确有此单」）；{@code NOT_FOUND} 或 null = 从登记表移除（微信侧不存在）。</p>
+     *
+     * @param outRefundNo 商户退款单号
+     * @param status      微信侧退款单状态
+     */
+    public void setQueryRefundStatus(String outRefundNo, String status) {
+        if (status == null || RefundQueryResult.NOT_FOUND.equals(status)) {
+            refundRegistry.remove(outRefundNo);
+        } else {
+            refundRegistry.put(outRefundNo, status);
+        }
+    }
+
+    /**
+     * 单测注入退款查询失败（GZ-JP-111：true → queryRefund 抛异常）。
+     *
+     * @param fail true = 模拟查询失败
+     */
+    public void setQueryRefundFail(boolean fail) {
+        this.queryRefundFail = fail;
     }
 
     @Override

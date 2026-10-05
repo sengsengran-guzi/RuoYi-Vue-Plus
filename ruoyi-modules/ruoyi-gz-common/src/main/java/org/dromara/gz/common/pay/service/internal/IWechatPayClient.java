@@ -135,6 +135,24 @@ public interface IWechatPayClient {
     RefundCallbackResult parseAndVerifyRefundNotify(NotifyContext ctx);
 
     /**
+     * 按商户退款单号查询单笔退款（GZ-JP-111，FLOW:F-JP-10.step2）。
+     *
+     * <p>对应微信 V3 {@code GET /v3/refund/domestic/refunds/{out_refund_no}}。用于退款单长时间停在「退款中」、
+     * 一直等不到退款回调时，主动核对微信侧真实状态再决定补偿动作（落账 / 落失败 / 同号补发）。</p>
+     *
+     * <p><b>微信侧没有这张退款单</b>（HTTP 404 {@code RESOURCE_NOT_EXISTS}，典型是「本地建了退款单、还没提交给微信进程就挂了」）
+     * <b>不抛异常</b>，返回 {@link RefundQueryResult#NOT_FOUND} —— 调用方据此用<b>同一个</b> out_refund_no 补发。
+     * 其余错误（网络 / 鉴权 / 5xx）照常抛出，由调用方本轮跳过、下轮再查，绝不能当成 NOT_FOUND 去补发。</p>
+     *
+     * <p>real 用 SDK {@code RefundService.queryByOutRefundNo}；mock（{@link MockWechatPayClient}）按 mock 退款登记表返回
+     * （{@link #refund} 受理过的单登记在表里，没登记过的返回 NOT_FOUND）。</p>
+     *
+     * @param outRefundNo 商户退款单号（= 本地 refund_no）
+     * @return 查询结果，永不为 null
+     */
+    RefundQueryResult queryRefund(String outRefundNo);
+
+    /**
      * 反向打款：商家转账到用户零钱（GZ-PAY-105，ADR-0006，doc/10 §14 / doc/11 §4.8）。
      *
      * <p>对应微信 V3「商家转账」（{@code POST /v3/transfer/batches}，平台 → 用户零钱）。承载回收返现等
@@ -252,6 +270,44 @@ public interface IWechatPayClient {
      */
     record RefundCallbackResult(String refundId, String outRefundNo, String outTradeNo,
                                 String refundStatus, String decryptedBody) {
+    }
+
+    /**
+     * 单笔退款查询结果（GZ-JP-111，{@link #queryRefund}）。
+     *
+     * <p>{@code status} 取值：微信 V3 退款单状态 {@link #SUCCESS} / {@link #PROCESSING} / {@link #ABNORMAL} /
+     * {@link #CLOSED}，外加本系统归一的 {@link #NOT_FOUND}（微信侧不存在这张退款单）。</p>
+     *
+     * @param outRefundNo 商户退款单号
+     * @param refundId    微信退款单号（NOT_FOUND 时为 null）
+     * @param status      退款单状态
+     * @param successTime 退款成功时间（微信原样字符串，仅 SUCCESS 有值）
+     * @param rawBody     查询返回原始报文（入审计；NOT_FOUND 时为微信错误报文）
+     */
+    record RefundQueryResult(String outRefundNo, String refundId, String status, String successTime,
+                             String rawBody) {
+
+        /** 退款成功 */
+        public static final String SUCCESS = "SUCCESS";
+        /** 退款处理中 */
+        public static final String PROCESSING = "PROCESSING";
+        /** 退款异常（如用户卡已销户，需商户人工处理） */
+        public static final String ABNORMAL = "ABNORMAL";
+        /** 退款关闭 */
+        public static final String CLOSED = "CLOSED";
+        /** 微信侧不存在这张退款单（本系统归一值，微信原文为 HTTP 404 RESOURCE_NOT_EXISTS） */
+        public static final String NOT_FOUND = "NOT_FOUND";
+
+        /**
+         * 构造「微信侧没有这张退款单」的结果。
+         *
+         * @param outRefundNo 商户退款单号
+         * @param rawBody     微信错误报文（可空）
+         * @return status = NOT_FOUND 的结果
+         */
+        public static RefundQueryResult notFound(String outRefundNo, String rawBody) {
+            return new RefundQueryResult(outRefundNo, null, NOT_FOUND, null, rawBody);
+        }
     }
 
     /**

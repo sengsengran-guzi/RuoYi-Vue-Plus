@@ -18,6 +18,7 @@ import org.dromara.gz.common.pay.service.IGzPayShippingService;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.NotifyContext;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.RefundCallbackResult;
+import org.dromara.gz.common.pay.service.internal.IWechatPayClient.RefundQueryResult;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.RefundRequest;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.RefundResult;
 import org.dromara.gz.common.service.IGzUserService;
@@ -74,10 +75,12 @@ import java.util.Set;
  *   回调事务 handleRefundNotify：锁退款单 → 守卫 UPDATE → 行落已退金额 → 订单 rollup
  * </pre>
  *
- * <p><b>崩溃窗口与兜底</b>：事务①提交后、调微信前进程挂掉，会留下一张永远停在 {@code refunding} 的
- * 退款单（钱没退出去）。本项目 <b>prod 未部署 SnailJob</b>（25 个 @JobExecutor 一个都没跑），
- * 自动补偿任务写了也不会执行 —— 所以兜底做成<b>人可操作的</b>：退款单列表把失败与长时间未回调的单
- * 排在最前，admin 点「重新发起」即可（{@link #retry} 对超过静默期的 {@code refunding} 也放行）。</p>
+ * <p><b>崩溃窗口与兜底</b>：事务①提交后、调微信前进程挂掉，会留下一张停在 {@code refunding} 的
+ * 退款单（钱没退出去）；回调丢失也会让单停在 {@code refunding}。两层兜底：
+ * ① 自动 —— 退款补偿调度（{@code GzJpRefundCompensateJob}，由 {@code GzLocalJpScheduler} 的 Spring
+ * {@code @Scheduled} 触发，不依赖 SnailJob）每 5 分钟扫超过静默期的 {@code refunding} 单，
+ * 查微信退款单后走 {@link #compensateStaleRefund}；② 人工 —— 退款单列表把失败与长时间未回调的单排在最前，
+ * admin 点「重新发起」（{@link #retry} 对超过静默期的 {@code refunding} 也放行）。</p>
  *
  * @author kevin-coder (sensenran-guzi · GZ-JP-107)
  */
@@ -104,12 +107,13 @@ public class GzJpRefundServiceImpl implements IGzJpRefundService {
     private static final String CB_FAILED = "failed";
 
     /**
-     * {@code refunding} 静默期：超过这么久还没等到回调，才允许 admin 重新发起。
+     * {@code refunding} 静默期：超过这么久还没等到回调，才允许 admin 重新发起（与退款补偿调度同一口径，
+     * 定义见 {@link IGzJpRefundService#REFUNDING_SILENCE}）。
      *
      * <p>太短会让店员在回调正常在途时狂点（微信按 out_refund_no 幂等，不会重复扣款，但会刷日志）；
-     * 太长则崩溃窗口里那张单要等很久才能救。微信退款通常几分钟内回调，10 分钟足够区分。</p>
+     * 太长则崩溃窗口里那张单要等很久才能救。</p>
      */
-    private static final Duration REFUNDING_SILENCE = Duration.ofMinutes(10);
+    private static final Duration REFUNDING_SILENCE = IGzJpRefundService.REFUNDING_SILENCE;
 
     private final GzJpRefundTxService txService;
     private final GzJpRefundMapper refundMapper;
@@ -449,6 +453,108 @@ public class GzJpRefundServiceImpl implements IGzJpRefundService {
             throw new ServiceException("重新发起退款失败：" + msg);
         }
         return toAdminVO(toRow(refundMapper.selectById(refundId)), Collections.emptyMap());
+    }
+
+    // ============================================================
+    //  卡单补偿（GZ-JP-111，FLOW:F-JP-10.step2）
+    // ============================================================
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p><b>本方法刻意不加 {@code @Transactional}</b>：查单 / 补发是外部调用，不能夹在 DB 事务里占连接、占锁；
+     * 写库全部走 {@link GzJpRefundTxService} 的独立事务段（与回调、admin 重试同一组方法）。</p>
+     */
+    @Override
+    public CompensateOutcome compensateStaleRefund(GzJpRefund refund) {
+        if (refund == null || refund.getId() == null || StrUtil.isBlank(refund.getRefundNo())) {
+            return CompensateOutcome.SKIPPED;
+        }
+        // 查单失败直接抛给调度：本轮跳过、下轮再查（不能当成 NOT_FOUND 去补发）
+        RefundQueryResult q = wechatPayClient.queryRefund(refund.getRefundNo());
+        String status = q == null ? null : q.status();
+
+        if (RefundQueryResult.SUCCESS.equals(status)) {
+            // ★ 与退款回调同一个落账方法：WHERE status='refunding' 守卫，回调先到则 affected=0 → 不写行、不 rollup
+            boolean moved = txService.applyRefundSuccess(refund, q.refundId());
+            if (!moved) {
+                writeCallbackLog(refund.getOutTradeNo(), q.rawBody(), null, CB_DUPLICATED,
+                    "查单补偿：微信已退款成功，但退款单已被回调抢先落账（affected=0），跳过");
+                log.info("[gz-jp-refund] 查单补偿：退款单已被抢先落账，跳过 refund_no={}", refund.getRefundNo());
+                return CompensateOutcome.ALREADY_SETTLED;
+            }
+            writeCallbackLog(refund.getOutTradeNo(), q.rawBody(), null, CB_PROCESSED,
+                "查单补偿：未等到退款回调，按查单结果 SUCCESS 落账");
+            log.warn("[gz-jp-refund] 查单补偿：退款已成功但回调没到，已补落账 refund_no={} item={} amount={}分 "
+                    + "wechat_refund_id={} success_time={}",
+                refund.getRefundNo(), refund.getOrderItemId(), refund.getRefundAmountCent(), q.refundId(),
+                q.successTime());
+            return CompensateOutcome.SETTLED;
+        }
+
+        if (RefundQueryResult.ABNORMAL.equals(status) || RefundQueryResult.CLOSED.equals(status)) {
+            String reason = "查单补偿：微信退款单 status=" + status;
+            boolean moved = txService.applyRefundFailure(refund, q.refundId(), reason);
+            writeCallbackLog(refund.getOutTradeNo(), q.rawBody(), null, moved ? CB_PROCESSED : CB_DUPLICATED,
+                moved ? reason + "，已标 refund_failed 留人工介入" : reason + "，退款单已被抢先推进（affected=0），跳过");
+            if (moved) {
+                log.error("[gz-jp-refund] 查单补偿：退款失败（{}）refund_no={} item={} —— 留 admin 重新发起",
+                    status, refund.getRefundNo(), refund.getOrderItemId());
+                return CompensateOutcome.MARKED_FAILED;
+            }
+            return CompensateOutcome.ALREADY_SETTLED;
+        }
+
+        if (RefundQueryResult.NOT_FOUND.equals(status)) {
+            return resendSameRefundNo(refund);
+        }
+
+        if (RefundQueryResult.PROCESSING.equals(status)) {
+            log.info("[gz-jp-refund] 查单补偿：微信仍在处理 refund_no={}，本轮不动", refund.getRefundNo());
+            return CompensateOutcome.PROCESSING;
+        }
+
+        log.error("[gz-jp-refund] 查单补偿：无法识别的微信退款单状态 status={} refund_no={}，本轮不动",
+            status, refund.getRefundNo());
+        return CompensateOutcome.SKIPPED;
+    }
+
+    /**
+     * 微信侧没有这张退款单 → 用<b>同一个</b> {@code refund_no} 补发（与 {@link #retry} 同一套调用与落库）。
+     *
+     * <p>★ 绝不换号：微信按 {@code out_refund_no} 幂等，同号重复提交不会退第二次；换号则是一张新退款，会双退。</p>
+     */
+    private CompensateOutcome resendSameRefundNo(GzJpRefund stale) {
+        // 查单到这里之间 admin 可能已手工重新发起 / 状态已变 —— 以库里当下为准
+        GzJpRefund refund = refundMapper.selectById(stale.getId());
+        if (refund == null || !GzJpRefundStatus.REFUNDING.getCode().equals(refund.getStatus())) {
+            log.info("[gz-jp-refund] 查单补偿：补发前退款单已不在退款中 refund_no={} status={}，跳过",
+                stale.getRefundNo(), refund == null ? null : refund.getStatus());
+            return CompensateOutcome.ALREADY_SETTLED;
+        }
+        String notifyUrl = resolveRefundNotifyUrl();
+        try {
+            RefundResult result = wechatPayClient.refund(new RefundRequest(
+                refund.getOutTradeNo(),
+                refund.getRefundNo(),
+                refund.getRefundAmountCent(),
+                refund.getTotalAmountCent(),
+                refund.getReason(),
+                notifyUrl));
+            // attempt_count + 1，并刷新 update_time —— 下一次查单要再等一个静默期
+            txService.markAccepted(refund.getId(), result.refundId());
+            log.warn("[gz-jp-refund] 查单补偿：微信侧无此退款单，已用同一 refund_no 补发 refund_no={} item={} "
+                    + "amount={}分 attempt={} wechat_refund_id={}",
+                refund.getRefundNo(), refund.getOrderItemId(), refund.getRefundAmountCent(),
+                refund.getAttemptCount() == null ? 1 : refund.getAttemptCount() + 1, result.refundId());
+            return CompensateOutcome.RESENT;
+        } catch (Exception e) {
+            String msg = StrUtil.blankToDefault(e.getMessage(), e.getClass().getSimpleName());
+            txService.markAcceptFailed(refund.getId(), refund.getOrderItemId(), "查单补偿补发失败：" + msg);
+            log.error("[gz-jp-refund] 查单补偿：补发仍失败，已落 refund_failed 留 admin 处理 refund_no={}: {}",
+                refund.getRefundNo(), msg, e);
+            return CompensateOutcome.RESEND_FAILED;
+        }
     }
 
     // ============================================================

@@ -23,14 +23,17 @@ import org.mockito.Mockito;
 import org.springframework.dao.DuplicateKeyException;
 
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 
 /**
@@ -79,7 +82,8 @@ class GzJpRefundFixture {
 
     final WechatPayProperties payProperties = new WechatPayProperties();
     final GzJpPayProperties jpPayProperties = new GzJpPayProperties();
-    final MockWechatPayClient payClient = new MockWechatPayClient(new WechatPayProperties());
+    /** spy：GZ-JP-111 补偿单测要断言「补发用的是哪个 out_refund_no / 有没有补发」；行为与真 mock 通道完全一致 */
+    final MockWechatPayClient payClient = Mockito.spy(new MockWechatPayClient(new WechatPayProperties()));
 
     final GzJpRefundTxService txService;
     final GzJpRefundServiceImpl service;
@@ -347,6 +351,10 @@ class GzJpRefundFixture {
                 throw new DuplicateKeyException("Duplicate entry for key 'uk_refund_no'");
             }
             r.setId(refundIdSeq.incrementAndGet());
+            // InjectionMetaObjectHandler.insertFill 同时填 create_time / update_time
+            Date now = new Date();
+            r.setCreateTime(now);
+            r.setUpdateTime(now);
             refunds.put(r.getId(), r);
             return 1;
         });
@@ -386,6 +394,24 @@ class GzJpRefundFixture {
 
         Mockito.when(refundMapper.selectMaxDailySeq(any())).thenReturn(0L);
 
+        // GZ-JP-111：status='refunding' AND COALESCE(update_time, create_time) < deadline ORDER BY id LIMIT n
+        Mockito.when(refundMapper.selectStaleRefunding(any(), anyInt())).thenAnswer(inv -> {
+            LocalDateTime deadline = inv.getArgument(0);
+            int limit = inv.getArgument(1);
+            List<GzJpRefund> out = new ArrayList<>();
+            for (GzJpRefund r : refunds.values()) {
+                if (!"0".equals(r.getDelFlag()) || !GzJpRefundStatus.REFUNDING.getCode().equals(r.getStatus())) {
+                    continue;
+                }
+                Date touched = r.getUpdateTime() != null ? r.getUpdateTime() : r.getCreateTime();
+                if (touched != null && toLocal(touched).isBefore(deadline)) {
+                    out.add(r);
+                }
+            }
+            out.sort(java.util.Comparator.comparing(GzJpRefund::getId));
+            return out.size() > limit ? out.subList(0, limit) : out;
+        });
+
         // WHERE status='refunding' 守卫（幂等的落点）
         Mockito.when(refundMapper.markAccepted(anyLong(), any())).thenAnswer(inv -> {
             GzJpRefund r = guarded(inv.getArgument(0), GzJpRefundStatus.REFUNDING.getCode());
@@ -395,6 +421,7 @@ class GzJpRefundFixture {
             r.setWechatRefundId(inv.getArgument(1));
             r.setAttemptCount(r.getAttemptCount() + 1);
             r.setVersion(r.getVersion() + 1);
+            r.setUpdateTime(new Date());
             return 1;
         });
 
@@ -409,6 +436,7 @@ class GzJpRefundFixture {
                 r.setWechatRefundId(inv.getArgument(1));
             }
             r.setVersion(r.getVersion() + 1);
+            r.setUpdateTime(new Date());
             return 1;
         });
 
@@ -424,6 +452,7 @@ class GzJpRefundFixture {
                 r.setWechatRefundId(inv.getArgument(1));
             }
             r.setVersion(r.getVersion() + 1);
+            r.setUpdateTime(new Date());
             return 1;
         });
 
@@ -436,8 +465,19 @@ class GzJpRefundFixture {
             r.setFailReason(null);
             r.setTriggeredTime(LocalDateTime.now());
             r.setVersion(r.getVersion() + 1);
+            r.setUpdateTime(new Date());
             return 1;
         });
+    }
+
+    /** 把退款单的 update_time 拨回 {@code minutesAgo} 分钟前（模拟「卡住」—— 静默期判定按 update_time） */
+    void ageRefund(GzJpRefund refund, long minutesAgo) {
+        refund.setUpdateTime(Date.from(LocalDateTime.now().minusMinutes(minutesAgo)
+            .atZone(ZoneId.systemDefault()).toInstant()));
+    }
+
+    private static LocalDateTime toLocal(Date d) {
+        return LocalDateTime.ofInstant(d.toInstant(), ZoneId.systemDefault());
     }
 
     private GzJpRefund guarded(Long id, String expectStatus) {

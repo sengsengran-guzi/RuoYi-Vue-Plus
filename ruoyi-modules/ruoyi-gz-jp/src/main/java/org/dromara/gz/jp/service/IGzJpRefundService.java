@@ -5,8 +5,11 @@ import org.dromara.common.mybatis.core.page.TableDataInfo;
 import org.dromara.gz.common.pay.service.internal.IWechatPayClient.NotifyContext;
 import org.dromara.gz.jp.domain.bo.GzJpMarkFailedBo;
 import org.dromara.gz.jp.domain.bo.GzJpRefundQueryBo;
+import org.dromara.gz.jp.domain.entity.GzJpRefund;
 import org.dromara.gz.jp.domain.vo.GzJpMarkFailedResultVO;
 import org.dromara.gz.jp.domain.vo.GzJpRefundAdminVO;
+
+import java.time.Duration;
 
 /**
  * 拼团<b>行级退款</b>服务（GZ-JP-107，FLOW:F-JP-04，ADR-0020 §3）。
@@ -111,4 +114,53 @@ public interface IGzJpRefundService {
      * @param outTradeNo 原业务支付订单号（日志溯源用）
      */
     void onFullRefundedByPayDomain(String orderNo, String outTradeNo);
+
+    /**
+     * {@code refunding} 静默期：超过这么久还没等到回调，admin 才能「重新发起」（{@link #retry}），
+     * 退款补偿调度（GZ-JP-111）也才会去查单补偿。两处同一口径。
+     *
+     * <p>微信退款通常几分钟内回调，10 分钟足够区分「回调在途」与「卡住了」。</p>
+     */
+    Duration REFUNDING_SILENCE = Duration.ofMinutes(10);
+
+    /**
+     * 补偿一张卡在 {@code refunding} 的退款单（GZ-JP-111，FLOW:F-JP-10.step2，REQ-FULFILL-008）。
+     *
+     * <p>先按 {@code refund_no} 查微信退款单（事务外），再按结果：</p>
+     * <ul>
+     *   <li>{@code SUCCESS} → 调<b>与退款回调同一个</b>落账方法（{@code GzJpRefundTxService.applyRefundSuccess}，
+     *       WHERE 状态守卫幂等：回调先到则 affected=0 跳过，不重复写行、不重复 rollup）；</li>
+     *   <li>{@code ABNORMAL} / {@code CLOSED} → 与回调同一个失败方法，落 {@code refund_failed} + {@code fail_reason}；</li>
+     *   <li>{@code NOT_FOUND}（微信侧没有这张单 —— 典型是建单后、提交微信前进程挂了）→ 用<b>同一个</b>
+     *       {@code refund_no} 补发（微信按 out_refund_no 幂等，换号会双退），受理成功 {@code attempt_count+1}；</li>
+     *   <li>{@code PROCESSING} → 不动，等回调或下一轮。</li>
+     * </ul>
+     * <p>不区分 {@code refund_type}：两种退款单都走这里，类型分支在落账方法里。</p>
+     *
+     * @param refund 扫描到的 refunding 退款单
+     * @return 本单补偿结果
+     * @throws RuntimeException 查单失败（网络 / 微信 5xx 等）原样抛出 —— 调用方本轮跳过、下轮再查，
+     *                          绝不能当成「微信没这单」去补发
+     */
+    CompensateOutcome compensateStaleRefund(GzJpRefund refund);
+
+    /**
+     * 单张退款单的补偿结果（{@link #compensateStaleRefund}）。
+     */
+    enum CompensateOutcome {
+        /** 微信已退成功，本次补落账（退款单 refunded + 行 + 订单 rollup） */
+        SETTLED,
+        /** 微信已有终态，但本地已被回调 / 其他路径抢先推进（affected=0），什么都没写 */
+        ALREADY_SETTLED,
+        /** 微信退款异常 / 关闭，本次落 refund_failed */
+        MARKED_FAILED,
+        /** 微信侧没有这张单，已用同一 refund_no 补发并受理成功 */
+        RESENT,
+        /** 微信侧没有这张单，补发受理失败，已落 refund_failed 留 admin 处理 */
+        RESEND_FAILED,
+        /** 微信仍在处理中，不动 */
+        PROCESSING,
+        /** 微信返回了无法识别的状态，不动（ERROR 日志） */
+        SKIPPED
+    }
 }
