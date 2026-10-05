@@ -23,4 +23,7 @@ public class GzPayTransactionQueryBo implements Serializable {
 
     /** 微信交易号（精确） */
     private String transactionId;
+
+    /** 只看迟到付款（GZ-PAY-106：callback_log 有 late_paid 记录的单） */
+    private Boolean latePaid;
 }

@@ -57,4 +57,14 @@ public final class GzJpOrderErrorCode {
      */
     public static final int DUPLICATE_SUBMIT = 4107;
     public static final String DUPLICATE_SUBMIT_MSG = "订单已提交，请勿重复下单（可在「我的订单」查看）";
+
+    /**
+     * 订单行来源与商品外键不一致（GZ-SNAP-102，{@code GzJpOrderItemSourceInvariant}）。
+     *
+     * <p>这是<b>程序错误</b>而不是客人操作错误：{@code source=batch} 必须挂拼团商品、{@code source=snap}
+     * 必须挂代切商品，两个外键互斥。真触发说明某条写路径装配错了，整单回滚、不落半截数据。
+     * 码段沿用 jp 域 41xx（4108-4115 已被 106 / 107 占用）。</p>
+     */
+    public static final int ITEM_SOURCE_INVALID = 4116;
+    public static final String ITEM_SOURCE_INVALID_MSG = "订单商品数据异常，请联系客服";
 }

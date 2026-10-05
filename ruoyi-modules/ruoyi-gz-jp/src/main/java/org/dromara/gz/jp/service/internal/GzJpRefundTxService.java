@@ -15,6 +15,7 @@ import org.dromara.gz.jp.domain.enums.GzJpFulfillStatus;
 import org.dromara.gz.jp.domain.enums.GzJpOrderStatus;
 import org.dromara.gz.jp.domain.enums.GzJpRefundSkipReason;
 import org.dromara.gz.jp.domain.enums.GzJpRefundStatus;
+import org.dromara.gz.jp.domain.enums.GzJpRefundType;
 import org.dromara.gz.jp.exception.GzJpRefundErrorCode;
 import org.dromara.gz.jp.mapper.GzJpOrderItemMapper;
 import org.dromara.gz.jp.mapper.GzJpOrderMapper;
@@ -85,7 +86,7 @@ public class GzJpRefundTxService {
      * <p><b>「已是 purchase_failed」不是拒绝而是补退款候选</b>：106 的 {@code /advance} 端点本来就允许
      * 把行推成 {@code purchase_failed}（不带退款）。若这里也一律拒掉，那些行的钱<b>永远退不出去</b>、
      * 且没有任何入口能补 —— 所以它们进「补建退款单」分支，靠
-     * {@code UNIQUE(tenant_id, order_item_id)} 保证不会退第二次。</p>
+     * {@code UNIQUE(tenant_id, order_item_id, refund_type)}（uk_item_type）保证不会退第二次。</p>
      *
      * @param ids        已去重升序的行 id
      * @param reason     退款原因（空则取默认）
@@ -240,6 +241,8 @@ public class GzJpRefundTxService {
                 .refundNo(refundNoGenerator.generate())
                 .orderId(order.getId())
                 .orderItemId(itemId)
+                // 购买失败全额退；显式赋值不靠列默认（到付运费差价 shipping_diff 走另一条路径，GZ-SNAP-306）
+                .refundType(GzJpRefundType.PURCHASE_FAILED.getCode())
                 .userId(row.getUserId())
                 .outTradeNo(txn == null ? order.getOrderNo() : txn.getOutTradeNo())
                 .payTransactionId(txn == null ? null : txn.getId())
@@ -258,7 +261,7 @@ public class GzJpRefundTxService {
             try {
                 refundMapper.insert(refund);
             } catch (DuplicateKeyException e) {
-                // 撞 uk_order_item = 并发的另一个请求刚为这一行建了退款单 → 幂等跳过（DB 层保证不重复退款）
+                // 撞 uk_item_type = 并发的另一个请求刚为这一行建了同类型退款单 → 幂等跳过（DB 层保证不重复退款）
                 // 撞 uk_refund_no  = Redis 号段落后 DB → 自愈后由调用方重试（本次这一行跳过，不重复扣款）
                 refundNoGenerator.reconcileToDbMax();
                 GzJpRefund concurrent = refundMapper.selectByOrderItemIds(List.of(itemId))
@@ -311,14 +314,41 @@ public class GzJpRefundTxService {
      * <p><b>REQUIRES_NEW</b>：调用方此时不在事务里（事务①已提交），但显式声明避免将来被人包进外层事务后，
      * 失败记录跟着一起回滚 —— 那正是本类拆分要防的事。</p>
      *
+     * <p><b>商品行只跟着退款单走</b>：{@code markFailed} 带 {@code status='refunding'} 守卫，affected=0 说明
+     * 调微信这段时间里退款回调（或查单补偿）已经把退款单推成了终态（典型：微信其实受理了，只是应答超时抛错）。
+     * 此时<b>不写商品行</b> —— 否则已退款成功的行会被改回 {@code refund_failed}，与退款单 / 订单 rollup 对不上。</p>
+     *
      * @param refundId   退款单 id
      * @param itemId     商品行 id
      * @param failReason 失败原因（本方法内截断）
      */
     @Transactional(rollbackFor = Exception.class, propagation = Propagation.REQUIRES_NEW)
     public void markAcceptFailed(Long refundId, Long itemId, String failReason) {
-        refundMapper.markFailed(refundId, null, trunc(failReason));
+        writeAcceptFailed(refundId, itemId, failReason);
+    }
+
+    /**
+     * 同 {@link #markAcceptFailed}，但把「本次是否真的落了 refund_failed」告诉调用方（查单补偿据此区分
+     * 「补发失败」与「已被回调抢先落账」）。
+     *
+     * @param refundId   退款单 id
+     * @param itemId     商品行 id
+     * @param failReason 失败原因（本方法内截断）
+     * @return true = 退款单 refunding → refund_failed 且商品行已同步；false = 退款单已非 refunding，什么都没写
+     */
+    @Transactional(rollbackFor = Exception.class, propagation = Propagation.REQUIRES_NEW)
+    public boolean markAcceptFailedIfRefunding(Long refundId, Long itemId, String failReason) {
+        return writeAcceptFailed(refundId, itemId, failReason);
+    }
+
+    private boolean writeAcceptFailed(Long refundId, Long itemId, String failReason) {
+        if (refundMapper.markFailed(refundId, null, trunc(failReason)) == 0) {
+            log.warn("[gz-jp-refund] 受理失败回写跳过：退款单已非 refunding（回调 / 补偿已抢先推进），商品行不动 "
+                + "refund_id={} item={} reason={}", refundId, itemId, failReason);
+            return false;
+        }
         itemMapper.writeRefundResult(itemId, GzJpRefundStatus.REFUND_FAILED.getCode(), null);
+        return true;
     }
 
     // ============================================================

@@ -70,4 +70,10 @@ public class GzPayTransactionVO implements Serializable {
     private LocalDateTime createTime;
 
     private String remark;
+
+    /**
+     * 迟到付款标记（GZ-PAY-106，非表字段）：微信已扣款但本地已 timeout / closed，业务未生效，
+     * 需在商户平台人工原路退款或补单。仅列表接口填充。
+     */
+    private Boolean latePaid;
 }

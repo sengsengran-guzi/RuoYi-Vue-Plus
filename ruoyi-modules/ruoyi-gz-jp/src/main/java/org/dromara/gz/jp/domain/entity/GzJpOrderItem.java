@@ -37,7 +37,7 @@ import java.time.LocalDateTime;
  * <p><b>⚠️ @Version 实体</b>：insert 后再 updateById 补字段会静默不落库 —— 一次性配齐再 insert
  * （详见 {@link GzJpOrder} 类注释）。</p>
  *
- * @author kevin-coder (sensenran-guzi · GZ-JP-105)
+ * @author kevin-coder (sensenran-guzi · GZ-JP-105 / GZ-SNAP-102)
  */
 @Data
 @Builder
@@ -66,11 +66,23 @@ public class GzJpOrderItem extends TenantEntity {
      */
     private Long userId;
 
-    /** 商品 FK→gz_jp_product.id */
+    /**
+     * 拼团商品 FK→gz_jp_product.id。
+     *
+     * <p>★ 二期起<b>可空</b>（ADR-0025 §5）：{@code source=batch} 必填、{@code source=snap} 恒空。
+     * 读侧凡是用它的地方都要容忍 null（展示信息一律读快照，不回查商品表）。</p>
+     */
     private Long productId;
 
     /**
-     * 下单时商品快照 JSON（见 {@code JpOrderSnapshot.Product}）。
+     * 代切商品 FK→gz_jp_snap_item.id（二期新增）：{@code source=snap} 必填、{@code source=batch} 恒空。
+     *
+     * <p>与 {@link #productId} 的互斥由 {@code GzJpOrderItemSourceInvariant} 在写入口统一校验。</p>
+     */
+    private Long snapItemId;
+
+    /**
+     * 下单时商品快照 JSON（见 {@code JpOrderSnapshot.Product}；{@code source=snap} 时另含 {@code snap} 段）。
      *
      * <p>★ 快照的是<b>下单这一刻</b>的商品，不是加购那一刻 —— 购物车不存价格、不做价格承诺。
      * 商品改名 / 改价 / 下架 / 删除后，已下单的行照常显示当时的样子。</p>
@@ -86,7 +98,7 @@ public class GzJpOrderItem extends TenantEntity {
     /** 行金额（分）= unitPriceCent × qty。★ 行级退款按此金额退 */
     private Long amountCent;
 
-    /** 来源（字典 gz_jp_item_source）：一期恒 {@code batch}；二期代切加 {@code snap} */
+    /** 来源（字典 gz_jp_item_source，见 {@code GzJpItemSource}）：{@code batch} 拼团 / {@code snap} 代切 */
     private String source;
 
     /** 履约状态（字典 gz_jp_fulfill_status，见 {@code GzJpFulfillStatus}）；状态机归 GZ-JP-106 */

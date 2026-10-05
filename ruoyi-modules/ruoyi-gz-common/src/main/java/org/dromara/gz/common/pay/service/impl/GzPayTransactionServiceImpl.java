@@ -40,7 +40,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * 支付订单服务实现（GZ-PAY-001）。
@@ -68,6 +72,11 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
     private static final String CB_PROCESSED = "processed";
     private static final String CB_DUPLICATED = "duplicated";
     private static final String CB_FAILED = "failed";
+    /**
+     * 迟到付款（GZ-PAY-106，FLOW:F-JP-06.step4b）：微信说已付款，本地支付单已是 timeout / closed。
+     * 不推进 paid、不分发业务，留人工在商户平台原路退款或补单；admin 支付流水据此筛「迟到付款」。
+     */
+    public static final String CB_LATE_PAID = "late_paid";
 
     /** 测试单有效期（doc/10 §2.E5：5 min 未回调 → timeout） */
     private static final int EXPIRE_MINUTES = 5;
@@ -147,10 +156,12 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
         GzPayTransaction tx = createCreatedTransaction(businessType, businessOrderNo, amountCent, openid, userId);
 
         // ② 调通道统一下单拿 prepay_id（mock 返回固定值 / real 调微信）
+        //    GZ-PAY-106：带 time_expire = 本地 expire_time，到点后微信侧拒绝付款（REQ-ORDER-012）
         String prepayId;
         try {
             prepayId = wechatPayClient.createJsapiOrder(
-                new UnifiedOrderRequest(tx.getOutTradeNo(), amountCent, openid, description, appid));
+                new UnifiedOrderRequest(tx.getOutTradeNo(), amountCent, openid, description, appid,
+                    tx.getExpireTime().atZone(ZoneId.systemDefault()).toOffsetDateTime()));
         } catch (Exception e) {
             // 通道失败 → 标 failed（doc/10 §2 通道失败态）
             tx.setStatus(PayStatus.FAILED);
@@ -199,7 +210,8 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
                 .currency("CNY")
                 // fee_cent 留 NULL（强约束 #7：PAY-104 拉 fundflowbill 回写）
                 .status(PayStatus.CREATED)
-                .expireTime(now.plusMinutes(EXPIRE_MINUTES))
+                // 秒精度：与下单请求里的 time_expire（微信只认到秒）逐字相等（GZ-PAY-106）
+                .expireTime(now.plusMinutes(EXPIRE_MINUTES).truncatedTo(ChronoUnit.SECONDS))
                 .version(0)
                 .build();
             try {
@@ -254,6 +266,15 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
             return true;
         }
 
+        // ③' 迟到付款（GZ-PAY-106）：本地已 timeout / closed 但微信扣款成功 —— 不再当重复吞掉，
+        //     也不推进 paid / 不分发业务（业务单可能已关、商品锁可能已给别人）。记 late_paid 留人工处理；
+        //     返回 true 应答微信（已如实记录，重推只会重复告警）。
+        if (isLatePaidStatus(tx.getStatus())) {
+            recordLatePaid(tx, result.transactionId(), result.payerTotal(), result.decryptedBody(),
+                ctx.signature(), "回调");
+            return true;
+        }
+
         // ④⑤⑥ 走幂等补单单点（markPaid 乐观锁 → SPI 分发 → callback_log）。
         //      与 PAY-102 主动查单补单共用同一段代码（强约束 #1 单点维护），来源不同仅 raw_body / signature 区分。
         applyPaid(tx, result.transactionId(), result.feeCent(), result.outTradeNo(),
@@ -284,6 +305,16 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
         LocalDateTime paidTime = LocalDateTime.now();
         int affected = transactionMapper.markPaid(tx.getId(), tx.getVersion(), transactionId, feeCent, paidTime);
         if (affected == 0) {
+            // GZ-PAY-106：回调读到 pending 后、markPaid 前被超时任务抢先标了 timeout → 这是迟到付款不是重复，
+            //   不能记 duplicated 吞掉。重读一次最新状态区分两者。
+            //   ★ 必须是当前读（FOR UPDATE）：回调路径前面那次 selectByOutTradeNo 已在本事务里建好 RR 快照，
+            //   普通 SELECT 重读仍返回快照里的 pending，超时任务已提交的 timeout 看不见 → 又落回 duplicated。
+            //   markPaid 这条 UPDATE 已对该行加了 X 锁，这里再锁同一行不会新增等待。
+            GzPayTransaction latest = transactionMapper.selectByIdForUpdate(tx.getId());
+            if (latest != null && isLatePaidStatus(latest.getStatus())) {
+                recordLatePaid(latest, transactionId, null, rawBody, signature, "并发超时");
+                return false;
+            }
             // 并发回调 / 查单已抢先推进 / version 漂移 → 视为重复（不重复分发 SPI handler，AC 5/6 第二道防线）
             writeCallbackLog(transactionId, outTradeNo, rawBody, signature,
                 CB_DUPLICATED, "乐观锁冲突（affected=0），并发已处理");
@@ -331,7 +362,12 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
             log.warn("[gz-pay] 查单补单订单不存在 id={}", txId);
             return ReconcileOutcome.SKIPPED_NOT_FOUND;
         }
-        // 已终态（paid / refunding / refunded / closed / timeout / failed）→ 不二次推进、不二次 dispatch（AC 5 幂等）
+        // GZ-PAY-106：微信查单 SUCCESS 但本地已 timeout / closed → 迟到付款，记 late_paid，不推进、不分发
+        if (isLatePaidStatus(tx.getStatus())) {
+            recordLatePaid(tx, transactionId, null, rawBody, null, "查单");
+            return ReconcileOutcome.LATE_PAID;
+        }
+        // 已终态（paid / refunding / refunded / failed）→ 不二次推进、不二次 dispatch（AC 5 幂等）
         if (!PayStatus.PENDING.equals(tx.getStatus())) {
             log.info("[gz-pay] 查单补单跳过（非 pending）out_trade_no={} status={}", tx.getOutTradeNo(), tx.getStatus());
             return ReconcileOutcome.SKIPPED_TERMINAL;
@@ -340,6 +376,38 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
         boolean reallyPaid = applyPaid(tx, transactionId, feeCent, tx.getOutTradeNo(), rawBody, null);
         // 行锁内仍出现 affected=0（version 漂移，理论罕见）→ 归并发已处理，幂等跳过（不计补单）
         return reallyPaid ? ReconcileOutcome.PAID : ReconcileOutcome.SKIPPED_TERMINAL;
+    }
+
+    /**
+     * 本地状态是否属于「迟到付款」判定范围（GZ-PAY-106）：timeout（超时任务关单）/ closed（微信侧已关）。
+     */
+    private static boolean isLatePaidStatus(String status) {
+        return PayStatus.TIMEOUT.equals(status) || PayStatus.CLOSED.equals(status);
+    }
+
+    /**
+     * 记迟到付款（GZ-PAY-106，FLOW:F-JP-06.step4b）：callback_log {@code late_paid}（带金额 + transaction_id）
+     * + ERROR 日志。<b>不改</b>交易状态、<b>不分发</b>业务 —— 由人工在商户平台原路退款或补单。
+     *
+     * @param tx            本地交易行（timeout / closed）
+     * @param transactionId 微信交易号
+     * @param payerTotal    微信侧实付金额（分；查单路径不带时为 null，以订单金额为准）
+     * @param rawBody       回调解密 JSON / 查单报文
+     * @param signature     回调签名（查单为 null）
+     * @param source        发现来源（回调 / 查单 / 并发超时），只进说明文字
+     */
+    private void recordLatePaid(GzPayTransaction tx, String transactionId, Long payerTotal,
+                                String rawBody, String signature, String source) {
+        String detail = "迟到付款（" + source + "）：本地 status=" + tx.getStatus()
+            + "，微信已扣款 amount_cent=" + tx.getAmountCent()
+            + (payerTotal != null ? " payer_total=" + payerTotal : "")
+            + " transaction_id=" + transactionId
+            + "；业务未生效，需在商户平台人工原路退款或补单";
+        writeCallbackLog(transactionId, tx.getOutTradeNo(), rawBody, signature, CB_LATE_PAID, detail);
+        log.error("[gz-pay] 迟到付款 out_trade_no={} business_type={} business_order_no={} status={} amount_cent={} "
+                + "payer_total={} transaction_id={} source={} —— 未推进 paid、未分发业务，需人工原路退款或补单",
+            tx.getOutTradeNo(), tx.getBusinessType(), tx.getBusinessOrderNo(), tx.getStatus(), tx.getAmountCent(),
+            payerTotal, transactionId, source);
     }
 
     /**
@@ -385,6 +453,9 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
                     int affected = transactionMapper.markTimeout(id, now);
                     if (affected == 1) {
                         closed++;
+                        // GZ-PAY-106：同时关微信侧支付单（覆盖本改动上线前创建、没带 time_expire 的在途单）。
+                        //   失败只记 warn，不回滚本地 timeout；万一之后仍被付款，由查单 / 回调记 late_paid 兜底。
+                        closeRemoteOrderQuietly(id);
                     } else {
                         skipped++;
                     }
@@ -402,6 +473,25 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
         });
     }
 
+    /**
+     * 标 timeout 后关微信侧支付单（GZ-PAY-106）。关单接口幂等；任何失败只记 warn，不影响本地 timeout。
+     */
+    private void closeRemoteOrderQuietly(Long id) {
+        String outTradeNo = null;
+        try {
+            GzPayTransaction tx = transactionMapper.selectById(id);
+            if (tx == null || StrUtil.isBlank(tx.getOutTradeNo())) {
+                log.warn("[gz-pay] 超时关单后关微信单跳过：读不到 out_trade_no id={}", id);
+                return;
+            }
+            outTradeNo = tx.getOutTradeNo();
+            wechatPayClient.closeOrder(outTradeNo);
+        } catch (Exception e) {
+            log.warn("[gz-pay] 超时关单后关微信单失败（本地 timeout 不回滚）id={} out_trade_no={}: {}",
+                id, outTradeNo, e.getMessage(), e);
+        }
+    }
+
     // ============================================================
     //  AC 5 / AC 12 查询
     // ============================================================
@@ -413,9 +503,34 @@ public class GzPayTransactionServiceImpl implements IGzPayTransactionService {
             .eq(StrUtil.isNotBlank(query.getStatus()), GzPayTransaction::getStatus, query.getStatus())
             .eq(StrUtil.isNotBlank(query.getOutTradeNo()), GzPayTransaction::getOutTradeNo, query.getOutTradeNo())
             .eq(StrUtil.isNotBlank(query.getTransactionId()), GzPayTransaction::getTransactionId, query.getTransactionId())
+            // GZ-PAY-106：只看迟到付款（callback_log 有 late_paid 记录的单）
+            .inSql(Boolean.TRUE.equals(query.getLatePaid()), GzPayTransaction::getOutTradeNo,
+                "SELECT out_trade_no FROM gz_pay_callback_log WHERE process_status = '" + CB_LATE_PAID
+                    + "' AND del_flag = '0' AND out_trade_no IS NOT NULL")
             .orderByDesc(GzPayTransaction::getId);
         Page<GzPayTransactionVO> page = transactionMapper.selectVoPage(pageQuery.build(), wrapper);
+        markLatePaid(page.getRecords());
         return TableDataInfo.build(page);
+    }
+
+    /**
+     * 给列表行打「迟到付款」标记（GZ-PAY-106）：本页 out_trade_no 中有 late_paid 回调日志的置 true。
+     */
+    private void markLatePaid(List<GzPayTransactionVO> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return;
+        }
+        List<String> outTradeNos = rows.stream().map(GzPayTransactionVO::getOutTradeNo)
+            .filter(StrUtil::isNotBlank).toList();
+        if (outTradeNos.isEmpty()) {
+            return;
+        }
+        List<GzPayCallbackLog> logs = callbackLogMapper.selectList(Wrappers.<GzPayCallbackLog>lambdaQuery()
+            .eq(GzPayCallbackLog::getProcessStatus, CB_LATE_PAID)
+            .in(GzPayCallbackLog::getOutTradeNo, outTradeNos));
+        Set<String> latePaid = logs == null ? Set.of() : logs.stream().map(GzPayCallbackLog::getOutTradeNo)
+            .collect(Collectors.toSet());
+        rows.forEach(r -> r.setLatePaid(latePaid.contains(r.getOutTradeNo())));
     }
 
     @Override

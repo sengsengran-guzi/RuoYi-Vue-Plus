@@ -362,7 +362,8 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
      */
     private String buildItemDesc(List<GzJpOrderItem> shipped) {
         JpOrderSnapshot.Product first = shipped.isEmpty() ? null : readSnapshot(shipped.get(0).getProductSnapshotJson());
-        String firstName = first == null || StrUtil.isBlank(first.getName()) ? "谷子商品" : first.getName();
+        String firstRaw = first == null ? null : first.resolveName();
+        String firstName = StrUtil.isBlank(firstRaw) ? "谷子商品" : firstRaw;
         String desc = shipped.size() == 1 ? firstName : firstName + " 等 " + shipped.size() + " 件";
         return StrUtil.maxLength(desc, 100);
     }
@@ -682,7 +683,8 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
         JpOrderSnapshot.Product snap = readSnapshot(row.getProductSnapshotJson());
         if (snap != null) {
             vo.setProductNo(snap.getProductNo());
-            vo.setName(snap.getName());
+            // 代切行（product_id 为空）名称取快照 snap 段；拼团行结果与一期一致
+            vo.setName(snap.resolveName());
             vo.setEventName(snap.getEventName());
         } else {
             vo.setName("商品");

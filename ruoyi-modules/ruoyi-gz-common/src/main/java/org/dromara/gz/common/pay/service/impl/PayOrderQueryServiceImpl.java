@@ -16,6 +16,7 @@ import org.springframework.stereotype.Service;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 主动查单 + 补单服务实现（GZ-PAY-102，doc/10 §6.N7 / §6.E3）。
@@ -44,6 +45,16 @@ public class PayOrderQueryServiceImpl implements IPayOrderQueryService {
     private static final int SCAN_LIMIT = 100;
     /** 超 30min 仍 pending 且 NOTPAY → 关单防偷付（AC 8） */
     private static final int CLOSE_AFTER_MINUTES = 30;
+    /** 迟到付款核查窗口（GZ-PAY-106）：近 24h 内标 timeout 的单 */
+    private static final int LATE_PAID_WINDOW_HOURS = 24;
+    /**
+     * 迟到付款核查最小间隔（GZ-PAY-106）：查单任务每 90s 一轮，timeout 单不必每轮都查 ——
+     * 关单后微信侧已不可付，这里只是兜底，按 10 分钟一轮控制查单配额。
+     */
+    private static final long LATE_PAID_CHECK_INTERVAL_MINUTES = 10;
+
+    /** 上一轮迟到付款核查时间（进程内节流；多实例各自节流，结果幂等） */
+    private final AtomicReference<LocalDateTime> lastLatePaidCheckAt = new AtomicReference<>();
 
     private final GzPayTransactionMapper transactionMapper;
     private final IWechatPayClient wechatPayClient;
@@ -87,8 +98,75 @@ public class PayOrderQueryServiceImpl implements IPayOrderQueryService {
                     result.scanned(), result.paid(), result.closed(), result.failed(),
                     result.timeout(), result.pending(), result.skipped());
             }
+
+            // GZ-PAY-106：近 24h 内 timeout 的单也查一遍 —— 回调丢失时迟到付款也能被发现（不计入上面的统计口径）
+            checkLatePaidTimeoutOrders(now);
             return result;
         });
+    }
+
+    /**
+     * 迟到付款核查（GZ-PAY-106，FLOW:F-JP-06.step4b）：扫近 24h 内 timeout 且未记过 late_paid 的单 → 查单。
+     *
+     * <ul>
+     *   <li>SUCCESS → {@code reconcilePaid}（行锁内判定 timeout → 记 late_paid，不推进、不分发）</li>
+     *   <li>NOTPAY → 补一次关微信单（本改动上线前的在途单 / 超时关单时关微信单失败的单），失败只记 warn</li>
+     *   <li>其余（CLOSED / USERPAYING / …）→ 不动</li>
+     * </ul>
+     *
+     * <p>进程内按 {@value #LATE_PAID_CHECK_INTERVAL_MINUTES} 分钟节流；单条异常隔离。</p>
+     *
+     * @param now 本轮时间
+     */
+    private void checkLatePaidTimeoutOrders(LocalDateTime now) {
+        LocalDateTime last = lastLatePaidCheckAt.get();
+        if (last != null && last.plusMinutes(LATE_PAID_CHECK_INTERVAL_MINUTES).isAfter(now)) {
+            return;
+        }
+        lastLatePaidCheckAt.set(now);
+
+        List<Long> ids = transactionMapper.selectLatePaidCheckTimeoutIds(now.minusHours(LATE_PAID_WINDOW_HOURS), SCAN_LIMIT);
+        int latePaid = 0;
+        for (Long id : ids) {
+            try {
+                if (checkOneTimeoutOrder(id)) {
+                    latePaid++;
+                }
+            } catch (Exception e) {
+                log.error("[gz-pay] 迟到付款核查单条失败 id={}", id, e);
+            }
+        }
+        if (!ids.isEmpty()) {
+            log.info("[gz-pay] 迟到付款核查完成：扫描 timeout 单 {} / 发现迟到付款 {}", ids.size(), latePaid);
+        }
+    }
+
+    /**
+     * 单笔 timeout 单查单。
+     *
+     * @return true = 发现迟到付款并已记 late_paid
+     */
+    private boolean checkOneTimeoutOrder(Long id) {
+        GzPayTransaction tx = transactionMapper.selectById(id);
+        if (tx == null || !PayStatus.TIMEOUT.equals(tx.getStatus())) {
+            return false;
+        }
+        QueryResult qr = wechatPayClient.queryByOutTradeNo(tx.getOutTradeNo());
+        String tradeState = qr.tradeState() == null ? "" : qr.tradeState().toUpperCase();
+        if ("SUCCESS".equals(tradeState)) {
+            ReconcileOutcome r = transactionService.reconcilePaid(id, qr.transactionId(), qr.feeCent(), qr.rawBody());
+            return r == ReconcileOutcome.LATE_PAID;
+        }
+        if ("NOTPAY".equals(tradeState)) {
+            try {
+                wechatPayClient.closeOrder(tx.getOutTradeNo());
+                log.info("[gz-pay] timeout 单微信侧仍可付，已补关微信单 out_trade_no={}", tx.getOutTradeNo());
+            } catch (Exception e) {
+                log.warn("[gz-pay] timeout 单补关微信单失败（下轮再试）out_trade_no={}: {}",
+                    tx.getOutTradeNo(), e.getMessage(), e);
+            }
+        }
+        return false;
     }
 
     /**

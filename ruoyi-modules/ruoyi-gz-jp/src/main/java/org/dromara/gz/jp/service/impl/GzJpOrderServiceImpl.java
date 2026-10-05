@@ -46,6 +46,7 @@ import org.dromara.gz.jp.mapper.GzJpProductMapper;
 import org.dromara.gz.jp.service.IGzJpCartService;
 import org.dromara.gz.jp.service.IGzJpEventService;
 import org.dromara.gz.jp.service.IGzJpOrderService;
+import org.dromara.gz.jp.service.internal.GzJpOrderItemSourceInvariant;
 import org.dromara.gz.user.domain.vo.GzUserAddressVO;
 import org.dromara.gz.user.service.IGzUserAddressService;
 import org.springframework.dao.DuplicateKeyException;
@@ -202,7 +203,10 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
             GzJpEventOptionVO event = eventMap.get(p.getEventId());
             int qty = ObjectUtil.defaultIfNull(ci.getQty(), 1);
             totalQty += qty;
-            itemMapper.insert(buildOrderItem(order, userId, p, event, qty));
+            GzJpOrderItem item = buildOrderItem(order, userId, p, event, qty);
+            // ★ 订单行写入统一校验：source 与 product_id / snap_item_id 互斥（GZ-SNAP-102）
+            GzJpOrderItemSourceInvariant.check(item);
+            itemMapper.insert(item);
         }
 
         // ⑨ 清掉已结算的购物车行（REQUIRED 传播，与本事务同生共死：下单失败车不会被清）
@@ -315,11 +319,12 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
         // 冗余 user_id：履约看板按客人聚合且跨订单（REQ-FULFILL-006）
         item.setUserId(userId);
         item.setProductId(p.getId());
+        // 拼团行不挂代切商品（snap_item_id 恒空）—— 见 GzJpOrderItemSourceInvariant
         item.setProductSnapshotJson(writeJson(buildProductSnapshot(p, event)));
         item.setQty(qty);
         item.setUnitPriceCent(unitPrice);
         item.setAmountCent(unitPrice * qty);
-        // ★ 一期恒 batch；二期代切加 snap（REQ-SNAP-004），只加枚举值不改表
+        // 拼团下单恒 batch（代切行由 GZ-SNAP-304 的代切下单路径写 snap）
         item.setSource(GzJpItemSource.BATCH.getCode());
         // 履约起点；支付回调再显式激活一次（见 GzJpOrderItemMapper.activatePurchasing 注释）
         item.setFulfillStatus(GzJpFulfillStatus.PURCHASING.getCode());
@@ -488,7 +493,7 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
             totalQty += ObjectUtil.defaultIfNull(item.getQty(), 0);
             if (thumbs.size() < LIST_THUMB_MAX) {
                 JpOrderSnapshot.Product snap = readJson(item.getProductSnapshotJson(), JpOrderSnapshot.Product.class);
-                thumbs.add(resolveImageUrl(snap == null ? null : snap.getMainImageId(), urlCache));
+                thumbs.add(resolveImageUrl(snap == null ? null : snap.resolveMainImageId(), urlCache));
             }
         }
         vo.setTotalQty(totalQty);
@@ -519,11 +524,12 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
         // ★ 商品信息一律读快照，不回查商品表：改名 / 下架 / 删除都不影响已下单的展示
         if (snap != null) {
             vo.setProductNo(snap.getProductNo());
-            vo.setName(snap.getName());
+            // 代切行（无商品表外键）名称 / 图片取快照 snap 段；拼团行结果与一期一致
+            vo.setName(snap.resolveName());
             vo.setDeliveryDateText(snap.getDeliveryDateText());
             vo.setNoticeText(snap.getNoticeText());
             vo.setEventName(snap.getEventName());
-            vo.setMainImageUrl(resolveImageUrl(snap.getMainImageId(), urlCache));
+            vo.setMainImageUrl(resolveImageUrl(snap.resolveMainImageId(), urlCache));
         } else {
             // 快照损坏（历史脏数据）：宁可少显示，也不要让整个订单详情 500
             vo.setName("商品");

@@ -146,6 +146,25 @@ public interface GzJpRefundMapper extends BaseMapperPlus<GzJpRefund, GzJpRefund>
     int markRetrying(@Param("id") Long id);
 
     /**
+     * 卡在 {@code refunding} 的退款单（GZ-JP-111，FLOW:F-JP-10.step2 退款补偿调度扫描）。
+     *
+     * <p>「卡住」= 最后一次被推进（建单 / 受理回写 / 补发回写都会刷 {@code update_time}）早于 {@code deadline}，
+     * 且至今仍是 {@code refunding}。用 {@code update_time} 而不是 {@code triggered_time}：补发成功后
+     * {@code markAccepted} 会刷新 {@code update_time}，同一张单要再静默一个周期才会被重新查，不会每轮都打微信。
+     * {@code update_time} 为空的历史行退回用 {@code create_time} 判。</p>
+     *
+     * <p>不区分 {@code refund_type}：购买失败退款与运费多退都要补偿（类型分支在落账方法里）。
+     * 调度线程在 {@code TenantHelper.ignore} 下跑，全租户扫。</p>
+     *
+     * @param deadline 静默期截止时刻（now − 10 分钟）
+     * @param limit    本轮最多取几张（处理不完的下一轮接着扫）
+     * @return 待补偿退款单，按 id 升序
+     */
+    @Select("SELECT * FROM gz_jp_refund WHERE del_flag = '0' AND status = 'refunding' "
+        + "AND COALESCE(update_time, create_time) < #{deadline} ORDER BY id ASC LIMIT #{limit}")
+    List<GzJpRefund> selectStaleRefunding(@Param("deadline") LocalDateTime deadline, @Param("limit") int limit);
+
+    /**
      * 当日退款单号 MAX 序号（{@code JPRF-yyyyMMdd-} 前缀）—— Redis 计数器播种 / 撞号自愈用。
      *
      * <p>照 {@code PayOrderNoGenerator} 的口径：{@code SUBSTRING} 取后 6 位转数字取 MAX。

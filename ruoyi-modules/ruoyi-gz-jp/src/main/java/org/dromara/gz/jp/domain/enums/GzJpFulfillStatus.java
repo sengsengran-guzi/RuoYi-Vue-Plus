@@ -7,11 +7,11 @@ package org.dromara.gz.jp.domain.enums;
  * 「这单到哪了」这个问法在拼团里不成立。</p>
  *
  * <pre>
- *   purchasing 购买中
- *     ├─ purchase_failed 购买失败      ← 分支终态（退款 GZ-JP-107）
- *     └─ await_seller_ship 等待官方发货
- *          → jp_shipped 日本仓库已发货 → customs 清关中
- *          → cn_sorting 国内分拣中 → delivered 发货完毕（终态，必带运单号）
+ *   主链：purchasing 购买中 → await_seller_ship 等待官方发货 → jp_shipped 日本仓库已发货
+ *         → customs 清关中 → cn_sorting 国内分拣中 → delivered 发货完毕（终态，必带运单号）
+ *
+ *   分支：上面<b>任一非终态</b> → purchase_failed 购买失败（终态，退款 GZ-JP-107）
+ *         —— 不只从 purchasing 进：货卡在链条中段才发现买不到也必须能退款（GZ-JP-106 有意设计）
  * </pre>
  *
  * <p><b>★ 允许跳过中间态</b>（REQ-EVENT-002：线下现货没有「等待官方发货」这一步）。

@@ -17,6 +17,7 @@ import com.wechat.pay.java.service.payments.model.Transaction;
 import com.wechat.pay.java.service.refund.RefundService;
 import com.wechat.pay.java.service.refund.model.AmountReq;
 import com.wechat.pay.java.service.refund.model.CreateRequest;
+import com.wechat.pay.java.service.refund.model.QueryByOutRefundNoRequest;
 import com.wechat.pay.java.service.refund.model.Refund;
 import com.wechat.pay.java.service.refund.model.RefundNotification;
 import jakarta.annotation.PostConstruct;
@@ -109,13 +110,20 @@ public class WechatPayV3ClientImpl implements IWechatPayClient {
         payer.setOpenid(req.openid());
         request.setPayer(payer);
 
+        // GZ-PAY-106：支付结束时间 = 本地 expire_time，到点后微信侧拒绝付款（REQ-ORDER-012）。
+        //   旧构造方式未带时间时不传，微信按默认时效处理。
+        String timeExpire = req.timeExpireRfc3339();
+        if (timeExpire != null) {
+            request.setTimeExpire(timeExpire);
+        }
+
         // prepayWithRequestPayment 一步拿到 prepay_id 包装 + 5 参签名；此处仅取 prepay_id 落库
         PrepayWithRequestPaymentResponse resp = jsapiService.prepayWithRequestPayment(request);
         // packageVal 形如 "prepay_id=wx..."，剥前缀回填 prepay_id
         String pkg = resp.getPackageVal();
         String prepayId = pkg != null && pkg.startsWith("prepay_id=") ? pkg.substring("prepay_id=".length()) : pkg;
-        log.info("[gz-pay] createJsapiOrder out_trade_no={} appid={} → prepay_id={}",
-            req.outTradeNo(), appid, prepayId);
+        log.info("[gz-pay] createJsapiOrder out_trade_no={} appid={} time_expire={} → prepay_id={}",
+            req.outTradeNo(), appid, timeExpire, prepayId);
         return prepayId;
     }
 
@@ -278,6 +286,44 @@ public class WechatPayV3ClientImpl implements IWechatPayClient {
         } catch (ValidationException e) {
             throw new WechatPayVerifyException("微信退款回调验签失败: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * 按商户退款单号查询单笔退款（GZ-JP-111）：{@code GET /v3/refund/domestic/refunds/{out_refund_no}}。
+     *
+     * <p>微信对不存在的退款单回 HTTP 404 + {@code code=RESOURCE_NOT_EXISTS}，SDK 抛
+     * {@link com.wechat.pay.java.core.exception.ServiceException}；只有这一种业务码归一成 NOT_FOUND，
+     * 其余异常原样抛出（调用方本轮跳过、下轮再查）—— 把网络抖动误判成「微信没这单」会触发补发，虽然微信按
+     * out_refund_no 幂等不至于双退，但会掩盖真实故障。</p>
+     */
+    @Override
+    public RefundQueryResult queryRefund(String outRefundNo) {
+        QueryByOutRefundNoRequest request = new QueryByOutRefundNoRequest();
+        request.setOutRefundNo(outRefundNo);
+        Refund refund;
+        try {
+            refund = refundService.queryByOutRefundNo(request);
+        } catch (com.wechat.pay.java.core.exception.ServiceException e) {
+            if (isRefundNotExists(e)) {
+                log.warn("[gz-pay] queryRefund out_refund_no={} → 微信侧不存在（{} {}）",
+                    outRefundNo, e.getHttpStatusCode(), e.getErrorCode());
+                return RefundQueryResult.notFound(outRefundNo, e.getResponseBody());
+            }
+            throw e;
+        }
+        String status = refund.getStatus() != null ? refund.getStatus().name() : null;
+        log.info("[gz-pay] queryRefund out_refund_no={} → refund_id={} status={}",
+            outRefundNo, refund.getRefundId(), status);
+        return new RefundQueryResult(refund.getOutRefundNo() != null ? refund.getOutRefundNo() : outRefundNo,
+            refund.getRefundId(), status, refund.getSuccessTime(), refund.toString());
+    }
+
+    /**
+     * 微信「退款单不存在」：以业务码 {@code RESOURCE_NOT_EXISTS} 为准（官方返回 HTTP 404 + 该码）。
+     * 只看 HTTP 404 不够 —— 网关 / 代理层的 404 不带业务码，不能据此断定微信没这单。
+     */
+    private static boolean isRefundNotExists(com.wechat.pay.java.core.exception.ServiceException e) {
+        return "RESOURCE_NOT_EXISTS".equals(e.getErrorCode());
     }
 
     /**
