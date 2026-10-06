@@ -28,7 +28,7 @@ public class GzJpSnapTradeService {
         return TableDataInfo.build(tasks.selectPage(page.build(),new LambdaQueryWrapper<GzJpSnapPurchase>()
             .eq(GzJpSnapPurchase::getPurchaseStatus,"success")
             .eq(status != null && !status.isBlank(),GzJpSnapPurchase::getTradeStatus,status)
-            .orderByAsc(GzJpSnapPurchase::getRateDeadlineAt).orderByAsc(GzJpSnapPurchase::getId)));
+            .last("ORDER BY CASE WHEN trade_status='arrived' AND rate_deadline_at <= DATE_ADD(NOW(), INTERVAL 12 HOUR) THEN 0 ELSE 1 END, rate_deadline_at IS NULL, rate_deadline_at ASC, id ASC")));
     }
     public long reminderCount() {
         return tasks.selectCount(new LambdaQueryWrapper<GzJpSnapPurchase>()
