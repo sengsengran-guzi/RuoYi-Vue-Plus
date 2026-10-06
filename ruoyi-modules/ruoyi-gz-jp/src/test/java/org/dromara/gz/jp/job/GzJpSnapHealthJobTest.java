@@ -31,6 +31,9 @@ class GzJpSnapHealthJobTest {
         tenant = mockStatic(TenantHelper.class);
         tenant.when(() -> TenantHelper.dynamic(eq("1001"), any(Runnable.class)))
             .thenAnswer(call -> { ((Runnable) call.getArgument(1)).run(); return null; });
+        // evictIfPresent returns boolean, so that dynamic lambda uses Supplier rather than Runnable.
+        tenant.when(() -> TenantHelper.dynamic(eq("1001"), any(java.util.function.Supplier.class)))
+            .thenAnswer(call -> ((java.util.function.Supplier<?>) call.getArgument(1)).get());
         job = new GzJpSnapHealthJob(gateway, properties, accounts, risk) {
             @Override protected void saveProbe(ObjectNode result) { probeResult = result; }
         };
@@ -90,10 +93,14 @@ class GzJpSnapHealthJobTest {
         when(accounts.pauseAccount("acc01", "challenge")).thenReturn(1);
         ConcurrentMapCacheManager caches = new ConcurrentMapCacheManager("sys_config");
         caches.getCache("sys_config").put("gz.jp.snap.auto", "stale enabled=true");
-        GzJpSnapRiskControl control = new GzJpSnapRiskControl(config, accounts, json, mock(org.dromara.gz.jp.mapper.GzJpSnapPurchaseMapper.class), caches);
+        var purchases = mock(org.dromara.gz.jp.mapper.GzJpSnapPurchaseMapper.class);
+        // Match the real framework: deferred evict in afterCommit must not leave stale data.
+        var transactionalCaches = new org.springframework.cache.transaction.TransactionAwareCacheManagerProxy(caches);
+        GzJpSnapRiskControl control = new GzJpSnapRiskControl(config, accounts, json, purchases, transactionalCaches);
         TransactionSynchronizationManager.initSynchronization();
         try {
             control.pause("acc01", "challenge");
+            verify(purchases).pauseQueued();
             var captor = org.mockito.ArgumentCaptor.forClass(String.class);
             verify(config).writeAutoConfig(captor.capture());
             var value = json.readTree(captor.getValue());

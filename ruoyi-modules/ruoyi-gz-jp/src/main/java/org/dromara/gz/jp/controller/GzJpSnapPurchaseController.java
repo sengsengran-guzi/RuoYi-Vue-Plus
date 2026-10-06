@@ -14,6 +14,14 @@ import java.util.List;
 @RestController @RequiredArgsConstructor @RequestMapping("/system/gz/jp/snap/purchase")
 public class GzJpSnapPurchaseController extends org.dromara.common.web.core.BaseController {
  private final GzJpSnapManualService service;
+ private final org.dromara.gz.jp.service.internal.GzJpSnapPurchaseReadService reads;
+ private final org.dromara.gz.jp.service.internal.GzJpSnapTradeService trades;
+ @GetMapping("/automatic-list") @SaCheckPermission("gz:jp:snap:purchase:query")
+ public org.dromara.common.mybatis.core.page.TableDataInfo<org.dromara.gz.jp.domain.entity.GzJpSnapPurchase> automatic(org.dromara.common.mybatis.core.page.PageQuery page){return reads.automatic(page);}
+ @GetMapping("/summary") @SaCheckPermission("gz:jp:snap:purchase:query")
+ public R<org.dromara.gz.jp.service.internal.GzJpSnapPurchaseReadService.Summary> summary(){return R.ok(reads.summary(trades.reminderCount()));}
+ @GetMapping("/{id}/detail") @SaCheckPermission("gz:jp:snap:purchase:query")
+ public R<org.dromara.gz.jp.service.internal.GzJpSnapPurchaseReadService.Detail> detail(@PathVariable Long id){return R.ok(reads.detail(id));}
  public record SuccessInput(@NotBlank @Size(max=64) String mercariTxnId,@NotNull @Positive Long actualPriceJpy){}
  public record FailInput(@NotBlank @Pattern(regexp="sold_out|deleted|price_up|manual_rejected") String failReason,@Size(max=512) String note){}
  @GetMapping("/manual-list") @SaCheckPermission("gz:jp:snap:purchase:query")

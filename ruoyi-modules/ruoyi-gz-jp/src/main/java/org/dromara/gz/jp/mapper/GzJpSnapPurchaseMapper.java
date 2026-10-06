@@ -36,6 +36,10 @@ public interface GzJpSnapPurchaseMapper extends BaseMapperPlus<GzJpSnapPurchase,
     java.util.List<GzJpSnapPurchase> manualList();
     @org.apache.ibatis.annotations.Update("UPDATE gz_jp_snap_purchase SET trade_status=#{tradeStatus},fail_reason=#{failReason},actual_shipping_jpy=#{actualShippingJpy},arrived_at=#{arrivedAt},rate_deadline_at=#{rateDeadlineAt},rated_at=#{ratedAt},manual_operator=COALESCE(#{manualOperator},manual_operator),version=version+1,update_time=NOW() WHERE id=#{id} AND version=#{version} AND del_flag='0'")
     int saveTrade(GzJpSnapPurchase task);
+    @org.apache.ibatis.annotations.Select("SELECT status FROM gz_jp_refund WHERE order_item_id=#{itemId} AND refund_type='shipping_diff' AND del_flag='0' ORDER BY id DESC LIMIT 1")
+    String shippingRefundStatus(Long itemId);
+    @org.apache.ibatis.annotations.Select("SELECT refund_amount_cent FROM gz_jp_refund WHERE order_item_id=#{itemId} AND refund_type='shipping_diff' AND del_flag='0' ORDER BY id DESC LIMIT 1")
+    Long shippingRefundAmount(Long itemId);
     @org.apache.ibatis.annotations.Select("SELECT * FROM gz_jp_snap_purchase WHERE del_flag='0' AND purchase_status='success' AND trade_status IN ('await_ship','shipped') ORDER BY id")
     java.util.List<GzJpSnapPurchase> patrolTrades();
 }

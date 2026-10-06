@@ -16,6 +16,12 @@ import org.dromara.gz.jp.domain.entity.GzJpSnapAccount;
  * @author kevin-coder (sensenran-guzi · GZ-SNAP-102)
  */
 public interface GzJpSnapAccountMapper extends BaseMapperPlus<GzJpSnapAccount, GzJpSnapAccount> {
+    @Update("UPDATE gz_jp_snap_account SET nickname=#{nickname},daily_limit=#{limit},cooldown_sec=#{cooldown},version=version+1,update_time=NOW() WHERE id=#{id} AND del_flag='0'")
+    int editAdmin(@Param("id") Long id, @Param("nickname") String nickname, @Param("limit") int limit, @Param("cooldown") int cooldown);
+    @Update("UPDATE gz_jp_snap_account SET admin_enabled=#{enabled},version=version+1,update_time=NOW() WHERE id=#{id} AND del_flag='0'")
+    int setAdminEnabled(@Param("id") Long id, @Param("enabled") boolean enabled);
+    @Update("UPDATE gz_jp_snap_account SET pause_reason=NULL,version=version+1,update_time=NOW() WHERE id=#{id} AND del_flag='0'")
+    int clearPause(@Param("id") Long id);
     // Background tasks have no LoginUser: always target the business tenant, never 000000.
     @Select("SELECT * FROM gz_jp_snap_account WHERE tenant_id='1001' AND del_flag='0'")
     List<GzJpSnapAccount> selectHealthAccounts();

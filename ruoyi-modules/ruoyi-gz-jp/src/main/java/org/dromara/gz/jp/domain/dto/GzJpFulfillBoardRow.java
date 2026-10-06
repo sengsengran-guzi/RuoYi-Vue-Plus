@@ -24,6 +24,9 @@ public class GzJpFulfillBoardRow implements Serializable {
     private Long orderId;
     private Long userId;
     private Long productId;
+    /** 来源 batch / snap；代切交易状态仅 snap 行有值。 */
+    private String source;
+    private String snapTradeStatus;
     private String productSnapshotJson;
     private Integer qty;
     private Long unitPriceCent;

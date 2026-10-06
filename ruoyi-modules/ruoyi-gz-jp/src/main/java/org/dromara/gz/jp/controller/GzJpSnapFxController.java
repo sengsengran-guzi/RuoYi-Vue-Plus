@@ -21,6 +21,8 @@ public class GzJpSnapFxController extends org.dromara.common.web.core.BaseContro
     @PostMapping @SaCheckPermission("gz:jp:snap:config:fx") @RepeatSubmit
     @Log(title="代切手动汇率", businessType=BusinessType.INSERT)
     public R<GzJpFxRate> create(@Valid @RequestBody Input input) { return R.ok(service.manual(input.ratePer100jpy())); }
+    @GetMapping("/latest") @SaCheckPermission("gz:jp:snap:config:query")
+    public R<GzJpSnapFxService.Latest> latest() { return R.ok(service.latest()); }
     @GetMapping @SaCheckPermission("gz:jp:snap:config:query")
     public R<List<GzJpFxRate>> history() { return R.ok(service.history()); }
 }

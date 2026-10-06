@@ -12,4 +12,9 @@ import org.dromara.gz.jp.domain.entity.GzJpSnapTerm;
  * @author kevin-coder (sensenran-guzi · GZ-SNAP-102)
  */
 public interface GzJpSnapTermMapper extends BaseMapperPlus<GzJpSnapTerm, GzJpSnapTerm> {
+    @org.apache.ibatis.annotations.Select("SELECT * FROM gz_jp_snap_term WHERE zh_term=#{zhTerm}")
+    GzJpSnapTerm findIncludingDeleted(String zhTerm);
+
+    @org.apache.ibatis.annotations.Update("UPDATE gz_jp_snap_term SET ja_term=#{jaTerm}, term_type=#{termType}, enabled=#{enabled}, sort_no=#{sortNo}, del_flag='0', update_by=#{updateBy}, update_time=NOW() WHERE id=#{id} AND del_flag<>'0'")
+    int restore(GzJpSnapTerm row);
 }
