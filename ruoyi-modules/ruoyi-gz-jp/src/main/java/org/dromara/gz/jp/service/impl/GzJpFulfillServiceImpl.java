@@ -408,6 +408,7 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
 
         // ① 悲观锁加载（ids 已升序 → 并发重叠请求的加锁顺序一致 → 不死锁）
         List<GzJpOrderItem> rows = itemMapper.selectByIdsForUpdate(ids);
+        itemMapper.assertSnapRated(rows);
         Map<Long, GzJpOrderItem> rowMap = new HashMap<>(rows.size());
         for (GzJpOrderItem row : rows) {
             rowMap.put(row.getId(), row);

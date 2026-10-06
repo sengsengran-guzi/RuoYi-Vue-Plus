@@ -145,7 +145,7 @@ public class GzJpRefundServiceImpl implements IGzJpRefundService {
         String notifyUrl = resolveRefundNotifyUrl();
 
         // ── 事务① ──（提交后才调微信）
-        GzJpRefundPlan plan = txService.markFailedAndCreateRefunds(ids, bo.getReason(), operatorId, triggeredBy);
+        GzJpRefundPlan plan = txService.markFailedAndCreateRefunds(ids, bo.getReason(), operatorId, triggeredBy, true);
 
         return dispatchSnapRefundPlan(plan, ids);
     }

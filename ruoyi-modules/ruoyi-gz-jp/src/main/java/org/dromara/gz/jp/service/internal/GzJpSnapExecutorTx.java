@@ -91,7 +91,11 @@ public class GzJpSnapExecutorTx {
  }
  private GzJpRefundPlan failure(GzJpSnapPurchase t,GzJpOrderItem item,String reason,Long operator,String triggeredBy){
   t.setPurchaseStatus("failed");t.setFailReason(reason);t.setResultAt(LocalDateTime.now());t.setNextActionAt(null);save(t);
-  var plan=refunds.markFailedAndCreateRefunds(List.of(item.getId()),"代切购买失败: "+reason,operator,triggeredBy);
+  return tradeFailure(item,reason,operator,triggeredBy);
+ }
+ /** Shared system failure exit, below admin fulfillment guards. Caller holds snap/order/item locks. */
+ public GzJpRefundPlan tradeFailure(GzJpOrderItem item,String reason,Long operator,String triggeredBy){
+  var plan=refunds.markFailedAndCreateRefunds(List.of(item.getId()),"代切失败: "+reason,operator,triggeredBy);
   if(!plan.getRejects().isEmpty()||!plan.getRefundRejects().isEmpty())throw new IllegalStateException("Snap refund rejected");
   snaps.releaseSnapLock(item.getId());return plan;
  }

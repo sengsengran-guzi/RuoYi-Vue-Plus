@@ -34,4 +34,8 @@ public interface GzJpSnapPurchaseMapper extends BaseMapperPlus<GzJpSnapPurchase,
     int saveOutcome(GzJpSnapPurchase task);
     @org.apache.ibatis.annotations.Select("SELECT p.* FROM gz_jp_snap_purchase p JOIN gz_jp_order_item i ON i.id=p.order_item_id AND i.tenant_id=p.tenant_id AND i.del_flag='0' JOIN gz_jp_order o ON o.id=i.order_id AND o.tenant_id=p.tenant_id AND o.del_flag='0' WHERE p.del_flag='0' AND p.purchase_status='manual_pending' ORDER BY o.paid_time ASC,p.id ASC")
     java.util.List<GzJpSnapPurchase> manualList();
+    @org.apache.ibatis.annotations.Update("UPDATE gz_jp_snap_purchase SET trade_status=#{tradeStatus},fail_reason=#{failReason},actual_shipping_jpy=#{actualShippingJpy},arrived_at=#{arrivedAt},rate_deadline_at=#{rateDeadlineAt},rated_at=#{ratedAt},manual_operator=COALESCE(#{manualOperator},manual_operator),version=version+1,update_time=NOW() WHERE id=#{id} AND version=#{version} AND del_flag='0'")
+    int saveTrade(GzJpSnapPurchase task);
+    @org.apache.ibatis.annotations.Select("SELECT * FROM gz_jp_snap_purchase WHERE del_flag='0' AND purchase_status='success' AND trade_status IN ('await_ship','shipped') ORDER BY id")
+    java.util.List<GzJpSnapPurchase> patrolTrades();
 }

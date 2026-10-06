@@ -97,6 +97,13 @@ public class GzJpRefundTxService {
     @Transactional(rollbackFor = Exception.class)
     public GzJpRefundPlan markFailedAndCreateRefunds(List<Long> ids, String reason,
                                                      Long operatorId, String triggeredBy) {
+        return markFailedAndCreateRefunds(ids, reason, operatorId, triggeredBy, false);
+    }
+
+    /** Admin-only guard. System purchase/trade failure paths use the four-argument method. */
+    @Transactional(rollbackFor = Exception.class)
+    public GzJpRefundPlan markFailedAndCreateRefunds(List<Long> ids, String reason,
+            Long operatorId, String triggeredBy, boolean adminEntry) {
         String target = GzJpFulfillStatus.PURCHASE_FAILED.getCode();
         GzJpRefundPlan plan = new GzJpRefundPlan();
         plan.setRequested(ids.size());
@@ -106,6 +113,7 @@ public class GzJpRefundTxService {
         itemMapper.selectByIds(ids).stream().map(GzJpOrderItem::getOrderId).distinct().sorted()
             .forEach(orderMapper::selectByIdForUpdate);
         List<GzJpOrderItem> rows = itemMapper.selectByIdsForUpdate(ids);
+        if (adminEntry) itemMapper.assertSnapRated(rows);
         Map<Long, GzJpOrderItem> rowMap = new HashMap<>(rows.size());
         for (GzJpOrderItem row : rows) {
             rowMap.put(row.getId(), row);
