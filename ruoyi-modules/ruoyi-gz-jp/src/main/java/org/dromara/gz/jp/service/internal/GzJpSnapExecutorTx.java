@@ -49,13 +49,19 @@ public class GzJpSnapExecutorTx {
   snaps.lockSnapById(original.getSnapItemId());var read=items.selectById(original.getOrderItemId());
   if(read==null)throw new IllegalStateException("Missing snap item");orders.lockById(read.getOrderId());var item=items.lockById(read.getId());var t=tasks.lock(original.getId());
   if(t==null||!(reconcile?"unknown":"executing").equals(t.getPurchaseStatus()))return null;
+  String priorDiagnostic=t.getLastError();
   LocalDateTime now=LocalDateTime.now();if(evidence!=null&&!evidence.isBlank())t.setEvidenceFileIds(evidence);if(error!=null)t.setLastError(error.substring(0,Math.min(error.length(),512)));
   boolean success=r!=null&&(reconcile?r.path("found").asBoolean(false):"success".equals(r.path("result").asText()));
   if(success&&!r.path("mercari_txn_id").asText().isBlank()&&r.path("actual_price_jpy").asLong()>0){
    t.setPurchaseStatus("success");t.setTradeStatus("await_ship");t.setMercariTxnId(r.path("mercari_txn_id").asText());t.setActualPriceJpy(r.path("actual_price_jpy").asLong());t.setResultAt(now);t.setNextActionAt(null);
    if(!"purchasing".equals(item.getFulfillStatus())||items.advanceGuarded(List.of(item.getId()),"purchasing","await_seller_ship",null)!=1)throw new IllegalStateException("Snap success transition lost");save(t);return null;
   }
-  if(reconcile){int count=t.getReconcileCount()+1;t.setReconcileCount(count);if(count>=3){t.setPurchaseStatus("manual_pending");t.setManualReason(r!=null&&r.hasNonNull("item_status")&&!"on_sale".equals(r.path("item_status").asText())?"reconcile_sold":"reconcile_exhausted");t.setNextActionAt(null);}else t.setNextActionAt(now.plusMinutes(count==1?2:10));save(t);return null;}
+  if(reconcile){
+   // A failed HTTP round must retain the last item status we actually observed.
+   String previous=priorDiagnostic;
+   String observed=r!=null&&r.hasNonNull("item_status")?r.path("item_status").asText():previous!=null&&previous.startsWith("reconcile:item_status=")?previous.substring(22).split(";",2)[0]:"on_sale";
+   String diagnostic="reconcile:item_status="+observed+";"+(error==null?"":error);t.setLastError(diagnostic.substring(0,Math.min(512,diagnostic.length())));
+   int count=t.getReconcileCount()+1;t.setReconcileCount(count);if(count>=3){t.setPurchaseStatus("manual_pending");t.setManualReason(!"on_sale".equals(observed)?"reconcile_sold":"reconcile_exhausted");t.setNextActionAt(null);}else t.setNextActionAt(now.plusMinutes(count==1?2:10));save(t);return null;}
   String reason=r==null?"":r.path("reason").asText();
   if(r!=null&&"failed".equals(r.path("result").asText())&&Set.of("sold_out","deleted","price_up").contains(reason)){
    t.setPurchaseStatus("failed");t.setFailReason(reason);t.setResultAt(now);t.setNextActionAt(null);save(t);
