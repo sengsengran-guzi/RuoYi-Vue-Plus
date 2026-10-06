@@ -349,4 +349,4 @@ gz:
       translate:
         provider: ${GZ_JP_SNAP_TRANSLATE_PROVIDER:mock}
       gateway:
-        base-url: http://127.0.0.1:8700
+        base-url: ${GZ_JP_GATEWAY_URL:http://127.0.0.1:8700}
