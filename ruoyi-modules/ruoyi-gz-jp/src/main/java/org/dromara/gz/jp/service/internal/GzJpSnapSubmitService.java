@@ -60,9 +60,12 @@ public class GzJpSnapSubmitService {
         var item=items.lockExternal(quote.externalId());
         if (item==null) throw error("商品已下架",SNAP_SOLD_OUT);
         if (item.getActiveOrderItemId()!=null) {
-            var held=orderItems.lockById(item.getActiveOrderItemId());
-            var order=held==null?null:orders.lockById(held.getOrderId());
-            if (order!=null && java.util.Set.of("created","paid").contains(order.getBusinessStatus()) && !"purchase_failed".equals(held.getFulfillStatus())) {
+            // The immutable order_id is a locator only; state decisions use current reads.
+            // All writers take order before order item, matching onPaid and avoiding lock inversion.
+            var locator=orderItems.selectById(item.getActiveOrderItemId());
+            var order=locator==null?null:orders.lockById(locator.getOrderId());
+            var held=order==null?null:orderItems.lockById(item.getActiveOrderItemId());
+            if (order!=null && held!=null && java.util.Set.of("created","paid").contains(order.getBusinessStatus()) && !"purchase_failed".equals(held.getFulfillStatus())) {
                 if (!Objects.equals(order.getUserId(),userId)) throw error("商品正在被其他客人购买",SNAP_ITEM_LOCKED);
                 if ("paid".equals(order.getBusinessStatus())) throw error("您已购买此商品",SNAP_ALREADY_BOUGHT);
                 return response(order,pay(order,userId));

@@ -13,6 +13,12 @@ public class GzJpSnapLockService {
     /** Caller must finish its guarded cancellation/failure transition first, in this same transaction. */
     @Transactional(rollbackFor=Exception.class)
     public int releaseSnapLock(Long orderItemId) { return items.releaseSnapLock(orderItemId); }
+    /** Cancellation takes snap before order, matching submit; locator fields are immutable. */
+    public void lockOrderItemsForCancellation(Long orderId) {
+        for (var item : orderItems.selectList(Wrappers.<GzJpOrderItem>lambdaQuery().eq(GzJpOrderItem::getOrderId,orderId).eq(GzJpOrderItem::getSource,"snap").orderByAsc(GzJpOrderItem::getSnapItemId))) {
+            items.lockSnapById(item.getSnapItemId());
+        }
+    }
     public void releaseOrder(Long orderId) {
         for (var item : orderItems.selectList(Wrappers.<GzJpOrderItem>lambdaQuery().eq(GzJpOrderItem::getOrderId,orderId).eq(GzJpOrderItem::getSource,"snap"))) releaseSnapLock(item.getId());
     }

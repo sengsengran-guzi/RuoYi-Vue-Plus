@@ -44,6 +44,7 @@ public class GzJpUnpaidExpireTxService {
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
     public boolean cancelExpired(Long orderId, LocalDateTime cancelledTime) {
+        snapLocks.lockOrderItemsForCancellation(orderId);
         boolean cancelled = orderMapper.markCancelled(orderId, cancelledTime) == 1;
         if (cancelled) snapLocks.releaseOrder(orderId);
         return cancelled;

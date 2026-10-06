@@ -13,6 +13,8 @@ import org.dromara.gz.jp.domain.entity.GzJpSnapItem;
  * @author kevin-coder (sensenran-guzi · GZ-SNAP-102)
  */
 public interface GzJpSnapItemMapper extends BaseMapperPlus<GzJpSnapItem, GzJpSnapItem> {
+    @org.apache.ibatis.annotations.Select("SELECT * FROM gz_jp_snap_item WHERE id=#{id} AND del_flag='0' FOR UPDATE")
+    GzJpSnapItem lockSnapById(@org.apache.ibatis.annotations.Param("id") Long id);
     @org.apache.ibatis.annotations.Select("SELECT * FROM gz_jp_snap_item WHERE platform='mercari' AND external_id=#{externalId} AND del_flag='0' FOR UPDATE")
     GzJpSnapItem lockExternal(@org.apache.ibatis.annotations.Param("externalId") String externalId);
     @org.apache.ibatis.annotations.Update("UPDATE gz_jp_snap_item SET active_order_item_id=#{orderItemId},version=version+1,update_time=NOW() WHERE id=#{id} AND del_flag='0'")
