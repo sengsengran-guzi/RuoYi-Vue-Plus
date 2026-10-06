@@ -16,7 +16,7 @@ import java.io.Serial;
 /**
  * gz_jp_snap_term —— 中日词表（中文搜索词 → 日文，REQ-SNAP-014）。
  *
- * <p>删除走 {@link #enabled} 启停，不软删后复用（UNIQUE(tenant_id, zh_term) 不含 del_flag）。</p>
+ * <p>删除走软删；同中文词重新新增时恢复原行（UNIQUE(tenant_id, zh_term) 不含 del_flag）。</p>
  *
  * <p>字段口径唯一真源：{@code doc/jp/authority/field-ssot.yaml} 的 {@code gz_jp_snap_term} 段；
  * 建表迁移 {@code V202610050723__GZ-SNAP-101-create-snap-tables.sql}。</p>
