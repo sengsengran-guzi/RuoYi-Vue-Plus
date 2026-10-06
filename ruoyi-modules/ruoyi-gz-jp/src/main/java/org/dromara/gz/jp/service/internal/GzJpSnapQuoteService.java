@@ -69,8 +69,9 @@ public class GzJpSnapQuoteService {
         catch (java.io.IOException ex) { throw new IllegalStateException("Unable to serialize snap quote", ex); }
         return new GzJpSnapPriceVO(snapshot.goodsCent(), snapshot.fixedFeeCent(), snapshot.estShippingCent(), snapshot.totalCent(), priceJpy, id, snapshot.expiresAt());
     }
+    /** Summary search may omit payer: reference then includes goods and fixed fee only, never guesses shipping. */
     public Long reference(long priceJpy, String payer) {
-        try { var pricing = pricing(); return calculate("", priceJpy, "buyer".equals(payer) ? "manual" : "auto", payer, pricing, latestFresh().getRatePer100jpy(), System.currentTimeMillis()).totalCent(); }
+        try { var pricing = pricing(); return calculate("", priceJpy, "buyer".equals(payer) ? "manual" : "auto", "buyer".equals(payer) ? "buyer" : "seller", pricing, latestFresh().getRatePer100jpy(), System.currentTimeMillis()).totalCent(); }
         catch (ServiceException ex) {
             if (ex.getCode() != null && (ex.getCode() == SNAP_PRICING_UNSET || ex.getCode() == SNAP_FX_STALE)) return null;
             throw ex;
