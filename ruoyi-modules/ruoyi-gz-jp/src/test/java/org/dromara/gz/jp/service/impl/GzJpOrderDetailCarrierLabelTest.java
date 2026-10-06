@@ -101,7 +101,7 @@ class GzJpOrderDetailCarrierLabelTest {
     void setUp() {
         service = new GzJpOrderServiceImpl(orderMapper, itemMapper, productMapper, eventService, cartService,
             payTransactionService, orderNoGenerator, userService, addressService, fileService, dictService,
-            new ObjectMapper(), null, null);
+            new ObjectMapper(), null, null, org.mockito.Mockito.mock(org.dromara.gz.jp.service.internal.GzJpSnapOrderDisplayService.class));
         when(orderMapper.selectById(ORDER_ID)).thenReturn(order());
         // 真字典的 9 项里取有代表性的几条（tenant_id=000000 的字典行已在 tenant.excludes 里，读得到）
         when(dictService.getAllDictByDictType("gz_express_carrier")).thenReturn(

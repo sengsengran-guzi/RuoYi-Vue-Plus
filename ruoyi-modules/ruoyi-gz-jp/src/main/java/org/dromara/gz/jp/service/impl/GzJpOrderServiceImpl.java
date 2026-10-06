@@ -118,6 +118,8 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
     private final org.dromara.gz.jp.service.internal.GzJpSnapPaidTaskService snapPaidTasks;
     private final org.dromara.gz.jp.service.internal.GzJpSnapReadService snapReads;
 
+    private final org.dromara.gz.jp.service.internal.GzJpSnapOrderDisplayService snapDisplay;
+
     // ============================================================
     //  下单（FLOW:F-JP-02.step4）
     // ============================================================
@@ -425,13 +427,21 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
                 .eq(GzJpOrderItem::getOrderId, orderId)
                 .orderByAsc(GzJpOrderItem::getId));
 
+        var displays = snapDisplay.load(items);
         Map<Long, String> urlCache = new HashMap<>();
         // 字典整单只读一次（30 款逐行读字典就是 N 次缓存往返）
         Map<String, String> carriers = safeDictMap();
         List<GzJpOrderItemVO> itemVOs = new ArrayList<>(items.size());
         int totalQty = 0;
         for (GzJpOrderItem item : items) {
-            itemVOs.add(toItemVO(item, urlCache, carriers));
+            var itemVO = toItemVO(item, urlCache, carriers);
+            var display = displays.get(item.getId());
+            if (display != null) {
+                itemVO.setSnapStatus(display.status());
+                itemVO.setSnapTradeStatus(display.trade());
+                itemVO.setShippingDiffRefundedCent(display.shippingRefunded());
+            }
+            itemVOs.add(itemVO);
             totalQty += ObjectUtil.defaultIfNull(item.getQty(), 0);
         }
 
@@ -474,18 +484,19 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
             Wrappers.<GzJpOrderItem>lambdaQuery()
                 .in(GzJpOrderItem::getOrderId, orderIds)
                 .orderByAsc(GzJpOrderItem::getId));
+        var displays = snapDisplay.load(items);
         Map<Long, List<GzJpOrderItem>> byOrder = new HashMap<>();
         for (GzJpOrderItem item : items) {
             byOrder.computeIfAbsent(item.getOrderId(), k -> new ArrayList<>()).add(item);
         }
         Map<Long, String> urlCache = new HashMap<>();
         voPage.setRecords(page.getRecords().stream()
-            .map(o -> toListVO(o, byOrder.getOrDefault(o.getId(), List.of()), urlCache))
+            .map(o -> toListVO(o, byOrder.getOrDefault(o.getId(), List.of()), urlCache, displays))
             .toList());
         return TableDataInfo.build(voPage);
     }
 
-    private GzJpOrderListItemVO toListVO(GzJpOrder o, List<GzJpOrderItem> items, Map<Long, String> urlCache) {
+    private GzJpOrderListItemVO toListVO(GzJpOrder o, List<GzJpOrderItem> items, Map<Long, String> urlCache, Map<Long, org.dromara.gz.jp.service.internal.GzJpSnapOrderDisplayService.Display> displays) {
         GzJpOrderListItemVO vo = new GzJpOrderListItemVO();
         vo.setId(o.getId());
         vo.setOrderNo(o.getOrderNo());
@@ -501,6 +512,15 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
                 JpOrderSnapshot.Product snap = readJson(item.getProductSnapshotJson(), JpOrderSnapshot.Product.class);
                 thumbs.add(resolveSnapshotImage(snap, urlCache));
             }
+        }
+        // 代切提交一单一行；批量读取本页任务与退款，避免每张卡片查库。
+        var snapRows = items.stream().filter(i -> "snap".equals(i.getSource())).toList();
+        if (!snapRows.isEmpty()) {
+            var display = displays.getOrDefault(snapRows.get(0).getId(), org.dromara.gz.jp.service.internal.GzJpSnapOrderDisplayService.project(null, 0));
+            vo.setRefundStatus(snapRows.get(0).getRefundStatus());
+            vo.setSnapStatus(display.status());
+            vo.setSnapTradeStatus(display.trade());
+            vo.setShippingDiffRefundedCent(snapRows.stream().mapToLong(i -> displays.getOrDefault(i.getId(), org.dromara.gz.jp.service.internal.GzJpSnapOrderDisplayService.project(null, 0)).shippingRefunded()).sum());
         }
         vo.setTotalQty(totalQty);
         vo.setThumbUrls(thumbs);

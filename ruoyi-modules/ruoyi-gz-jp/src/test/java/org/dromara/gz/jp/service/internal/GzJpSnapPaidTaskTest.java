@@ -33,7 +33,7 @@ class GzJpSnapPaidTaskTest {
         snapshot("auto",null);var orders=mock(GzJpOrderMapper.class);var rows=mock(GzJpOrderItemMapper.class);
         when(orders.selectByOrderNoForUpdate("JPO-test")).thenReturn(order);when(orders.markPaid(any(),any(),any())).thenReturn(1,0);
         when(rows.selectList(any(com.baomidou.mybatisplus.core.conditions.Wrapper.class))).thenReturn(java.util.List.of(row));
-        var ordersService=new GzJpOrderServiceImpl(orders,rows,null,null,null,null,null,null,null,null,null,json,service,null);
+        var ordersService=new GzJpOrderServiceImpl(orders,rows,null,null,null,null,null,null,null,null,null,json,service,null, org.mockito.Mockito.mock(org.dromara.gz.jp.service.internal.GzJpSnapOrderDisplayService.class));
         var txn=new GzPayTransaction();txn.setId(9L);txn.setBusinessOrderNo("JPO-test");txn.setPaidTime(java.time.LocalDateTime.now());
         ordersService.onPaid(txn);ordersService.onPaid(txn);verify(tasks,times(1)).insertIfAbsent(any());verify(rows,times(1)).activatePurchasing(1L);
     }
