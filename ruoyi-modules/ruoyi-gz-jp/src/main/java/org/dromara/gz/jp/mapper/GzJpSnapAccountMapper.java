@@ -26,4 +26,9 @@ public interface GzJpSnapAccountMapper extends BaseMapperPlus<GzJpSnapAccount, G
 
     @Update("UPDATE gz_jp_snap_account SET pause_reason=#{reason}, update_time=NOW(), version=version+1 WHERE tenant_id='1001' AND del_flag='0' AND account_code=#{code}")
     int pauseAccount(@Param("code") String code, @Param("reason") String reason);
+
+    @Select("SELECT * FROM gz_jp_snap_account WHERE tenant_id='1001' AND del_flag='0' ORDER BY id FOR UPDATE")
+    List<GzJpSnapAccount> lockAccounts();
+    @Update("UPDATE gz_jp_snap_account SET today_count=CASE WHEN today_date=#{date} THEN today_count+1 ELSE 1 END,today_date=#{date},last_purchase_at=#{now},version=version+1,update_time=#{now} WHERE id=#{id} AND del_flag='0'")
+    int consume(@Param("id") Long id,@Param("date") java.time.LocalDate date,@Param("now") LocalDateTime now);
 }

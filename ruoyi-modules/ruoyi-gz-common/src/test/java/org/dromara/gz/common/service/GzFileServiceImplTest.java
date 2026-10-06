@@ -234,4 +234,21 @@ class GzFileServiceImplTest {
         assertThat(vo.getUrl()).contains("X-Amz-Signed=fake");
         verify(ossClient).createPresignedGetUrl(eq("gz/2026/05/uuid.png"), eq(Duration.ofHours(1)));
     }
+
+    @Test void snapHtmlStoredAsDownloadOnly() {
+        var upload = UploadResult.builder().filename("snap/evidence.html").eTag("test").build();
+        when(ossClient.uploadSuffix(any(byte[].class), eq(".html"), eq("application/octet-stream"))).thenReturn(upload);
+        Mockito.doAnswer(inv -> { ((GzFileObject) inv.getArgument(0)).setId(305L); return 1; }).when(baseMapper).insert(any(GzFileObject.class));
+        var result = service.upload(new MockMultipartFile("file", "evidence.html", "text/html", "<html>snapshot</html>".getBytes()), "snap_evidence");
+        assertThat(result.getUsageType()).isEqualTo("snap_evidence");
+        verify(ossClient).uploadSuffix(any(byte[].class), eq(".html"), eq("application/octet-stream"));
+    }
+    @Test void adminProductImageStillRejectsHtml() {
+        assertThatThrownBy(() -> service.upload(new MockMultipartFile("file", "page.html", "text/html", "snapshot".getBytes()), "jp_product_image"))
+            .isInstanceOf(ServiceException.class).hasMessageContaining("file.mime.notAllowed");
+    }
+    @Test void evidenceMimeAndSuffixMustMatch() {
+        assertThatThrownBy(() -> service.upload(new MockMultipartFile("file", "page.exe", "text/plain", "snapshot".getBytes()), "snap_evidence"))
+            .isInstanceOf(ServiceException.class).hasMessageContaining("file.suffix.notAllowed");
+    }
 }

@@ -29,6 +29,18 @@ import java.util.List;
  */
 public interface GzJpOrderItemMapper extends BaseMapperPlus<GzJpOrderItem, GzJpOrderItem> {
 
+    /** Current read after item locks; missing tasks also block admin fulfillment. */
+    @Select("SELECT trade_status FROM gz_jp_snap_purchase WHERE order_item_id=#{itemId} AND del_flag='0' FOR UPDATE")
+    String snapTradeStatusForUpdate(Long itemId);
+
+    default void assertSnapRated(List<GzJpOrderItem> rows) {
+        List<Long> blocked = rows.stream().filter(row -> "snap".equals(row.getSource()))
+            .filter(row -> !"rated".equals(snapTradeStatusForUpdate(row.getId())))
+            .map(GzJpOrderItem::getId).toList();
+        if (!blocked.isEmpty()) throw new org.dromara.common.core.exception.ServiceException(
+            "SNAP_TRADE_NOT_RATED: 验货评价后才能履约，商品行 " + blocked, 409);
+    }
+
     @Select("SELECT * FROM gz_jp_order_item WHERE id=#{id} AND del_flag='0' FOR UPDATE")
     GzJpOrderItem lockById(@Param("id") Long id);
     @Update("UPDATE gz_jp_order_item SET product_snapshot_json=JSON_SET(product_snapshot_json,'$.snap.mainImageId',#{fileId}),version=version+1,update_time=NOW() WHERE id=#{id} AND source='snap' AND del_flag='0'")

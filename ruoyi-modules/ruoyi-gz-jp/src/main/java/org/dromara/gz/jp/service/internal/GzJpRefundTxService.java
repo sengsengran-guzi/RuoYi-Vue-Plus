@@ -97,12 +97,23 @@ public class GzJpRefundTxService {
     @Transactional(rollbackFor = Exception.class)
     public GzJpRefundPlan markFailedAndCreateRefunds(List<Long> ids, String reason,
                                                      Long operatorId, String triggeredBy) {
+        return markFailedAndCreateRefunds(ids, reason, operatorId, triggeredBy, false);
+    }
+
+    /** Admin-only guard. System purchase/trade failure paths use the four-argument method. */
+    @Transactional(rollbackFor = Exception.class)
+    public GzJpRefundPlan markFailedAndCreateRefunds(List<Long> ids, String reason,
+            Long operatorId, String triggeredBy, boolean adminEntry) {
         String target = GzJpFulfillStatus.PURCHASE_FAILED.getCode();
         GzJpRefundPlan plan = new GzJpRefundPlan();
         plan.setRequested(ids.size());
 
         // ① 悲观锁加载（ids 已升序 → 并发重叠请求加锁顺序一致 → 不死锁）
+        // Serialize monetary reservation on the order before taking item locks.
+        itemMapper.selectByIds(ids).stream().map(GzJpOrderItem::getOrderId).distinct().sorted()
+            .forEach(orderMapper::selectByIdForUpdate);
         List<GzJpOrderItem> rows = itemMapper.selectByIdsForUpdate(ids);
+        if (adminEntry) itemMapper.assertSnapRated(rows);
         Map<Long, GzJpOrderItem> rowMap = new HashMap<>(rows.size());
         for (GzJpOrderItem row : rows) {
             rowMap.put(row.getId(), row);
@@ -187,7 +198,7 @@ public class GzJpRefundTxService {
         // 已有退款单的行：给人话原因而不是直接撞唯一键（DuplicateKey 报文 admin 看不懂）
         Map<Long, GzJpRefund> existing = new HashMap<>();
         for (GzJpRefund r : refundMapper.selectByOrderItemIds(candidates)) {
-            existing.put(r.getOrderItemId(), r);
+            if (!shippingDiff(r)) existing.put(r.getOrderItemId(), r);
         }
 
         // 原支付流水（按订单批量取一次，别逐行查）+ 已占用退款额（超退兜底）
@@ -206,6 +217,15 @@ public class GzJpRefundTxService {
             }
 
             long amount = row.getAmountCent() == null ? 0L : row.getAmountCent();
+            List<GzJpRefund> prior = refundMapper.selectByOrderItemIds(List.of(itemId));
+            long successfulDiff = prior.stream().filter(GzJpRefundTxService::shippingDiff)
+                .filter(r -> "refunded".equals(r.getStatus())).mapToLong(GzJpRefund::getRefundAmountCent).sum();
+            amount -= successfulDiff;
+            long usedItem = activeAmount(prior);
+            if (amount < 0 || usedItem + amount > row.getAmountCent()) {
+                throw new ServiceException("该商品退款仍在处理中或退款预算不足，请等待差价退款完成后重试",
+                    GzJpRefundErrorCode.REFUND_EXCEEDS_TOTAL);
+            }
 
             // 原支付流水：没有它就没法向微信证明「退的是哪一单」——宁可拒绝也不能凭空造一笔退款
             GzPayTransaction txn = txnByOrder.get(order.getId());
@@ -265,7 +285,7 @@ public class GzJpRefundTxService {
                 // 撞 uk_refund_no  = Redis 号段落后 DB → 自愈后由调用方重试（本次这一行跳过，不重复扣款）
                 refundNoGenerator.reconcileToDbMax();
                 GzJpRefund concurrent = refundMapper.selectByOrderItemIds(List.of(itemId))
-                    .stream().findFirst().orElse(null);
+                    .stream().filter(r -> !shippingDiff(r)).findFirst().orElse(null);
                 log.warn("[gz-jp-refund] 建退款单撞唯一键 item={}（并发或号段落后），已跳过不重复退款: {}",
                     itemId, e.getMessage());
                 if (concurrent != null) {
@@ -287,6 +307,55 @@ public class GzJpRefundTxService {
                 plan.pending(itemId, refund);
             }
         }
+    }
+
+    /** Arrival-only difference plan. Caller dispatches after this transaction commits. */
+    @Transactional(rollbackFor = Exception.class)
+    public GzJpRefundPlan createShippingDiff(Long itemId, Long actualShippingJpy) {
+        if (actualShippingJpy == null || actualShippingJpy < 0) throw new ServiceException("实际到付运费必须大于等于0");
+        GzJpOrderItem read = itemMapper.selectById(itemId);
+        if (read == null) throw new ServiceException("商品行不存在");
+        GzJpOrder order = orderMapper.selectByIdForUpdate(read.getOrderId());
+        GzJpOrderItem row = itemMapper.lockById(itemId);
+        if (row == null || !"snap".equals(row.getSource()) || order == null
+            || !GzJpOrderStatus.isPaidLike(order.getBusinessStatus()) || "purchase_failed".equals(row.getFulfillStatus()))
+            throw new ServiceException("该商品不可退到付差价");
+        long diff;
+        try {
+            var snap = new com.fasterxml.jackson.databind.ObjectMapper().readTree(row.getProductSnapshotJson()).path("snap");
+            if (!"buyer".equals(snap.path("shippingPayer").asText())) throw new ServiceException("包邮商品无需退到付差价");
+            java.math.BigDecimal rate = new java.math.BigDecimal(snap.path("ratePer100Jpy").asText());
+            if (rate.signum() <= 0 || !snap.has("estShippingCent")) throw new ServiceException("锁定运费快照无效");
+            long actual = rate.multiply(java.math.BigDecimal.valueOf(actualShippingJpy))
+                .setScale(0, java.math.RoundingMode.CEILING).longValueExact();
+            diff = Math.subtractExact(snap.path("estShippingCent").asLong(), actual);
+        } catch (java.io.IOException | NumberFormatException | ArithmeticException e) {
+            throw new ServiceException("锁定运费快照无效: " + e.getMessage());
+        }
+        GzJpRefundPlan plan = new GzJpRefundPlan(); plan.setRequested(1);
+        if (diff <= 0) return plan;
+        List<GzJpRefund> prior = refundMapper.selectByOrderItemIds(List.of(itemId));
+        GzJpRefund existing = prior.stream().filter(GzJpRefundTxService::shippingDiff).findFirst().orElse(null);
+        if (existing != null) { plan.skip(itemId, existing, skipReasonOf(existing)); return plan; }
+        GzPayTransaction txn = order.getPayTransactionId() == null ? null : payTransactionMapper.selectById(order.getPayTransactionId());
+        if (txn == null) throw new ServiceException("订单缺少支付流水");
+        if (activeAmount(prior) + diff > row.getAmountCent()
+            || refundMapper.sumActiveAmountByOrderId(order.getId()) + diff > txn.getAmountCent())
+            throw new ServiceException("退款总额将超过原支付金额", GzJpRefundErrorCode.REFUND_EXCEEDS_TOTAL);
+        GzJpRefund refund = GzJpRefund.builder().refundNo(refundNoGenerator.generate())
+            .orderId(order.getId()).orderItemId(itemId).refundType("shipping_diff").userId(row.getUserId())
+            .outTradeNo(txn.getOutTradeNo()).payTransactionId(txn.getId()).refundAmountCent(diff)
+            .totalAmountCent(txn.getAmountCent()).status("refunding").reason("到付运费差价退回")
+            .attemptCount(0).triggeredBy("snap_shipping").triggeredTime(LocalDateTime.now()).version(0).delFlag("0").build();
+        refundMapper.insert(refund); plan.pending(itemId, refund); return plan;
+    }
+
+    private static boolean shippingDiff(GzJpRefund refund) {
+        return refund != null && "shipping_diff".equals(refund.getRefundType());
+    }
+    private static long activeAmount(List<GzJpRefund> refunds) {
+        return refunds.stream().filter(r -> !"refund_failed".equals(r.getStatus()))
+            .mapToLong(GzJpRefund::getRefundAmountCent).sum();
     }
 
     // ============================================================
@@ -347,7 +416,8 @@ public class GzJpRefundTxService {
                 + "refund_id={} item={} reason={}", refundId, itemId, failReason);
             return false;
         }
-        itemMapper.writeRefundResult(itemId, GzJpRefundStatus.REFUND_FAILED.getCode(), null);
+        GzJpRefund current = refundMapper.selectByIdForUpdate(refundId);
+        if (!shippingDiff(current)) itemMapper.writeRefundResult(itemId, GzJpRefundStatus.REFUND_FAILED.getCode(), null);
         return true;
     }
 
@@ -372,6 +442,7 @@ public class GzJpRefundTxService {
         if (moved == 0) {
             return false;
         }
+        if (shippingDiff(refund)) return true;
         // 行上落结果：★ refund_amount_cent 恒 = 退款单金额 = 该行 amount_cent（accept 第 1 条断言这一点）
         itemMapper.writeRefundResult(refund.getOrderItemId(),
             GzJpRefundStatus.REFUNDED.getCode(), refund.getRefundAmountCent());
@@ -395,6 +466,7 @@ public class GzJpRefundTxService {
         if (moved == 0) {
             return false;
         }
+        if (shippingDiff(refund)) return true;
         itemMapper.writeRefundResult(refund.getOrderItemId(),
             GzJpRefundStatus.REFUND_FAILED.getCode(), null);
         return true;
@@ -409,10 +481,21 @@ public class GzJpRefundTxService {
      */
     @Transactional(rollbackFor = Exception.class)
     public boolean markRetrying(Long refundId, Long itemId) {
+        GzJpRefund read = refundMapper.selectById(refundId);
+        if (read == null) return false;
+        GzJpOrder order = orderMapper.selectByIdForUpdate(read.getOrderId());
+        GzJpOrderItem row = itemMapper.lockById(read.getOrderItemId());
+        GzJpRefund current = refundMapper.selectByIdForUpdate(refundId);
+        if (current == null || !"refund_failed".equals(current.getStatus())) return false;
+        List<GzJpRefund> prior = refundMapper.selectByOrderItemIds(List.of(current.getOrderItemId()));
+        if (row == null || order == null || activeAmount(prior) + current.getRefundAmountCent() > row.getAmountCent()
+            || refundMapper.sumActiveAmountByOrderId(order.getId()) + current.getRefundAmountCent() > current.getTotalAmountCent())
+            throw new ServiceException("退款预算已被占用，不能重试", GzJpRefundErrorCode.REFUND_EXCEEDS_TOTAL);
         if (refundMapper.markRetrying(refundId) == 0) {
             return false;
         }
-        itemMapper.writeRefundResult(itemId, GzJpRefundStatus.REFUNDING.getCode(), null);
+        if (!shippingDiff(refundMapper.selectByIdForUpdate(refundId)))
+            itemMapper.writeRefundResult(itemId, GzJpRefundStatus.REFUNDING.getCode(), null);
         return true;
     }
 

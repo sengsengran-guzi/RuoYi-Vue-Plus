@@ -60,7 +60,9 @@ public class GzFileServiceImpl implements IGzFileService {
 
         // 4. MIME 白名单校验（强约束 #3 — jpg/png/webp/gif）
         String contentType = file.getContentType();
-        if (contentType == null || !GzFileConstants.ALLOWED_IMAGE_MIME.contains(contentType.toLowerCase())) {
+        boolean evidenceDocument = usage == GzFileUsageType.SNAP_EVIDENCE && contentType != null
+            && java.util.Set.of("text/plain", "text/html", "application/json").contains(contentType.toLowerCase());
+        if (contentType == null || (!evidenceDocument && !GzFileConstants.ALLOWED_IMAGE_MIME.contains(contentType.toLowerCase()))) {
             throw new ServiceException("file.mime.notAllowed: " + contentType);
         }
 
@@ -74,7 +76,8 @@ public class GzFileServiceImpl implements IGzFileService {
             throw new ServiceException("file.suffix.missing");
         }
         String suffix = originalName.substring(dotIdx).toLowerCase();
-        if (!GzFileConstants.ALLOWED_IMAGE_SUFFIX.contains(suffix)) {
+        String expectedEvidenceSuffix = "text/plain".equals(contentType) ? ".txt" : "text/html".equals(contentType) ? ".html" : ".json";
+        if (evidenceDocument ? !expectedEvidenceSuffix.equals(suffix) : !GzFileConstants.ALLOWED_IMAGE_SUFFIX.contains(suffix)) {
             throw new ServiceException("file.suffix.notAllowed: " + suffix);
         }
 
@@ -82,7 +85,9 @@ public class GzFileServiceImpl implements IGzFileService {
         OssClient storage = OssFactory.instance();
         UploadResult uploadResult;
         try {
-            uploadResult = storage.uploadSuffix(file.getBytes(), suffix, contentType);
+            // Page snapshots are stored as downloads, never executable HTML on the storage origin.
+            String storedMime = evidenceDocument ? "application/octet-stream" : contentType;
+            uploadResult = storage.uploadSuffix(file.getBytes(), suffix, storedMime);
         } catch (IOException e) {
             log.error("[GZ-SYS-005] OSS upload IO exception", e);
             throw new ServiceException("file.upload.io: " + e.getMessage());

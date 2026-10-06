@@ -36,7 +36,9 @@ public enum GzFileUsageType {
     /** 拼团场封面（GZ-JP-101，FIELD:gz_jp_event.cover_image_id） */
     JP_EVENT_IMAGE("jp_event_image", "拼团场封面"),
     /** 拼团商品主图 + 图集（GZ-JP-102，FIELD:gz_jp_product.main_image_id / gallery_image_ids；一期用图集承载详情） */
-    JP_PRODUCT_IMAGE("jp_product_image", "拼团商品图");
+    JP_PRODUCT_IMAGE("jp_product_image", "拼团商品图"),
+    /** Gateway purchase screenshots and page snapshots; internal evidence only. */
+    SNAP_EVIDENCE("snap_evidence", "代切购买证据");
 
     /** 落库枚举值 */
     private final String code;

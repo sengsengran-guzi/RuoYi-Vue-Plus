@@ -90,7 +90,7 @@ class GzJpSnapHealthJobTest {
         when(accounts.pauseAccount("acc01", "challenge")).thenReturn(1);
         ConcurrentMapCacheManager caches = new ConcurrentMapCacheManager("sys_config");
         caches.getCache("sys_config").put("gz.jp.snap.auto", "stale enabled=true");
-        GzJpSnapRiskControl control = new GzJpSnapRiskControl(config, accounts, json, caches);
+        GzJpSnapRiskControl control = new GzJpSnapRiskControl(config, accounts, json, mock(org.dromara.gz.jp.mapper.GzJpSnapPurchaseMapper.class), caches);
         TransactionSynchronizationManager.initSynchronization();
         try {
             control.pause("acc01", "challenge");

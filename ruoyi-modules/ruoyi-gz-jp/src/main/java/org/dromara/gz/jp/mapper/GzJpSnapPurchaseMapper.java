@@ -14,4 +14,28 @@ import org.dromara.gz.jp.domain.entity.GzJpSnapPurchase;
 public interface GzJpSnapPurchaseMapper extends BaseMapperPlus<GzJpSnapPurchase, GzJpSnapPurchase> {
     @org.apache.ibatis.annotations.Insert("INSERT INTO gz_jp_snap_purchase(order_item_id,order_no,snap_item_id,external_id,locked_price_jpy,mode,purchase_status,manual_reason,next_action_at,reconcile_count,trade_status,version,create_time,update_time) VALUES(#{orderItemId},#{orderNo},#{snapItemId},#{externalId},#{lockedPriceJpy},#{mode},#{purchaseStatus},#{manualReason},#{nextActionAt},0,'none',0,NOW(),NOW()) ON DUPLICATE KEY UPDATE order_item_id=order_item_id")
     int insertIfAbsent(GzJpSnapPurchase task);
+
+    @org.apache.ibatis.annotations.Select("SELECT * FROM gz_jp_snap_purchase WHERE tenant_id='1001' AND del_flag='0' AND purchase_status IN ('queued','unknown') AND next_action_at<=#{now} ORDER BY id LIMIT 32")
+    java.util.List<GzJpSnapPurchase> due(java.time.LocalDateTime now);
+    @org.apache.ibatis.annotations.Select("SELECT * FROM gz_jp_snap_purchase WHERE id=#{id} AND del_flag='0' FOR UPDATE")
+    GzJpSnapPurchase lock(Long id);
+    @org.apache.ibatis.annotations.Update("UPDATE gz_jp_snap_purchase SET purchase_status='executing',account_code=#{code},executed_at=#{now},next_action_at=NULL,version=version+1,update_time=#{now} WHERE id=#{id} AND purchase_status='queued' AND version=#{version} AND del_flag='0'")
+    int claim(@org.apache.ibatis.annotations.Param("id") Long id,@org.apache.ibatis.annotations.Param("version") Integer version,@org.apache.ibatis.annotations.Param("code") String code,@org.apache.ibatis.annotations.Param("now") java.time.LocalDateTime now);
+    @org.apache.ibatis.annotations.Update("UPDATE gz_jp_snap_purchase SET purchase_status='unknown',next_action_at=NOW(),last_error='restart: execution outcome unknown',version=version+1,update_time=NOW() WHERE tenant_id='1001' AND del_flag='0' AND purchase_status='executing' AND executed_at<#{cutoff}")
+    int recover(java.time.LocalDateTime cutoff);
+    @org.apache.ibatis.annotations.Update("UPDATE gz_jp_snap_purchase SET purchase_status='manual_pending',manual_reason='auto_paused',next_action_at=NULL,version=version+1,update_time=NOW() WHERE tenant_id='1001' AND del_flag='0' AND purchase_status='queued'")
+    int pauseQueued();
+    @org.apache.ibatis.annotations.Select("SELECT COUNT(*) FROM gz_jp_snap_purchase WHERE tenant_id='1001' AND del_flag='0' AND account_code=#{code} AND purchase_status='executing'")
+    int executing(String code);
+    @org.apache.ibatis.annotations.Select("SELECT purchase_status FROM gz_jp_snap_purchase WHERE tenant_id='1001' AND del_flag='0' AND account_code=#{code} AND executed_at IS NOT NULL ORDER BY executed_at DESC,id DESC LIMIT 3")
+    java.util.List<String> recentResults(String code);
+
+    @org.apache.ibatis.annotations.Update("UPDATE gz_jp_snap_purchase SET purchase_status=#{purchaseStatus},manual_reason=#{manualReason},fail_reason=#{failReason},reconcile_count=#{reconcileCount},next_action_at=#{nextActionAt},mercari_txn_id=#{mercariTxnId},actual_price_jpy=#{actualPriceJpy},trade_status=#{tradeStatus},result_at=#{resultAt},evidence_file_ids=COALESCE(#{evidenceFileIds},evidence_file_ids),last_error=COALESCE(#{lastError},last_error),manual_operator=#{manualOperator},manual_note=#{manualNote},version=version+1,update_time=NOW() WHERE id=#{id} AND version=#{version} AND del_flag='0'")
+    int saveOutcome(GzJpSnapPurchase task);
+    @org.apache.ibatis.annotations.Select("SELECT p.* FROM gz_jp_snap_purchase p JOIN gz_jp_order_item i ON i.id=p.order_item_id AND i.tenant_id=p.tenant_id AND i.del_flag='0' JOIN gz_jp_order o ON o.id=i.order_id AND o.tenant_id=p.tenant_id AND o.del_flag='0' WHERE p.del_flag='0' AND p.purchase_status='manual_pending' ORDER BY o.paid_time ASC,p.id ASC")
+    java.util.List<GzJpSnapPurchase> manualList();
+    @org.apache.ibatis.annotations.Update("UPDATE gz_jp_snap_purchase SET trade_status=#{tradeStatus},fail_reason=#{failReason},actual_shipping_jpy=#{actualShippingJpy},arrived_at=#{arrivedAt},rate_deadline_at=#{rateDeadlineAt},rated_at=#{ratedAt},manual_operator=COALESCE(#{manualOperator},manual_operator),version=version+1,update_time=NOW() WHERE id=#{id} AND version=#{version} AND del_flag='0'")
+    int saveTrade(GzJpSnapPurchase task);
+    @org.apache.ibatis.annotations.Select("SELECT * FROM gz_jp_snap_purchase WHERE del_flag='0' AND purchase_status='success' AND trade_status IN ('await_ship','shipped') ORDER BY id")
+    java.util.List<GzJpSnapPurchase> patrolTrades();
 }

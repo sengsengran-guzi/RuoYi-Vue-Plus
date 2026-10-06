@@ -24,6 +24,7 @@ public class GzJpSnapRiskControl {
     private final GzJpSnapRuntimeConfigMapper configMapper;
     private final GzJpSnapAccountMapper accountMapper;
     private final ObjectMapper json;
+    private final org.dromara.gz.jp.mapper.GzJpSnapPurchaseMapper purchases;
     private final CacheManager cacheManager;
 
     @Transactional(rollbackFor = Exception.class)
@@ -38,7 +39,9 @@ public class GzJpSnapRiskControl {
                 value.put("pausedReason", reason);
                 value.put("pausedAt", OffsetDateTime.now().toString());
                 if (configMapper.writeAutoConfig(json.writeValueAsString(value)) != 1) throw new IllegalStateException("Auto config update failed");
+                if (accountCode != null) accountMapper.recordHealth(accountCode, "challenge", false, java.time.LocalDateTime.now());
                 if (accountCode != null && accountMapper.pauseAccount(accountCode, reason) != 1) throw new IllegalStateException("Snap account not found: " + accountCode);
+                purchases.pauseQueued();
             } catch (java.io.IOException ex) {
                 throw new IllegalStateException("Invalid snap auto config", ex);
             }
