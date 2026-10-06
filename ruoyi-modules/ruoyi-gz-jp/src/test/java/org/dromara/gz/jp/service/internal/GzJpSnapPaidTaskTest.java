@@ -27,7 +27,7 @@ class GzJpSnapPaidTaskTest {
         var bounded=saved().getManualReason();assertEquals(64,bounded.codePointCount(0,bounded.length()));
         assertEquals(full,json.readValue(row.getProductSnapshotJson(),JpOrderSnapshot.Product.class).getSnap().getGateReason());}
     @Test void pauseSendsAutoToManual()throws Exception {snapshot("auto",null);when(config.getConfigValue(anyString())).thenReturn("{\"enabled\":false}");service.enqueue(order,row);assertEquals("auto_paused",saved().getManualReason());}
-    @Test void missingConfigFailsClosed()throws Exception {snapshot("auto",null);service.enqueue(order,row);assertEquals("manual",saved().getMode());}
+    @Test void missingConfigFailsClosed()throws Exception {snapshot("auto",null);when(config.getConfigValue(anyString())).thenReturn("");service.enqueue(order,row);assertEquals("manual",saved().getMode());}
     @Test void invalidSnapshotRollsBack() {row.setProductSnapshotJson("{}");assertThrows(org.dromara.common.core.exception.ServiceException.class,()->service.enqueue(order,row));verifyNoInteractions(tasks);}
     @Test void repeatedPaymentDoesNotEnqueueTwice()throws Exception {
         snapshot("auto",null);var orders=mock(GzJpOrderMapper.class);var rows=mock(GzJpOrderItemMapper.class);

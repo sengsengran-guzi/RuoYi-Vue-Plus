@@ -19,7 +19,7 @@ public class GzJpSnapPaidTaskService {
             var snap=json.readValue(item.getProductSnapshotJson(), JpOrderSnapshot.Product.class).getSnap();
             if (snap==null || snap.getPriceJpy()==null || snap.getExternalId()==null) throw new ServiceException("代切订单快照不完整");
             String raw=config.getConfigValue("gz.jp.snap.auto");
-            boolean enabled=raw!=null && json.readTree(raw).path("enabled").asBoolean(false);
+            boolean enabled=raw!=null && !raw.isBlank() && json.readTree(raw).path("enabled").asBoolean(false);
             boolean manual="manual".equals(snap.getGateResult()) || !enabled;
             String reason="manual".equals(snap.getGateResult()) ? "gate:"+(snap.getGateReason()==null?"manual":snap.getGateReason()) : "auto_paused";
             // Task reason is VARCHAR(64); retain the full admission evidence in the order snapshot.
