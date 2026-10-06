@@ -59,7 +59,7 @@ public class GzJpSnapExecutorTx {
   String reason=r==null?"":r.path("reason").asText();
   if(r!=null&&"failed".equals(r.path("result").asText())&&Set.of("sold_out","deleted","price_up").contains(reason)){
    t.setPurchaseStatus("failed");t.setFailReason(reason);t.setResultAt(now);t.setNextActionAt(null);save(t);
-   var plan=refunds.markFailedAndCreateRefunds(List.of(item.getId()),"代切购买失败: "+reason,null,"snap_scheduler");if(!plan.getRejects().isEmpty())throw new IllegalStateException("Snap refund rejected");snaps.releaseSnapLock(item.getId());return plan;
+   var plan=refunds.markFailedAndCreateRefunds(List.of(item.getId()),"代切购买失败: "+reason,null,"snap_scheduler");if(!plan.getRejects().isEmpty()||!plan.getRefundRejects().isEmpty())throw new IllegalStateException("Snap refund rejected");snaps.releaseSnapLock(item.getId());return plan;
   }
   if(r!=null&&"failed".equals(r.path("result").asText())&&Set.of("shipping_changed","account_unpayable").contains(reason)){t.setPurchaseStatus("manual_pending");t.setManualReason(reason);t.setNextActionAt(null);}
   else{t.setPurchaseStatus("unknown");t.setNextActionAt(now.plusSeconds(30));}save(t);return null;

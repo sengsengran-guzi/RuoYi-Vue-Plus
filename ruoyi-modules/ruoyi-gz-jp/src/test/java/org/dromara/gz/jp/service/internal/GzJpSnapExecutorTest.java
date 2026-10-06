@@ -13,4 +13,16 @@ import static org.mockito.Mockito.*;
  @Test void timeoutNeverRefundsOrRequeues(){var f=new Snap305Fixture();f.task.setPurchaseStatus("executing");f.tx.result(f.task,null,false,null,"timeout");assertEquals("unknown",f.task.getPurchaseStatus());assertTrue(f.task.getNextActionAt().isAfter(LocalDateTime.now().plusSeconds(29)));verifyNoInteractions(f.refunds);}
  @Test void disabledSwitchDoesNotClaim(){var f=new Snap305Fixture();when(f.runtime.lockAutoConfig()).thenReturn("{\"enabled\":false}");assertNull(f.tx.claim(1L,LocalDateTime.now()));verifyNoInteractions(f.accounts);}
  @Test void alreadyExecutingAccountWaits(){var f=new Snap305Fixture();f.task.setPurchaseStatus("queued");when(f.accounts.lockAccounts()).thenReturn(List.of(f.account()));when(f.tasks.executing("acc01")).thenReturn(1);assertNull(f.tx.claim(1L,LocalDateTime.now()));assertEquals("queued",f.task.getPurchaseStatus());}
+
+ @Test void failedTransitionCreatesRefundBeforeReleasingMatchingLock() throws Exception {
+  var f=new Snap305Fixture();f.task.setPurchaseStatus("executing");var plan=new org.dromara.gz.jp.service.internal.dto.GzJpRefundPlan();
+  when(f.refunds.markFailedAndCreateRefunds(anyList(),anyString(),isNull(),anyString())).thenReturn(plan);
+  assertSame(plan,f.tx.result(f.task,f.json.readTree("{\"result\":\"failed\",\"reason\":\"sold_out\"}"),false,null,null));
+  var order=inOrder(f.tasks,f.refunds,f.snaps);order.verify(f.snaps).lockSnapById(3L);order.verify(f.tasks).lock(1L);order.verify(f.tasks).saveOutcome(any());order.verify(f.refunds).markFailedAndCreateRefunds(eq(List.of(2L)),anyString(),isNull(),eq("snap_scheduler"));order.verify(f.snaps).releaseSnapLock(2L);
+ }
+ @Test void rejectedRefundRollsBackInsteadOfReleasingLock() throws Exception {
+  var f=new Snap305Fixture();f.task.setPurchaseStatus("executing");var plan=new org.dromara.gz.jp.service.internal.dto.GzJpRefundPlan();plan.rejectRefund(2L,"missing payment",500);
+  when(f.refunds.markFailedAndCreateRefunds(anyList(),anyString(),isNull(),anyString())).thenReturn(plan);
+  assertThrows(IllegalStateException.class,()->f.tx.result(f.task,f.json.readTree("{\"result\":\"failed\",\"reason\":\"sold_out\"}"),false,null,null));verify(f.snaps,never()).releaseSnapLock(anyLong());
+ }
 }
