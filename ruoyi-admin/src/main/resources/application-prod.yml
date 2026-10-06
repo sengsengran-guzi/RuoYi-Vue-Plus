@@ -353,5 +353,7 @@ gz:
 gz:
   jp:
     snap:
+      translate:
+        provider: ${GZ_JP_SNAP_TRANSLATE_PROVIDER:aliyun}
       gateway:
         base-url: ${GZ_JP_GATEWAY_URL:}

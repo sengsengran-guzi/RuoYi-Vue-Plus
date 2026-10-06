@@ -1,5 +1,6 @@
 package org.dromara.gz.jp.mapper;
 
+import org.apache.ibatis.annotations.Insert;
 import org.dromara.common.mybatis.core.mapper.BaseMapperPlus;
 import org.dromara.gz.jp.domain.entity.GzJpSnapItem;
 
@@ -12,4 +13,8 @@ import org.dromara.gz.jp.domain.entity.GzJpSnapItem;
  * @author kevin-coder (sensenran-guzi · GZ-SNAP-102)
  */
 public interface GzJpSnapItemMapper extends BaseMapperPlus<GzJpSnapItem, GzJpSnapItem> {
+    @Insert("INSERT INTO gz_jp_snap_item (platform,external_id,title_ja,title_zh,price_jpy,item_status,shipping_payer,category_id,condition_text,seller_id,gate_result,gate_reason,raw_json,fetched_at,create_time,update_time) "
+        + "VALUES (#{platform},#{externalId},#{titleJa},#{titleZh},#{priceJpy},#{itemStatus},#{shippingPayer},#{categoryId},#{conditionText},#{sellerId},#{gateResult},#{gateReason},#{rawJson},#{fetchedAt},NOW(),NOW()) "
+        + "ON DUPLICATE KEY UPDATE title_ja=VALUES(title_ja),title_zh=VALUES(title_zh),price_jpy=VALUES(price_jpy),item_status=VALUES(item_status),shipping_payer=VALUES(shipping_payer),category_id=VALUES(category_id),condition_text=VALUES(condition_text),seller_id=VALUES(seller_id),gate_result=VALUES(gate_result),gate_reason=VALUES(gate_reason),raw_json=VALUES(raw_json),fetched_at=VALUES(fetched_at),update_time=NOW(),version=version+1")
+    int upsertLive(GzJpSnapItem item);
 }

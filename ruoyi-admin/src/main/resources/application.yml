@@ -301,6 +301,12 @@ warm-flow:
 gz:
   jp:
     snap:
+      image-base-url: ${GZ_JP_SNAP_IMAGE_BASE_URL:http://127.0.0.1:8700}
+      translate:
+        provider: ${GZ_JP_SNAP_TRANSLATE_PROVIDER:aliyun}
+        endpoint: ${GZ_JP_SNAP_TRANSLATE_ENDPOINT:mt.cn-hangzhou.aliyuncs.com}
+        access-key-id: ${ALIYUN_TRANSLATE_ACCESS_KEY_ID:}
+        access-key-secret: ${ALIYUN_TRANSLATE_ACCESS_KEY_SECRET:}
       gateway:
         base-url: ${GZ_JP_GATEWAY_URL:http://127.0.0.1:8700}
         secret: ${GZ_JP_GATEWAY_SECRET:}

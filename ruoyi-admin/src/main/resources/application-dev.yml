@@ -346,5 +346,7 @@ gz:
     enabled: ${GZ_LOCAL_SCHEDULER_ENABLED:false}
   jp:
     snap:
+      translate:
+        provider: ${GZ_JP_SNAP_TRANSLATE_PROVIDER:mock}
       gateway:
         base-url: http://127.0.0.1:8700

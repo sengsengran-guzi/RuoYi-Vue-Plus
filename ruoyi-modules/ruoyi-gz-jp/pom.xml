@@ -18,6 +18,8 @@
     </description>
 
     <dependencies>
+        <!-- Kevin explicitly approved official machine translation SDK for GZ-SNAP-302. -->
+        <dependency><groupId>com.aliyun</groupId><artifactId>alimt20181012</artifactId><version>1.5.2</version></dependency>
         <!-- 谷子宇宙业务通用层（微信登录 / 支付通道 / 文件对象 / 回收站注册表），
              并传递引入全部 ruoyi-common-*（core / mybatis / tenant / web / log / security / idempotent 等）。 -->
         <dependency>
