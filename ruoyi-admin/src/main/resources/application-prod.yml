@@ -348,3 +348,10 @@ gz:
   # 日后部署 SnailJob 集群（路 A）→ 注入 GZ_LOCAL_SCHEDULER_ENABLED=false 关掉本地版避免与控制台 cron 双跑。
   local-scheduler:
     enabled: ${GZ_LOCAL_SCHEDULER_ENABLED:true}
+
+--- # 生产必须显式配置日本服务地址；空地址不会退回本机。
+gz:
+  jp:
+    snap:
+      gateway:
+        base-url: ${GZ_JP_GATEWAY_URL:}
