@@ -47,9 +47,10 @@ public class GzJpSnapRiskControl {
             }
         });
         Runnable evict = () -> TenantHelper.dynamic("1001", () ->
-            Objects.requireNonNull(cacheManager.getCache(CacheNames.SYS_CONFIG)).evict(AUTO_CONFIG_KEY));
+            Objects.requireNonNull(cacheManager.getCache(CacheNames.SYS_CONFIG)).evictIfPresent(AUTO_CONFIG_KEY));
         // Evict through the framework cache manager: both Redisson local cache and shared Redis.
         // Only after commit, so another reader cannot repopulate the old value before commit.
+        // evictIfPresent is immediate: evict would register another afterCommit too late.
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override public void afterCommit() { evict.run(); }
