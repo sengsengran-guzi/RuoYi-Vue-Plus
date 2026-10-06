@@ -25,6 +25,7 @@ import org.springframework.stereotype.Component;
 public class GzLocalJpScheduler {
 
     private final GzJpSnapHealthJob snapHealthJob;
+    private final org.dromara.gz.jp.service.internal.GzJpSnapFxService snapFxService;
     private final GzJpUnpaidExpireJob unpaidExpireJob;
     private final GzJpRefundCompensateJob refundCompensateJob;
 
@@ -57,6 +58,10 @@ public class GzLocalJpScheduler {
             log.error("[gz-local-sched] jp-refund-compensate FAILED", ex);
         }
     }
+    @Scheduled(fixedDelayString = "${gz.local-scheduler.jp-snap-fx-ms:1800000}",
+        initialDelayString = "${gz.local-scheduler.initial-delay-ms:60000}")
+    public void snapFx() { snapFxService.fetch(); }
+
     @Scheduled(fixedDelayString = "${gz.local-scheduler.jp-snap-heartbeat-ms:120000}",
         initialDelayString = "${gz.local-scheduler.initial-delay-ms:60000}")
     public void snapHeartbeat() {

@@ -15,6 +15,10 @@ public class GzJpSnapFilter {
     public String reason(JsonNode item, Rules rules) {
         if ("shops".equals(item.path("item_type").asText())) return "shops_unsupported";
         if (!"on_sale".equals(item.path("status").asText())) return "item_not_on_sale";
+        return admissionReason(item, rules);
+    }
+    public String admissionReason(JsonNode item, Rules rules) {
+        if ("shops".equals(item.path("item_type").asText())) return "shops_unsupported";
         boolean allowed = rules.categories().contains(item.path("category_id").asText());
         for (JsonNode id : item.path("category_lineage")) allowed |= rules.categories().contains(id.asText());
         if (!allowed) return "category_not_allowed";

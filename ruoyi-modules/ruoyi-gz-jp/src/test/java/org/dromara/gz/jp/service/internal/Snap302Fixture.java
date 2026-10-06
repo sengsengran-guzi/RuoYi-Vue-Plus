@@ -21,10 +21,13 @@ class Snap302Fixture {
     final GzJpSnapTranslator translator = new GzJpSnapTranslator(properties, cache);
     final GzJpSnapNormalizer normalizer = new GzJpSnapNormalizer(gateway, translator);
     final GzJpSnapFilter filter = new GzJpSnapFilter();
-    final GzJpSnapReadService service = new GzJpSnapReadService(gateway, normalizer, filter, translator, cache, config, terms, items, properties, mock(GzJpSnapRiskControl.class), json);
+    final GzJpSnapQuoteService quotes = mock(GzJpSnapQuoteService.class);
+    final GzJpSnapReadService service = new GzJpSnapReadService(gateway, normalizer, filter, translator, cache, config, terms, items, properties, mock(GzJpSnapRiskControl.class), json, new GzJpSnapGate(), quotes);
     Snap302Fixture() {
         when(config.getConfigValue("gz.jp.snap.filter")).thenReturn("{\"categoryWhitelist\":[\"745\",\"975\",\"980\"],\"keywordBlacklist\":[\"専用\"]}");
+        when(quotes.quote(anyString(), anyLong(), anyString(), anyString())).thenReturn(new org.dromara.gz.jp.domain.vo.GzJpSnapPriceVO(1,0,0,1,801,"test",Long.MAX_VALUE));
         when(terms.selectList(any())).thenReturn(List.of());
+        when(config.getConfigValue("gz.jp.snap.gate")).thenReturn("{\"blockKeywords\":[\"専用\"],\"proxyRefuseKeywords\":[\"代行業者\"],\"manualKeywords\":[\"即購入不可\"]}");
     }
     JsonNode node(String value) { try { return json.readTree(value); } catch (Exception ex) { throw new IllegalArgumentException(ex); } }
     JsonNode item(String id, String category, String type, String status, String title) {
