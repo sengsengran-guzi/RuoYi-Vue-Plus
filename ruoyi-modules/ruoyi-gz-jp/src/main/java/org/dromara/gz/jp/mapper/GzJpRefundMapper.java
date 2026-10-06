@@ -58,7 +58,7 @@ public interface GzJpRefundMapper extends BaseMapperPlus<GzJpRefund, GzJpRefund>
      * @return 已存在的退款单（可能为空）
      */
     @Select("<script>SELECT * FROM gz_jp_refund WHERE del_flag = '0' AND order_item_id IN "
-        + "<foreach collection='ids' item='id' open='(' separator=',' close=')'>#{id}</foreach></script>")
+        + "<foreach collection='ids' item='id' open='(' separator=',' close=')'>#{id}</foreach> FOR UPDATE</script>")
     List<GzJpRefund> selectByOrderItemIds(@Param("ids") Collection<Long> orderItemIds);
 
     /**
@@ -71,7 +71,7 @@ public interface GzJpRefundMapper extends BaseMapperPlus<GzJpRefund, GzJpRefund>
      * @return 已占用金额（无退款单返回 0，不返回 null）
      */
     @Select("SELECT COALESCE(SUM(refund_amount_cent), 0) FROM gz_jp_refund "
-        + "WHERE del_flag = '0' AND order_id = #{orderId} AND status IN ('refunding','refunded')")
+        + "WHERE del_flag = '0' AND order_id = #{orderId} AND status != 'refund_failed' FOR UPDATE")
     long sumActiveAmountByOrderId(@Param("orderId") Long orderId);
 
     /**

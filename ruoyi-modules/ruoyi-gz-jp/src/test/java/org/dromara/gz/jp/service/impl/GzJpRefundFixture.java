@@ -191,6 +191,8 @@ class GzJpRefundFixture {
     // ============================================================
 
     private void wireItemMapper() {
+        Mockito.when(itemMapper.selectById(any())).thenAnswer(inv -> items.get((Long) inv.getArgument(0)));
+        Mockito.when(itemMapper.lockById(anyLong())).thenAnswer(inv -> items.get((Long) inv.getArgument(0)));
         Mockito.when(itemMapper.selectByIdsForUpdate(any())).thenAnswer(inv -> {
             Collection<Long> ids = inv.getArgument(0);
             lockCalls.add(new ArrayList<>(ids));

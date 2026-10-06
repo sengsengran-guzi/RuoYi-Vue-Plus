@@ -150,6 +150,12 @@ public class GzJpRefundServiceImpl implements IGzJpRefundService {
         return dispatchSnapRefundPlan(plan, ids);
     }
 
+    /** Used by the arrival flow; external payment dispatch always follows transaction commit. */
+    public GzJpMarkFailedResultVO refundShippingDiff(Long orderItemId, Long actualShippingJpy) {
+        resolveRefundNotifyUrl();
+        return dispatchSnapRefundPlan(txService.createShippingDiff(orderItemId, actualShippingJpy), List.of());
+    }
+
     /** Dispatch an already committed refund plan; snap result and plan are created atomically. */
     public GzJpMarkFailedResultVO dispatchSnapRefundPlan(GzJpRefundPlan plan, List<Long> ids) {
         String notifyUrl = resolveRefundNotifyUrl();
@@ -157,7 +163,7 @@ public class GzJpRefundServiceImpl implements IGzJpRefundService {
         //   「边到边发，最后剩几款买不到、标失败退款」。那条路径上原先一次发货上报都没有，
         //   于是订单实际结束、微信侧却永远停在「部分发货」（只有 is_all_delivered=true 才收口）。
         //   放在事务①提交之后：此刻 purchase_failed 已落库，countUnfinished 才算得准。
-        settleShippingIfAllDone(ids);
+        if (!ids.isEmpty()) settleShippingIfAllDone(ids);
 
         // ── 事务外：逐张提交微信 ──
         int accepted = 0;
