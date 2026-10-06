@@ -30,7 +30,12 @@ public class GzJpSnapFxService {
         rates.insert(entity); return entity;
     }
     public List<GzJpFxRate> history() {
-        return rates.selectList(new LambdaQueryWrapper<GzJpFxRate>().orderByDesc(GzJpFxRate::getFetchedAt).orderByDesc(GzJpFxRate::getId).last("LIMIT 50"));
+        return rates.selectList(new LambdaQueryWrapper<GzJpFxRate>().orderByDesc(GzJpFxRate::getFetchedAt).orderByDesc(GzJpFxRate::getId).last("LIMIT 20"));
+    }
+    public record Latest(GzJpFxRate rate,boolean stale) {}
+    public Latest latest() {
+        var rows=history();var latest=rows.isEmpty()?null:rows.get(0);
+        return new Latest(latest,latest==null || latest.getFetchedAt()==null || latest.getFetchedAt().isBefore(LocalDateTime.now().minusHours(6)));
     }
     /** On failure append nothing: previous observations and manual overrides remain intact. */
     public void fetch() {
