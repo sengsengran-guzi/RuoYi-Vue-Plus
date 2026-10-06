@@ -52,6 +52,9 @@ public class GzJpFulfillBoardItemVO implements Serializable {
 
     @JsonSerialize(using = ToStringSerializer.class)
     private Long productId;
+    /** 来源 batch / snap；代切交易状态仅 snap 行有值。 */
+    private String source;
+    private String snapTradeStatus;
 
     /** 商品编号（快照） */
     private String productNo;

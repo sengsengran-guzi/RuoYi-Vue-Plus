@@ -657,6 +657,8 @@ public class GzJpFulfillServiceImpl implements IGzJpFulfillService {
         vo.setBusinessStatus(row.getBusinessStatus());
         vo.setUserId(row.getUserId());
         vo.setProductId(row.getProductId());
+        vo.setSource(row.getSource());
+        vo.setSnapTradeStatus(row.getSnapTradeStatus());
         vo.setQty(row.getQty());
         vo.setUnitPriceCent(row.getUnitPriceCent());
         vo.setAmountCent(row.getAmountCent());
