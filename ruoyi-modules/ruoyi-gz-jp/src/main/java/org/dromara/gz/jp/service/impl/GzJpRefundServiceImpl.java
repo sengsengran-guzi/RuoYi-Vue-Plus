@@ -147,6 +147,12 @@ public class GzJpRefundServiceImpl implements IGzJpRefundService {
         // ── 事务① ──（提交后才调微信）
         GzJpRefundPlan plan = txService.markFailedAndCreateRefunds(ids, bo.getReason(), operatorId, triggeredBy);
 
+        return dispatchSnapRefundPlan(plan, ids);
+    }
+
+    /** Dispatch an already committed refund plan; snap result and plan are created atomically. */
+    public GzJpMarkFailedResultVO dispatchSnapRefundPlan(GzJpRefundPlan plan, List<Long> ids) {
+        String notifyUrl = resolveRefundNotifyUrl();
         // ★ 标了购买失败之后，整单可能就此「全部落定」了 —— 拼团最典型的收尾正是
         //   「边到边发，最后剩几款买不到、标失败退款」。那条路径上原先一次发货上报都没有，
         //   于是订单实际结束、微信侧却永远停在「部分发货」（只有 is_all_delivered=true 才收口）。
