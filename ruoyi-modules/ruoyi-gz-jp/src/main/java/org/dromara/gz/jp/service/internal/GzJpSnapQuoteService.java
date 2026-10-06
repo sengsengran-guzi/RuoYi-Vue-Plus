@@ -89,6 +89,13 @@ public class GzJpSnapQuoteService {
             return snapshot;
         } catch (java.io.IOException ex) { log.warn("Corrupt snap quote; refusing it", ex); throw expired(); }
     }
+    /** Derive the item from the server-owned quote; submission accepts no external item or price. */
+    public GzJpSnapQuoteSnapshot require(String quoteId) {
+        String raw = quoteId == null ? null : store.get(quoteId);
+        if (raw == null) throw expired();
+        try { return require(quoteId, json.readValue(raw, GzJpSnapQuoteSnapshot.class).externalId()); }
+        catch (java.io.IOException ex) { log.warn("Corrupt snap quote", ex); throw expired(); }
+    }
     private ServiceException unset() { return new ServiceException("定价参数未配置完整，暂不能报价", SNAP_PRICING_UNSET); }
     private ServiceException expired() { return new ServiceException("报价已过期，请重新报价", SNAP_QUOTE_EXPIRED); }
 }

@@ -19,6 +19,8 @@ import java.util.List;
  */
 public interface GzJpOrderMapper extends BaseMapperPlus<GzJpOrder, GzJpOrder> {
 
+    @Select("SELECT * FROM gz_jp_order WHERE id=#{id} AND del_flag='0' FOR UPDATE")
+    GzJpOrder lockById(@Param("id") Long id);
     /**
      * 按 order_no <b>行级锁</b>加载订单（支付回调 {@code onPaid} 用）。
      *

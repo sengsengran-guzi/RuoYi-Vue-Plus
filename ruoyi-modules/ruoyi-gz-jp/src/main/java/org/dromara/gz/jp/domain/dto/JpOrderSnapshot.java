@@ -188,6 +188,12 @@ public final class JpOrderSnapshot {
 
         /** ★ 报价单号（Redis {@code quote:{quoteId}} 的键）—— 锁价凭据的出处 */
         private String quoteId;
+        /** Original image evidence; mp read paths must rewrite through the owned proxy. */
+        private String mainImageUrl;
+        private Long goodsCent;
+        private Long totalCent;
+        private Long expiresAt;
+        private Boolean ackNoCancel;
 
         /**
          * 报价时间（{@code yyyy-MM-dd HH:mm:ss}，Asia/Shanghai）。

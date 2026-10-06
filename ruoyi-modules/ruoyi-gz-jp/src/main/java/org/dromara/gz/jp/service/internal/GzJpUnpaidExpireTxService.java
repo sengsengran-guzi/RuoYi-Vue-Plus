@@ -27,6 +27,7 @@ public class GzJpUnpaidExpireTxService {
 
     private final GzJpOrderMapper orderMapper;
     private final IGzJpOrderService orderService;
+    private final GzJpSnapLockService snapLocks;
 
     /**
      * 本地关单：{@code created → cancelled} + {@code cancelled_time}（条件更新）。
@@ -43,7 +44,9 @@ public class GzJpUnpaidExpireTxService {
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
     public boolean cancelExpired(Long orderId, LocalDateTime cancelledTime) {
-        return orderMapper.markCancelled(orderId, cancelledTime) == 1;
+        boolean cancelled = orderMapper.markCancelled(orderId, cancelledTime) == 1;
+        if (cancelled) snapLocks.releaseOrder(orderId);
+        return cancelled;
     }
 
     /**

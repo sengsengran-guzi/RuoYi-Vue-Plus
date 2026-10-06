@@ -115,6 +115,8 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
     private final DictService dictService;
     /** Spring 全局 ObjectMapper（快照 JSON 序列化/反序列化；构造注入以便单测替换） */
     private final ObjectMapper objectMapper;
+    private final org.dromara.gz.jp.service.internal.GzJpSnapPaidTaskService snapPaidTasks;
+    private final org.dromara.gz.jp.service.internal.GzJpSnapReadService snapReads;
 
     // ============================================================
     //  下单（FLOW:F-JP-02.step4）
@@ -396,6 +398,10 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
         // 全部商品行进入履约起点（★ 幂等第二道在 SQL 的 WHERE 里：只碰仍在 purchasing 的行，
         // 万一回调被重放也不会把已推进到「日本仓库已发货」的行打回去）
         int activated = itemMapper.activatePurchasing(order.getId());
+        for (GzJpOrderItem item : itemMapper.selectList(Wrappers.<GzJpOrderItem>lambdaQuery()
+            .eq(GzJpOrderItem::getOrderId, order.getId()).eq(GzJpOrderItem::getSource, "snap"))) {
+            snapPaidTasks.enqueue(order, item);
+        }
         log.info("[gz-jp-order] onPaid ok orderNo={} orderId={} → paid payTxnId={} 激活商品行={} 行",
             orderNo, order.getId(), txn.getId(), activated);
     }
@@ -493,7 +499,7 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
             totalQty += ObjectUtil.defaultIfNull(item.getQty(), 0);
             if (thumbs.size() < LIST_THUMB_MAX) {
                 JpOrderSnapshot.Product snap = readJson(item.getProductSnapshotJson(), JpOrderSnapshot.Product.class);
-                thumbs.add(resolveImageUrl(snap == null ? null : snap.resolveMainImageId(), urlCache));
+                thumbs.add(resolveSnapshotImage(snap, urlCache));
             }
         }
         vo.setTotalQty(totalQty);
@@ -529,7 +535,7 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
             vo.setDeliveryDateText(snap.getDeliveryDateText());
             vo.setNoticeText(snap.getNoticeText());
             vo.setEventName(snap.getEventName());
-            vo.setMainImageUrl(resolveImageUrl(snap.resolveMainImageId(), urlCache));
+            vo.setMainImageUrl(resolveSnapshotImage(snap, urlCache));
         } else {
             // 快照损坏（历史脏数据）：宁可少显示，也不要让整个订单详情 500
             vo.setName("商品");
@@ -542,6 +548,14 @@ public class GzJpOrderServiceImpl implements IGzJpOrderService {
      * 快照里的 file id（string）→ 可渲染签名 URL。null / 已删 / 空串 → 占位图，<b>绝不返回 null</b>
      * （mp {@code <image>} 拿到 null 渲染成裂图）。
      */
+    private String resolveSnapshotImage(JpOrderSnapshot.Product snap, Map<Long,String> cache) {
+        if (snap != null && StrUtil.isBlank(snap.resolveMainImageId()) && snap.getSnap() != null
+            && StrUtil.isNotBlank(snap.getSnap().getMainImageUrl())) {
+            String proxy = snapReads.image(snap.getSnap().getMainImageUrl());
+            if (StrUtil.isNotBlank(proxy)) return proxy;
+        }
+        return resolveImageUrl(snap == null ? null : snap.resolveMainImageId(), cache);
+    }
     private String resolveImageUrl(String fileIdStr, Map<Long, String> urlCache) {
         if (StrUtil.isBlank(fileIdStr)) {
             return PLACEHOLDER_IMAGE_URL;

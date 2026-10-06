@@ -274,7 +274,7 @@ class GzJpMixedSourceQueryTest {
             return new GzJpOrderServiceImpl(orderMapper, itemMapper, Mockito.mock(GzJpProductMapper.class),
                 Mockito.mock(IGzJpEventService.class), Mockito.mock(IGzJpCartService.class), payTransactionService,
                 Mockito.mock(PayOrderNoGenerator.class), userService, Mockito.mock(IGzUserAddressService.class),
-                fileService, dictService, new ObjectMapper());
+                fileService, dictService, new ObjectMapper(), null, null);
         }
     }
 
