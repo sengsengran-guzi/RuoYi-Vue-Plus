@@ -40,7 +40,7 @@ final class GzJpUnpaidExpireFixture {
     final IWechatPayClient wechatPayClient = mock(IWechatPayClient.class);
     final IGzPayTransactionService payTransactionService = mock(IGzPayTransactionService.class);
     final IGzJpOrderService orderService = mock(IGzJpOrderService.class);
-    final GzJpUnpaidExpireTxService txService = new GzJpUnpaidExpireTxService(orderMapper, orderService);
+    final GzJpUnpaidExpireTxService txService = new GzJpUnpaidExpireTxService(orderMapper, orderService, org.mockito.Mockito.mock(org.dromara.gz.jp.service.internal.GzJpSnapLockService.class));
 
     /** in-memory gz_jp_order */
     final List<GzJpOrder> orders = new ArrayList<>();

@@ -339,3 +339,14 @@ gz:
   # mp 真机自测入口（/app/gz/test/**）总开关。dev 默认开（本地/模拟器自测方便）。
   test:
     enabled: ${GZ_TEST_ENABLED:true}
+
+--- # 本地默认不触发调度；联调时只能显式打开，gateway 固定本地。
+gz:
+  local-scheduler:
+    enabled: ${GZ_LOCAL_SCHEDULER_ENABLED:false}
+  jp:
+    snap:
+      translate:
+        provider: ${GZ_JP_SNAP_TRANSLATE_PROVIDER:mock}
+      gateway:
+        base-url: http://127.0.0.1:8700

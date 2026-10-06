@@ -29,6 +29,10 @@ import java.util.List;
  */
 public interface GzJpOrderItemMapper extends BaseMapperPlus<GzJpOrderItem, GzJpOrderItem> {
 
+    @Select("SELECT * FROM gz_jp_order_item WHERE id=#{id} AND del_flag='0' FOR UPDATE")
+    GzJpOrderItem lockById(@Param("id") Long id);
+    @Update("UPDATE gz_jp_order_item SET product_snapshot_json=JSON_SET(product_snapshot_json,'$.snap.mainImageId',#{fileId}),version=version+1,update_time=NOW() WHERE id=#{id} AND source='snap' AND del_flag='0'")
+    int setSnapImage(@Param("id") Long id, @Param("fileId") String fileId);
     /**
      * 支付成功后把整单商品行置为履约起点 {@code purchasing}（FLOW:F-JP-02.step6）。
      *

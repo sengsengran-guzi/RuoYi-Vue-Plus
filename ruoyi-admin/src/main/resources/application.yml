@@ -296,3 +296,21 @@ warm-flow:
   node-tooltip: true
   # 默认Authorization，如果有多个token，用逗号分隔
   token-name: ${sa-token.token-name},clientid
+
+--- # 日本服务：密钥只从环境读取，缺失时调用失败关闭；不输出签名/密钥。
+gz:
+  jp:
+    snap:
+      image-base-url: ${GZ_JP_SNAP_IMAGE_BASE_URL:http://127.0.0.1:8700}
+      translate:
+        provider: ${GZ_JP_SNAP_TRANSLATE_PROVIDER:aliyun}
+        endpoint: ${GZ_JP_SNAP_TRANSLATE_ENDPOINT:mt.cn-hangzhou.aliyuncs.com}
+        access-key-id: ${ALIYUN_TRANSLATE_ACCESS_KEY_ID:}
+        access-key-secret: ${ALIYUN_TRANSLATE_ACCESS_KEY_SECRET:}
+      gateway:
+        base-url: ${GZ_JP_GATEWAY_URL:http://127.0.0.1:8700}
+        secret: ${GZ_JP_GATEWAY_SECRET:}
+        read-failure-threshold: 3
+        circuit-open-ms: 60000
+        probe-keyword: ${GZ_JP_GATEWAY_PROBE_KEYWORD:ブルーロック 缶バッジ}
+        probe-item-id: ${GZ_JP_GATEWAY_PROBE_ITEM:m99000000001}

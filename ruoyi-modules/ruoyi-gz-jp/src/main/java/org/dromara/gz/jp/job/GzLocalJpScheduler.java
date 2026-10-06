@@ -24,6 +24,8 @@ import org.springframework.stereotype.Component;
 @ConditionalOnProperty(prefix = "gz.local-scheduler", name = "enabled", havingValue = "true")
 public class GzLocalJpScheduler {
 
+    private final GzJpSnapHealthJob snapHealthJob;
+    private final org.dromara.gz.jp.service.internal.GzJpSnapFxService snapFxService;
     private final GzJpUnpaidExpireJob unpaidExpireJob;
     private final GzJpRefundCompensateJob refundCompensateJob;
 
@@ -55,5 +57,22 @@ public class GzLocalJpScheduler {
         } catch (Exception ex) {
             log.error("[gz-local-sched] jp-refund-compensate FAILED", ex);
         }
+    }
+    @Scheduled(fixedDelayString = "${gz.local-scheduler.jp-snap-fx-ms:1800000}",
+        initialDelayString = "${gz.local-scheduler.initial-delay-ms:60000}")
+    public void snapFx() { snapFxService.fetch(); }
+
+    @Scheduled(fixedDelayString = "${gz.local-scheduler.jp-snap-heartbeat-ms:120000}",
+        initialDelayString = "${gz.local-scheduler.initial-delay-ms:60000}")
+    public void snapHeartbeat() {
+        try { snapHealthJob.heartbeat(); }
+        catch (Exception ex) { log.error("[gz-local-sched] jp-snap-heartbeat FAILED", ex); }
+    }
+
+    @Scheduled(fixedDelayString = "${gz.local-scheduler.jp-snap-probe-ms:600000}",
+        initialDelayString = "${gz.local-scheduler.initial-delay-ms:60000}")
+    public void snapProbe() {
+        try { snapHealthJob.probe(); }
+        catch (Exception ex) { log.error("[gz-local-sched] jp-snap-probe FAILED", ex); }
     }
 }

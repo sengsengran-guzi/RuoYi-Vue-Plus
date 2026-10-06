@@ -171,7 +171,7 @@ public final class JpOrderSnapshot {
         /** 到付预估运费（分）；包邮为 0 —— 到仓后按实际运费多退少不补（REQ-SNAP-025） */
         private Long estShippingCent;
 
-        /** 报价时的准入结果（字典 gz_jp_snap_gate：auto / manual / blocked） */
+        /** 提交时保守准入结果（报价或实时复查任一manual即manual；金额/汇率仍锁报价） */
         private String gateResult;
 
         /** 报价时命中的准入规则 */
@@ -188,6 +188,12 @@ public final class JpOrderSnapshot {
 
         /** ★ 报价单号（Redis {@code quote:{quoteId}} 的键）—— 锁价凭据的出处 */
         private String quoteId;
+        /** Original image evidence; mp read paths must rewrite through the owned proxy. */
+        private String mainImageUrl;
+        private Long goodsCent;
+        private Long totalCent;
+        private Long expiresAt;
+        private Boolean ackNoCancel;
 
         /**
          * 报价时间（{@code yyyy-MM-dd HH:mm:ss}，Asia/Shanghai）。
