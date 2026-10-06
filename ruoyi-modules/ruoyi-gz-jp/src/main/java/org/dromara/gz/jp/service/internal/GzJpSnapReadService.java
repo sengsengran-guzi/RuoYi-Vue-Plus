@@ -139,7 +139,7 @@ public class GzJpSnapReadService {
         return new GzJpSnapDetailVO(id, title, titleZh, description, translator.translate(description, "ja", "zh", "description:" + id),
             entity.getPriceJpy(), entity.getItemStatus(), entity.getShippingPayer(), entity.getConditionText(), entity.getCategoryId(),
             List.copyOf(pictures), decision.purchasable() && price != null, decision.unavailableReason() != null ? decision.unavailableReason() : quoteError != null ? "quote_unavailable" : null,
-            price == null ? null : price.totalCent(), decision.result().getCode(), reason, price, quoteError);
+            price == null ? null : price.totalCent(), decision.result().getCode(), reason, price, quoteError, entity.getFetchedAt().atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli());
     }
     public List<String> hotTerms() { return TenantHelper.dynamic("1001", () -> enabledTerms().stream().filter(t -> "ip".equals(t.getTermType())).limit(12).map(GzJpSnapTerm::getZhTerm).toList()); }
     public GzJpSnapNormalizer.Result normalize(String input) {

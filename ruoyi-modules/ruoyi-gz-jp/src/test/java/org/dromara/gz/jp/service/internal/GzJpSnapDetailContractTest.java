@@ -22,6 +22,8 @@ class GzJpSnapDetailContractTest {
         var v=f.service.itemInTenant("m1"); assertEquals("blocked",v.gateResult());assertFalse(v.purchasable());assertNull(v.price());
         var captor=org.mockito.ArgumentCaptor.forClass(org.dromara.gz.jp.domain.entity.GzJpSnapItem.class);
         org.mockito.Mockito.verify(f.items).upsertLive(captor.capture());assertEquals("proxy_refuse:代行業者@seller_intro",captor.getValue().getGateReason());
+        assertEquals(captor.getValue().getFetchedAt().atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli(), v.fetchedAt());
+        assertTrue(Math.abs(System.currentTimeMillis() - v.fetchedAt()) < 5000);
         f.service.itemInTenant("m1");org.mockito.Mockito.verify(f.gateway,org.mockito.Mockito.times(1)).seller("99000001");
         org.mockito.Mockito.verify(f.quotes,org.mockito.Mockito.never()).quote(org.mockito.ArgumentMatchers.anyString(),org.mockito.ArgumentMatchers.anyLong(),org.mockito.ArgumentMatchers.anyString(),org.mockito.ArgumentMatchers.anyString());
     }
