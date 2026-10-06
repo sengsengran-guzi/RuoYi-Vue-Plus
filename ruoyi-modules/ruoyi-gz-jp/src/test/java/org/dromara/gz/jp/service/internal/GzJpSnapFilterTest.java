@@ -21,7 +21,7 @@ class GzJpSnapFilterTest extends Snap302Fixture {
         }
     }
     @Test void emptyWhitelistRefusesSearchWithoutGatewayAndRefusesDirectDetails() {
-        when(config.getConfigValue(any())).thenReturn("{\"categoryWhitelist\":[]}");
+        when(config.getConfigValue("gz.jp.snap.filter")).thenReturn("{\"categoryWhitelist\":[]}");
         assertTrue(service.searchInTenant("缶バッジ", "created_desc", 1).items().isEmpty());
         verify(gateway,never()).search(any(),any(),anyInt(),any());
         when(gateway.item("m1")).thenReturn(item("m1","975","c2c","on_sale","badge"));
@@ -39,7 +39,7 @@ class GzJpSnapFilterTest extends Snap302Fixture {
         when(gateway.search(any(),any(),anyInt(),any())).thenReturn(body(item("m1","975","c2c","on_sale","缶バッジ")));
         var result = service.searchInTenant("缶バッジ","created_desc",1);
         assertEquals("http://127.0.0.1:8700/v1/img/item/synthetic.png",result.items().get(0).thumbUrl());
-        when(config.getConfigValue(any())).thenReturn("{\"categoryWhitelist\":[\"745\",\"975\",\"980\"],\"keywordBlacklist\":[\"缶バッジ\"]}");
+        when(config.getConfigValue("gz.jp.snap.filter")).thenReturn("{\"categoryWhitelist\":[\"745\",\"975\",\"980\"],\"keywordBlacklist\":[\"缶バッジ\"]}");
         assertTrue(service.searchInTenant("缶バッジ","created_desc",1).items().isEmpty());
         verify(gateway,times(1)).search(any(),any(),anyInt(),any());
         assertEquals("",service.image("https://evil.test/a.png"));
