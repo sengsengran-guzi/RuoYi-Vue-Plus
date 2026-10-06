@@ -3,7 +3,13 @@ import java.util.List;
 /** Fresh admission and public quote projection; no FX or markup terms are exposed. */
 public record GzJpSnapDetailVO(String externalId, String titleJa, String titleZh, String descriptionJa, String descriptionZh,
     long priceJpy, String itemStatus, String shippingPayer, String conditionText, String categoryId, List<String> imageUrls,
-    boolean purchasable, String unavailableReason, Long referencePriceCent, String gateResult, String gateReason, GzJpSnapPriceVO price, Integer quoteErrorCode) {
+    boolean purchasable, String unavailableReason, Long referencePriceCent, String gateResult, String gateReason, GzJpSnapPriceVO price, Integer quoteErrorCode, Long fetchedAt) {
+    /** Snapshot time as Unix epoch milliseconds; database local time uses Asia/Shanghai. */
+    public GzJpSnapDetailVO(String externalId, String titleJa, String titleZh, String descriptionJa, String descriptionZh,
+        long priceJpy, String itemStatus, String shippingPayer, String conditionText, String categoryId, List<String> imageUrls,
+        boolean purchasable, String unavailableReason, Long referencePriceCent, String gateResult, String gateReason, GzJpSnapPriceVO price, Integer quoteErrorCode) {
+        this(externalId, titleJa, titleZh, descriptionJa, descriptionZh, priceJpy, itemStatus, shippingPayer, conditionText, categoryId, imageUrls, purchasable, unavailableReason, referencePriceCent, gateResult, gateReason, price, quoteErrorCode, null);
+    }
     public GzJpSnapDetailVO(String externalId, String titleJa, String titleZh, String descriptionJa, String descriptionZh,
         long priceJpy, String itemStatus, String shippingPayer, String conditionText, String categoryId, List<String> imageUrls,
         boolean purchasable, String unavailableReason, Long referencePriceCent) {

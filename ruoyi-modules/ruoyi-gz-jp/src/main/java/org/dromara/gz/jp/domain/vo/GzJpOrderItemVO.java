@@ -102,4 +102,11 @@ public class GzJpOrderItemVO implements Serializable {
 
     /** 已退金额（分，仅已退款行有值） */
     private Long refundAmountCent;
+    /** 对客代切展示态；拼团行为 null，不含采购内部状态。 */
+    private String snapStatus;
+    /** 白名单交易态；仅代切行提供。 */
+    private String snapTradeStatus;
+    /** 运费差价实际已退金额（分），不含在途或失败退款。 */
+    private Long shippingDiffRefundedCent;
+
 }

@@ -53,4 +53,13 @@ public class GzJpOrderListItemVO implements Serializable {
 
     /** 支付时间（未支付为 null） */
     private LocalDateTime paidTime;
+    /** 对客代切展示态；拼团行为 null，不含采购内部状态。 */
+    private String snapStatus;
+    /** 代切失败退款到账态，仅用于公共状态文案。 */
+    private String refundStatus;
+    /** 白名单交易态；仅代切行提供。 */
+    private String snapTradeStatus;
+    /** 运费差价实际已退金额（分），不含在途或失败退款。 */
+    private Long shippingDiffRefundedCent;
+
 }

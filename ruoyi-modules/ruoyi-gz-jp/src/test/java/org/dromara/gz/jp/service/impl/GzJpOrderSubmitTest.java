@@ -147,7 +147,7 @@ class GzJpOrderSubmitTest {
         insertedItems.clear();
         service = new GzJpOrderServiceImpl(orderMapper, itemMapper, productMapper, eventService, cartService,
             payTransactionService, orderNoGenerator, userService, addressService, fileService, dictService,
-            objectMapper, null, null);
+            objectMapper, null, null, org.mockito.Mockito.mock(org.dromara.gz.jp.service.internal.GzJpSnapOrderDisplayService.class));
 
         // 订单号生成器：固定发号，便于断言前缀
         when(orderNoGenerator.generate(PayBusinessType.JP)).thenReturn("JPO-20260807-000001");

@@ -81,13 +81,24 @@ public class GzJpSnapReadService {
         if (page == 1) for (JsonNode item : body.path("items")) {
             if (filter.reason(item, rules) == null) titleSources.put(item.path("external_id").asText(), item.path("title_ja").asText());
         }
+        List<String> externalIds = new ArrayList<>();
+        for (JsonNode item : body.path("items")) if (filter.reason(item, rules) == null) externalIds.add(item.path("external_id").asText());
+        Map<String, GzJpSnapItem> known = new LinkedHashMap<>();
+        if (!externalIds.isEmpty()) {
+            for (GzJpSnapItem snapshot : items.selectList(new LambdaQueryWrapper<GzJpSnapItem>()
+                .eq(GzJpSnapItem::getPlatform, "mercari").in(GzJpSnapItem::getExternalId, externalIds))) {
+                known.put(snapshot.getExternalId(), snapshot);
+            }
+        }
         Map<String, String> titleTranslations = page == 1 ? translator.titles(titleSources) : Map.of();
         for (JsonNode item : body.path("items")) {
             if (filter.reason(item, rules) != null) continue;
             String id = item.path("external_id").asText(); String title = item.path("title_ja").asText();
             String translated = titleTranslations.getOrDefault(id, title);
+            GzJpSnapItem snapshot = known.get(id);
             result.add(new GzJpSnapSearchVO.Card(id, title, translated, item.path("price_jpy").asLong(), quotes.reference(item.path("price_jpy").asLong(), item.path("shipping_payer").asText()),
-                image(item.path("thumb_url").asText(item.path("thumb").asText()))));
+                image(item.path("thumb_url").asText(item.path("thumb").asText())),
+                snapshot == null ? null : snapshot.getGateResult(), snapshot == null ? null : snapshot.getGateReason()));
         }
         return new GzJpSnapSearchVO(query, null, List.copyOf(result), body.path("has_next").asBoolean(), stale);
     }
@@ -128,7 +139,7 @@ public class GzJpSnapReadService {
         return new GzJpSnapDetailVO(id, title, titleZh, description, translator.translate(description, "ja", "zh", "description:" + id),
             entity.getPriceJpy(), entity.getItemStatus(), entity.getShippingPayer(), entity.getConditionText(), entity.getCategoryId(),
             List.copyOf(pictures), decision.purchasable() && price != null, decision.unavailableReason() != null ? decision.unavailableReason() : quoteError != null ? "quote_unavailable" : null,
-            price == null ? null : price.totalCent(), decision.result().getCode(), reason, price, quoteError);
+            price == null ? null : price.totalCent(), decision.result().getCode(), reason, price, quoteError, entity.getFetchedAt().atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli());
     }
     public List<String> hotTerms() { return TenantHelper.dynamic("1001", () -> enabledTerms().stream().filter(t -> "ip".equals(t.getTermType())).limit(12).map(GzJpSnapTerm::getZhTerm).toList()); }
     public GzJpSnapNormalizer.Result normalize(String input) {
